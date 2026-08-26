@@ -38,16 +38,15 @@ jobs:
         run: mako --version
 
       - name: test
+        shell: bash {0}
         run: |
-          result=$(mako test . 2>&1)
-          echo "$result"
-          passed=$(echo "$result" | grep "mako test:" | tail -1 | grep -o '[0-9]* passed' | grep -o '[0-9]*')
-          failed=$(echo "$result" | grep "mako test:" | tail -1 | grep -o '[0-9]* failed' | grep -o '[0-9]*')
+          mako test . 2>&1 | tee /tmp/test-output.txt
+          passed=$(grep "mako test:" /tmp/test-output.txt | tail -1 | grep -o '[0-9]* passed' | grep -o '[0-9]*')
+          failed=$(grep "mako test:" /tmp/test-output.txt | tail -1 | grep -o '[0-9]* failed' | grep -o '[0-9]*')
+          echo "result: ${passed:-0} passed, ${failed:-0} failed"
           if [ "${passed:-0}" -ge 11 ] && [ "${failed:-0}" -le 1 ]; then
-            echo "OK: $passed passed, $failed failed (live_test port races are expected in CI)"
             exit 0
           else
-            echo "FAIL: $passed passed, $failed failed"
             exit 1
           fi
 
