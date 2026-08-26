@@ -2,18 +2,16 @@
 
 In-memory data store that speaks RESP2. Written in [Mako](https://github.com/loreste/mako). MIT licensed. Not a Redis fork.
 
-Runs on Linux and macOS. Refuses to start on anything else.
+Runs on Linux and macOS (x86_64, arm64). Windows is not supported (Unix syscalls). WSL2 works.
 
 ```
-mako build --release -p lib -o bonodis
-mako build --release -p cli -o bonodis-cli
-./bonodis --bind 127.0.0.1 --port 6379 --protected-mode no
-./bonodis-cli PING
-./bonodis-cli SET k v
-./bonodis-cli GET k
+mako run -p lib -- --bind 127.0.0.1 --port 6379 --protected-mode no
+mako run -p cli -- PING
+mako run -p cli -- SET k v
+mako run -p cli -- GET k
 ```
 
-Version **0.14.0**. Needs Mako 0.5.7+.
+Version **0.14.0**. Needs [Mako](https://github.com/loreste/mako) 0.5.7+. See [install docs](docs/install.md).
 
 ## What it is
 
@@ -438,7 +436,8 @@ Unit tests (store, RESP codec, CRC16, glob, Lua) and live TCP tests (every comma
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) -- install, build, first commands, language examples
+- [Install](docs/install.md) -- requirements, platforms, systemd, Docker
+- [Getting started](docs/getting-started.md) -- first commands, language examples, production checklist
 - [Agent memory](docs/agent-memory.md) -- store/recall/pack context for AI agents
 - [REACT triggers](docs/react.md) -- server-side triggers on writes
 - [Graph, facts, leases](docs/graph-and-facts.md) -- edges, triples, beliefs, budgets
