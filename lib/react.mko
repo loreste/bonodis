@@ -1,0 +1,281 @@
+pack bonodis
+
+// REACT — server-side triggers that fire after a write succeeds on a shard.
+//
+// REACT CREATE name key ON WRITE cmd1 arg1 … | cmd2 arg2 …
+// REACT DELETE name
+// REACT LIST
+//
+// Pipe separator (|) delimits commands. Substitutions:
+//   $KEY   — the key that triggered the reaction
+//   $VALUE — argv[2] of the triggering command (the written value), or "" if absent
+//   $RESULT — the RESP reply of the previous reaction command (raw), or "" for the first
+//
+// Rules are shard-local. The key in CREATE is an exact match (no globs).
+// All reaction commands execute on the same shard, same thread, synchronously.
+
+// Storage: rules are kept in the Store.xp map under "\u001eReact\u001e" prefix.
+// Each rule is encoded as: key \u001f cmd1_arg1 \u001f cmd1_arg2 …
+// The rule name list is in xp["\u001eReactNames\u001e"] as CSV.
+// The key→names index is in xp["\u001eReactIdx\u001e" + ikey(db,key)] as CSV.
+
+const REACT_PFX = "\u001eReact\u001e"
+const REACT_IDX = "\u001eReactIdx\u001e"
+const REACT_NAMES = "\u001eReactNames\u001e"
+
+fn react_rule_key(name: string) -> string {
+    return REACT_PFX + name
+}
+
+fn react_encode_rule(key: string, cmds: []string) -> string {
+    let mut s = key
+    let mut i = 0
+    while i < len(cmds) {
+        s = s + "\t" + cmds[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn react_decode_key(encoded: string) -> string {
+    let sep = str_index(encoded, "\t")
+    if sep < 0 {
+        return encoded
+    }
+    return encoded[:sep]
+}
+
+fn react_decode_cmds(encoded: string) -> []string {
+    let sep = str_index(encoded, "\t")
+    if sep < 0 {
+        let none: []string = []
+        return none
+    }
+    return str_split(encoded[sep + 1:], "\t")
+}
+
+// Replace first occurrence of `old` with `new` in `s`.
+fn react_replace(s: string, old: string, nw: string) -> string {
+    let i = str_index(s, old)
+    if i < 0 {
+        return s
+    }
+    return s[:i] + nw + s[i + str_len(old):]
+}
+
+// Parse REACT CREATE name key ON WRITE cmd1 a1 a2 | cmd2 b1 b2
+fn react_parse_create(argv: []string) -> (string, string, []string, int) {
+    let none: []string = []
+    if len(argv) < 7 {
+        return ("", "", none, 0)
+    }
+    let name = argv[2]
+    let key = argv[3]
+    let o4 = str_to_upper(argv[4])
+    let o5 = str_to_upper(argv[5])
+    if not str_eq(o4, "ON") {
+        return ("", "", none, 0)
+    }
+    if not str_eq(o5, "WRITE") {
+        return ("", "", none, 0)
+    }
+    let mut tokens = make([]string, 0, len(argv) - 6)
+    let mut i = 6
+    while i < len(argv) {
+        tokens = append(tokens, argv[i])
+        i = i + 1
+    }
+    return (name, key, tokens, 1)
+}
+
+fn Store_cmd_react(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("react")
+    }
+    let sub = str_to_upper(argv[1])
+    if str_eq(sub, "CREATE") {
+        let name, key, tokens, ok = react_parse_create(argv)
+        if ok == 0 {
+            return r_err("ERR syntax: REACT CREATE name key ON WRITE cmd [arg ...] [| cmd [arg ...]]")
+        }
+        if str_len(name) == 0 or str_len(key) == 0 {
+            return r_err("ERR name and key must be non-empty")
+        }
+        let rk = react_rule_key(name)
+        self.xp[rk] = react_encode_rule(key, tokens)
+        // add to key→name index
+        let idx_key = REACT_IDX + ikey(db, key)
+        let existing = self.xp[idx_key]
+        if str_len(existing) == 0 {
+            self.xp[idx_key] = name
+        } else {
+            if csv_has(existing, name) == 0 {
+                self.xp[idx_key] = csv_add(existing, name)
+            }
+        }
+        // track name in global list
+        let names = self.xp[REACT_NAMES]
+        if csv_has(names, name) == 0 {
+            self.xp[REACT_NAMES] = csv_add(names, name)
+        }
+        return r_ok()
+    }
+    if str_eq(sub, "DELETE") {
+        if len(argv) < 3 {
+            return r_arity("react")
+        }
+        let name = argv[2]
+        let rk = react_rule_key(name)
+        let encoded = self.xp[rk]
+        if str_len(encoded) == 0 {
+            return r_int(0)
+        }
+        let key = react_decode_key(encoded)
+        // remove from key→name index
+        let idx_key = REACT_IDX + ikey(db, key)
+        self.xp[idx_key] = csv_del(self.xp[idx_key], name)
+        // remove from global name list
+        self.xp[REACT_NAMES] = csv_del(self.xp[REACT_NAMES], name)
+        // remove rule
+        delete(self.xp, rk)
+        return r_int(1)
+    }
+    if str_eq(sub, "LIST") {
+        let all = self.xp[REACT_NAMES]
+        let names = str_split(all, ",")
+        let mut out = make([]string, 0, 8)
+        let mut i = 0
+        while i < len(names) {
+            if str_len(names[i]) > 0 {
+                let rk = react_rule_key(names[i])
+                let encoded = self.xp[rk]
+                if str_len(encoded) > 0 {
+                    out = append(out, names[i])
+                    out = append(out, react_decode_key(encoded))
+                }
+            }
+            i = i + 1
+        }
+        return r_array_bulks(out)
+    }
+    return r_err("ERR unknown REACT subcommand '" + resp_safe(argv[1]) + "'")
+}
+
+// Substitute $KEY and $VALUE in a token. $RESULT is left for shard_loop.
+fn react_sub(token: string, key: string, value: string, result: string) -> string {
+    let mut s = token
+    if str_contains(s, "$KEY") {
+        s = react_replace(s, "$KEY", key)
+    }
+    if str_contains(s, "$VALUE") {
+        s = react_replace(s, "$VALUE", value)
+    }
+    return s
+}
+
+// Extract a usable string from a RESP reply.
+fn react_result_payload(resp: string) -> string {
+    if str_len(resp) == 0 {
+        return ""
+    }
+    let c = str_byte_at(resp, 0)
+    if c == 36 {
+        let cr = find_crlf(resp, 0)
+        if cr < 2 {
+            return ""
+        }
+        let ln = int_of(resp[1:cr])
+        if ln < 0 {
+            return ""
+        }
+        let start = cr + 2
+        if start + ln > str_len(resp) {
+            return resp[start:]
+        }
+        return resp[start:start + ln]
+    }
+    if c == 58 {
+        let cr = find_crlf(resp, 0)
+        if cr < 2 {
+            return ""
+        }
+        return resp[1:cr]
+    }
+    if c == 43 {
+        let cr = find_crlf(resp, 0)
+        if cr < 2 {
+            return ""
+        }
+        return resp[1:cr]
+    }
+    return ""
+}
+
+// Collect reaction commands for a key. Returns a flat list of argv arrays
+// encoded as: "argc\nlen\narg\nlen\narg..." separated by \u001e.
+// Caller (shard_loop) executes them via st.dispatch_cmd.
+fn Store_react_collect(mut self: Store, db: int, key: string, value: string) -> []string {
+    let none: []string = []
+    if str_eq(self.xp["\u001eReactFiring\u001e"], "1") {
+        return none
+    }
+    let idx_key = REACT_IDX + ikey(db, key)
+    let names_csv = self.xp[idx_key]
+    if str_len(names_csv) == 0 {
+        return none
+    }
+    let names = str_split(names_csv, ",")
+    let mut cmds = make([]string, 0, 4)
+    let mut ni = 0
+    while ni < len(names) {
+        let name = names[ni]
+        if str_len(name) > 0 {
+            let rk = react_rule_key(name)
+            let encoded = self.xp[rk]
+            if str_len(encoded) > 0 {
+                let tokens = react_decode_cmds(encoded)
+                let mut cmd_argv = make([]string, 0, 8)
+                let mut ti = 0
+                while ti < len(tokens) {
+                    let tok = tokens[ti]
+                    if str_eq(tok, "|") {
+                        if len(cmd_argv) > 0 {
+                            cmds = append(cmds, react_encode_argv(cmd_argv))
+                            cmd_argv = make([]string, 0, 8)
+                        }
+                    } else {
+                        cmd_argv = append(cmd_argv, react_sub(tok, key, value, ""))
+                    }
+                    ti = ti + 1
+                }
+                if len(cmd_argv) > 0 {
+                    cmds = append(cmds, react_encode_argv(cmd_argv))
+                }
+            }
+        }
+        ni = ni + 1
+    }
+    return cmds
+}
+
+fn react_encode_argv(argv: []string) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(argv) {
+        if i > 0 {
+            s = s + "\n"
+        }
+        s = s + argv[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn react_decode_argv(encoded: string) -> []string {
+    return str_split(encoded, "\n")
+}
+
+// Keep for touch_store_methods compatibility
+fn Store_react_fire(mut self: Store, db: int, key: string, value: string) {
+    // no-op — reactions are executed by shard_loop
+}

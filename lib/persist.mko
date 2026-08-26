@@ -1,0 +1,188 @@
+pack bonodis
+
+// always = 0 (fsync every write), everysec = 1000, no = -1 (never).
+fn fsync_ms_of(name: string) -> int {
+    let u = str_to_lower(name)
+    if str_eq(u, "always") {
+        return 0
+    }
+    if str_eq(u, "no") {
+        return 0 - 1
+    }
+    return 1000
+}
+
+fn fsync_policy_name(ms: int) -> string {
+    if ms < 0 {
+        return "no"
+    }
+    if ms == 0 {
+        return "always"
+    }
+    return "everysec"
+}
+
+fn pack_rewrite(recs: []string) -> string {
+    let b = str_builder()
+    builder_write(b, "REWRITE\n")
+    builder_write(b, format_int(len(recs)))
+    builder_write(b, "\n")
+    let mut i = 0
+    while i < len(recs) {
+        builder_write(b, format_int(str_len(recs[i])))
+        builder_write(b, "\n")
+        builder_write(b, recs[i])
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn unpack_rewrite(msg: string) -> []string {
+    let none: []string = []
+    if not str_has_prefix(msg, "REWRITE\n") {
+        return none
+    }
+    let rest = msg[8:]
+    let nl = find_nl(rest, 0)
+    if nl < 0 {
+        return none
+    }
+    let n = int_of(rest[:nl])
+    if n < 0 {
+        return none
+    }
+    let mut pos = nl + 1
+    let mut out = make([]string, 0, n)
+    let mut i = 0
+    let bodyn = str_len(rest)
+    while i < n {
+        if pos >= bodyn {
+            return none
+        }
+        let nl2 = find_nl(rest, pos)
+        if nl2 < 0 {
+            return none
+        }
+        let ln = int_of(rest[pos:nl2])
+        pos = nl2 + 1
+        if ln < 0 or pos + ln > bodyn {
+            return none
+        }
+        out = append(out, rest[pos:pos + ln])
+        pos = pos + ln
+        i = i + 1
+    }
+    return out
+}
+
+fn persist_rewrite_file(path: string, recs: []string) -> int {
+    let tmp = path + ".new"
+    let nw = wal_open(tmp)
+    let mut i = 0
+    while i < len(recs) {
+        let rc = wal_append(nw, recs[i])
+        if rc != 0 {
+            log_wal_append_err(rc)
+        }
+        i = i + 1
+    }
+    let _ = wal_sync(nw)
+    let _ = wal_close(nw)
+    let _ = remove_file(path)
+    let cr = copy_file(tmp, path)
+    let _ = remove_file(tmp)
+    slog_with2("info", "AOF rewrite", "path", path, "records", format_int(len(recs)))
+    return cr
+}
+
+fn persist_loop(rx: chan[string], path: string, fsync_ms: int, enabled: int) -> int {
+    if enabled == 0 {
+        while true {
+            let rec = rx.recv()
+            if str_eq(rec, "STOP") {
+                return 0
+            }
+        }
+        return 0
+    }
+    let mut w = wal_open(path)
+    log_wal_open(path)
+    let mut pending = 0
+    let mut last = 0
+    while true {
+        let rec = rx.recv()
+        if str_eq(rec, "STOP") {
+            if pending == 1 {
+                let _ = wal_sync(w)
+            }
+            let _ = wal_close(w)
+            log_wal_close()
+            return 0
+        }
+        if str_eq(rec, "FSYNC") {
+            if pending == 1 {
+                let _ = wal_sync(w)
+                pending = 0
+                last = wall_ms()
+            }
+            continue
+        }
+        if str_has_prefix(rec, "REWRITE") {
+            if pending == 1 {
+                let _ = wal_sync(w)
+                pending = 0
+            }
+            let _ = wal_close(w)
+            let recs = unpack_rewrite(rec)
+            let _ = persist_rewrite_file(path, recs)
+            w = wal_open(path)
+            last = wall_ms()
+            continue
+        }
+        let rc = wal_append(w, rec)
+        if rc != 0 {
+            log_wal_append_err(rc)
+        } else {
+            pending = 1
+        }
+        if fsync_ms < 0 {
+            pending = 1
+        } else if fsync_ms == 0 {
+            let _ = wal_sync(w)
+            pending = 0
+            last = wall_ms()
+        } else {
+            let now = wall_ms()
+            if last == 0 or now - last >= fsync_ms {
+                let _ = wal_sync(w)
+                pending = 0
+                last = now
+            }
+        }
+    }
+    return 0
+}
+
+fn wal_load(path: string) -> []string {
+    let none: []string = []
+    if not file_exists(path) {
+        return none
+    }
+    let w = wal_open(path)
+    let mut out = make([]string, 0, 16)
+    let mut off = 0
+    while true {
+        let rec = wal_read_at(w, off)
+        if str_len(rec) == 0 {
+            break
+        }
+        out = append(out, rec)
+        let next = wal_next_off()
+        if next < 0 {
+            break
+        }
+        off = next
+    }
+    let _ = wal_close(w)
+    return out
+}

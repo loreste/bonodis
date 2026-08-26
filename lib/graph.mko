@@ -1,0 +1,531 @@
+pack bonodis
+
+// Knowledge graph, facts, leases, WHY. Stored on existing xp/xseq maps
+// (Mako struct field count is tight). Same-slot only — use {hash} tags.
+
+fn type_name(t: int) -> string {
+    if t == T_STR {
+        return "string"
+    }
+    if t == T_HASH {
+        return "hash"
+    }
+    if t == T_LIST {
+        return "list"
+    }
+    if t == T_SET {
+        return "set"
+    }
+    if t == T_ZSET {
+        return "zset"
+    }
+    if t == T_STREAM {
+        return "stream"
+    }
+    if t == T_VEC {
+        return "vector"
+    }
+    return "none"
+}
+
+fn rk_out(ik: string) -> string {
+    return "\u001eRout\u001e" + ik
+}
+
+fn rk_in(ik: string) -> string {
+    return "\u001eRin\u001e" + ik
+}
+
+fn rk_fact(ik: string) -> string {
+    return "\u001eFact\u001e" + ik
+}
+
+fn rk_fidx(db: int, p: string, o: string) -> string {
+    return "\u001eFidx\u001e" + format_int(db) + "\u001e" + p + "\u001e" + o
+}
+
+fn rk_last(ik: string) -> string {
+    return "\u001eLast\u001e" + ik
+}
+
+fn rk_tok(ik: string) -> string {
+    return "\u001eTok\u001e" + ik
+}
+
+fn rk_until(ik: string) -> string {
+    return "\u001eUntil\u001e" + ik
+}
+
+fn edge_row(nb: string, ty: string) -> string {
+    return nb + "\t" + ty
+}
+
+fn edge_nb(row: string) -> string {
+    let i = str_index(row, "\t")
+    if i < 0 {
+        return row
+    }
+    return row[:i]
+}
+
+fn edge_ty(row: string) -> string {
+    let i = str_index(row, "\t")
+    if i < 0 {
+        return "related"
+    }
+    return row[i + 1:]
+}
+
+fn edge_rows(blob: string) -> []string {
+    let mut out = make([]string, 0, 4)
+    if str_len(blob) == 0 {
+        return out
+    }
+    let parts = str_split(blob, "\n")
+    let mut i = 0
+    while i < len(parts) {
+        if str_len(parts[i]) > 0 {
+            out = append(out, parts[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn edge_join(rows: []string) -> string {
+    let b = str_builder()
+    let mut first = 1
+    let mut i = 0
+    while i < len(rows) {
+        if str_len(rows[i]) > 0 {
+            if first == 0 {
+                builder_write(b, "\n")
+            }
+            builder_write(b, rows[i])
+            first = 0
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn edge_put(blob: string, nb: string, ty: string) -> string {
+    let mut rows = edge_rows(blob)
+    let mut i = 0
+    let mut hit = 0
+    while i < len(rows) {
+        if str_eq(edge_nb(rows[i]), nb) {
+            rows[i] = edge_row(nb, ty)
+            hit = 1
+        }
+        i = i + 1
+    }
+    if hit == 0 {
+        rows = append(rows, edge_row(nb, ty))
+    }
+    return edge_join(rows)
+}
+
+fn fact_put(blob: string, p: string, o: string) -> string {
+    let row = edge_row(p, o)
+    let mut rows = edge_rows(blob)
+    let mut i = 0
+    while i < len(rows) {
+        if str_eq(rows[i], row) {
+            return blob
+        }
+        i = i + 1
+    }
+    rows = append(rows, row)
+    return edge_join(rows)
+}
+
+fn fact_del_pair(blob: string, p: string, o: string) -> string {
+    let row = edge_row(p, o)
+    let mut rows = edge_rows(blob)
+    let mut i = 0
+    while i < len(rows) {
+        if str_eq(rows[i], row) {
+            rows[i] = ""
+        }
+        i = i + 1
+    }
+    return edge_join(rows)
+}
+
+fn edge_del(blob: string, nb: string) -> string {
+    let mut rows = edge_rows(blob)
+    let mut i = 0
+    while i < len(rows) {
+        if str_eq(edge_nb(rows[i]), nb) {
+            rows[i] = ""
+        }
+        i = i + 1
+    }
+    return edge_join(rows)
+}
+
+fn fact_po(p: string, o: string) -> string {
+    return p + "\u001e" + o
+}
+
+fn Store_scrub_graph(mut self: Store, ik: string) {
+    let name = ukey(ik)
+    let db = kdb(ik)
+    let outs = edge_rows(self.xp[rk_out(ik)])
+    let mut i = 0
+    while i < len(outs) {
+        let oik = ikey(db, edge_nb(outs[i]))
+        self.xp[rk_in(oik)] = edge_del(self.xp[rk_in(oik)], name)
+        i = i + 1
+    }
+    let ins = edge_rows(self.xp[rk_in(ik)])
+    i = 0
+    while i < len(ins) {
+        let oik = ikey(db, edge_nb(ins[i]))
+        self.xp[rk_out(oik)] = edge_del(self.xp[rk_out(oik)], name)
+        i = i + 1
+    }
+    let facts = edge_rows(self.xp[rk_fact(ik)])
+    i = 0
+    while i < len(facts) {
+        let po = facts[i]
+        let sp = str_index(po, "\u001e")
+        if sp > 0 {
+            let ix = rk_fidx(db, po[:sp], po[sp + 1:])
+            self.xp[ix] = csv_del(self.xp[ix], name)
+        }
+        i = i + 1
+    }
+    delete(self.xp, rk_out(ik))
+    delete(self.xp, rk_in(ik))
+    delete(self.xp, rk_fact(ik))
+    delete(self.xp, rk_last(ik))
+    delete(self.xp, rk_tok(ik))
+    delete(self.xseq, rk_until(ik))
+}
+
+fn Store_cmd_relate(mut self: Store, db: int, argv: []string, add: int) -> string {
+    if len(argv) < 3 {
+        return r_arity("relate")
+    }
+    let a = argv[1]
+    let b = argv[2]
+    if str_eq(a, b) {
+        return r_err("ERR from and to must differ")
+    }
+    let mut typ = "related"
+    if len(argv) >= 4 and str_len(argv[3]) > 0 {
+        typ = argv[3]
+    }
+    let aik = ikey(db, a)
+    let bik = ikey(db, b)
+    if add == 0 {
+        self.xp[rk_out(aik)] = edge_del(self.xp[rk_out(aik)], b)
+        self.xp[rk_in(bik)] = edge_del(self.xp[rk_in(bik)], a)
+        return r_int(1)
+    }
+    self.xp[rk_out(aik)] = edge_put(self.xp[rk_out(aik)], b, typ)
+    self.xp[rk_in(bik)] = edge_put(self.xp[rk_in(bik)], a, typ)
+    return r_ok()
+}
+
+fn Store_cmd_neighbors(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("neighbors")
+    }
+    let ik = ikey(db, argv[1])
+    let mut incoming = 0
+    let mut filter = ""
+    let mut count = 64
+    let mut i = 2
+    while i < len(argv) {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "IN") {
+            incoming = 1
+            i = i + 1
+        } else if str_eq(o, "OUT") {
+            incoming = 0
+            i = i + 1
+        } else if str_eq(o, "TYPE") and i + 1 < len(argv) {
+            filter = argv[i + 1]
+            i = i + 2
+        } else if str_eq(o, "COUNT") and i + 1 < len(argv) {
+            let n, ok = int_ok(argv[i + 1])
+            if ok == 1 and n > 0 {
+                count = n
+            }
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    let mut blob = self.xp[rk_out(ik)]
+    if incoming == 1 {
+        blob = self.xp[rk_in(ik)]
+    }
+    let rows = edge_rows(blob)
+    let mut out = make([]string, 0, 8)
+    let mut n = 0
+    i = 0
+    while i < len(rows) and n < count {
+        let ty = edge_ty(rows[i])
+        if str_len(filter) == 0 or str_eq(ty, filter) {
+            out = append(out, edge_nb(rows[i]))
+            out = append(out, ty)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return r_array_bulks(out)
+}
+
+fn Store_cmd_path(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("path")
+    }
+    let src = argv[1]
+    let dst = argv[2]
+    let mut capv = 32
+    if len(argv) >= 5 and str_eq(str_to_upper(argv[3]), "MAX") {
+        let n, ok = int_ok(argv[4])
+        if ok == 1 and n > 0 {
+            capv = n
+        }
+    }
+    if capv > 64 {
+        capv = 64
+    }
+    if str_eq(src, dst) {
+        let mut one = make([]string, 0, 1)
+        one = append(one, src)
+        return r_array_bulks(one)
+    }
+    let mut q = make([]string, 0, 8)
+    q = append(q, src)
+    let mut seen = make(map[string]int)
+    seen[src] = 1
+    let mut prev = make(map[string]string)
+    let mut qi = 0
+    while qi < len(q) and qi < capv {
+        let cur = q[qi]
+        qi = qi + 1
+        if str_eq(cur, dst) {
+            break
+        }
+        let cik = ikey(db, cur)
+        let rows = edge_rows(self.xp[rk_out(cik)])
+        let mut ri = 0
+        while ri < len(rows) {
+            let nb = edge_nb(rows[ri])
+            if not has(seen, nb) {
+                seen[nb] = 1
+                prev[nb] = cur
+                q = append(q, nb)
+            }
+            ri = ri + 1
+        }
+    }
+    if not has(prev, dst) {
+        let none: []string = []
+        return r_array_bulks(none)
+    }
+    let mut rev = make([]string, 0, 8)
+    let mut cur = dst
+    let mut guard = 0
+    while str_len(cur) > 0 and guard < 64 {
+        rev = append(rev, cur)
+        if str_eq(cur, src) {
+            break
+        }
+        if not has(prev, cur) {
+            let none: []string = []
+            return r_array_bulks(none)
+        }
+        cur = prev[cur]
+        guard = guard + 1
+    }
+    let mut out = make([]string, 0, len(rev))
+    let mut j = len(rev) - 1
+    while j >= 0 {
+        out = append(out, rev[j])
+        j = j - 1
+    }
+    return r_array_bulks(out)
+}
+
+fn Store_cmd_fact(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("fact")
+    }
+    let sub = str_to_upper(argv[1])
+    if str_eq(sub, "ADD") {
+        if len(argv) < 5 {
+            return r_arity("fact")
+        }
+        let s = argv[2]
+        let p = argv[3]
+        let o = argv[4]
+        let ik = ikey(db, s)
+        let po = fact_po(p, o)
+        self.xp[rk_fact(ik)] = fact_put(self.xp[rk_fact(ik)], p, o)
+        let _ = po
+        self.xp[rk_fidx(db, p, o)] = csv_add(self.xp[rk_fidx(db, p, o)], s)
+        self.xseq[rk_bsc(ik, p, o)] = 100
+        return r_ok()
+    }
+    if str_eq(sub, "DEL") {
+        if len(argv) < 5 {
+            return r_arity("fact")
+        }
+        let s = argv[2]
+        let p = argv[3]
+        let o = argv[4]
+        let ik = ikey(db, s)
+        self.xp[rk_fact(ik)] = fact_del_pair(self.xp[rk_fact(ik)], p, o)
+        self.xp[rk_fidx(db, p, o)] = csv_del(self.xp[rk_fidx(db, p, o)], s)
+        return r_int(1)
+    }
+    if str_eq(sub, "OF") {
+        let ik = ikey(db, argv[2])
+        let rows = edge_rows(self.xp[rk_fact(ik)])
+        let mut out = make([]string, 0, 8)
+        let mut i = 0
+        while i < len(rows) {
+            out = append(out, edge_nb(rows[i]))
+            out = append(out, edge_ty(rows[i]))
+            i = i + 1
+        }
+        return r_array_bulks(out)
+    }
+    if str_eq(sub, "WHO") {
+        if len(argv) < 4 {
+            return r_arity("fact")
+        }
+        let raw = self.xp[rk_fidx(db, argv[2], argv[3])]
+        let mut out = make([]string, 0, 4)
+        let parts = str_split(raw, ",")
+        let mut i = 0
+        while i < len(parts) {
+            if str_len(parts[i]) > 0 {
+                out = append(out, parts[i])
+            }
+            i = i + 1
+        }
+        return r_array_bulks(out)
+    }
+    return r_err("ERR unknown FACT subcommand")
+}
+
+fn Store_lease_live(mut self: Store, ik: string) -> int {
+    if not has(self.xseq, rk_until(ik)) {
+        return 0
+    }
+    if self.xseq[rk_until(ik)] <= wall_ms() {
+        delete(self.xp, rk_tok(ik))
+        delete(self.xseq, rk_until(ik))
+        return 0
+    }
+    return 1
+}
+
+fn Store_cmd_lease(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("lease")
+    }
+    let ik = ikey(db, argv[1])
+    let sec, ok = int_ok(argv[2])
+    if ok == 0 or sec < 1 {
+        return r_notint()
+    }
+    let until = wall_ms() + sec * 1000
+    let live = self.lease_live(ik)
+    if len(argv) >= 4 {
+        if live == 1 {
+            if not str_eq(self.xp[rk_tok(ik)], argv[3]) {
+                return r_nil()
+            }
+        }
+        self.xp[rk_tok(ik)] = argv[3]
+        self.xseq[rk_until(ik)] = until
+        return r_bulk(argv[3])
+    }
+    if live == 1 {
+        return r_nil()
+    }
+    let tok = format_int(self.ops) + "-" + format_int(wall_ms())
+    self.xp[rk_tok(ik)] = tok
+    self.xseq[rk_until(ik)] = until
+    return r_bulk(tok)
+}
+
+fn Store_cmd_unlease(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("unlease")
+    }
+    let ik = ikey(db, argv[1])
+    if self.lease_live(ik) == 0 {
+        return r_int(0)
+    }
+    if not str_eq(self.xp[rk_tok(ik)], argv[2]) {
+        return r_int(0)
+    }
+    delete(self.xp, rk_tok(ik))
+    delete(self.xseq, rk_until(ik))
+    return r_int(1)
+}
+
+fn Store_cmd_leased(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("leased")
+    }
+    let ik = ikey(db, argv[1])
+    if self.lease_live(ik) == 0 {
+        return r_nil()
+    }
+    return r_bulk(self.xp[rk_tok(ik)])
+}
+
+fn Store_cmd_why(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("why")
+    }
+    let key = argv[1]
+    let ik = ikey(db, key)
+    let mut items = make([]string, 0, 20)
+    items = append(items, "key")
+    items = append(items, key)
+    items = append(items, "slot")
+    items = append(items, format_int(key_slot(key)))
+    items = append(items, "type")
+    items = append(items, type_name(self.kind(ik)))
+    items = append(items, "ttl_ms")
+    if has(self.expire, ik) {
+        let mut left = self.expire[ik] - wall_ms()
+        if left < 0 {
+            left = 0
+        }
+        items = append(items, format_int(left))
+    } else {
+        items = append(items, "-1")
+    }
+    items = append(items, "bytes")
+    items = append(items, format_int(self.payload_bytes(ik)))
+    items = append(items, "last")
+    if has(self.xp, rk_last(ik)) {
+        items = append(items, self.xp[rk_last(ik)])
+    } else {
+        items = append(items, "")
+    }
+    items = append(items, "out")
+    items = append(items, format_int(len(edge_rows(self.xp[rk_out(ik)]))))
+    items = append(items, "facts")
+    items = append(items, format_int(len(edge_rows(self.xp[rk_fact(ik)]))))
+    items = append(items, "lease")
+    if self.lease_live(ik) == 1 {
+        items = append(items, self.xp[rk_tok(ik)])
+    } else {
+        items = append(items, "")
+    }
+    return r_array_bulks(items)
+}

@@ -1,0 +1,927 @@
+pack bonodis
+
+fn pack_floats(xs: []float) -> string {
+    let b = str_builder()
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 {
+            builder_write(b, ",")
+        }
+        builder_write(b, format_float(xs[i], 6))
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn unpack_floats(s: string) -> []float {
+    let none: []float = []
+    if str_len(s) == 0 {
+        return none
+    }
+    let parts = str_split(s, ",")
+    let mut out = make([]float, 0, len(parts))
+    let mut i = 0
+    while i < len(parts) {
+        if str_len(parts[i]) > 0 {
+            out = append(out, parse_float(parts[i]))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn parse_float_args(argv: []string, start: int) -> []float {
+    let none: []float = []
+    if start >= len(argv) {
+        return none
+    }
+    let mut out = make([]float, 0, len(argv) - start)
+    let mut i = start
+    while i < len(argv) {
+        out = append(out, parse_float(argv[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_norm(xs: []float) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(xs) {
+        s = s + xs[i] * xs[i]
+        i = i + 1
+    }
+    if s <= 0.0 {
+        return 0.0
+    }
+    return math_sqrt(s)
+}
+
+fn vec_cosine(a: []float, b: []float) -> float {
+    if len(a) == 0 or len(a) != len(b) {
+        return 0.0
+    }
+    let mut dot = 0.0
+    let mut i = 0
+    while i < len(a) {
+        dot = dot + a[i] * b[i]
+        i = i + 1
+    }
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    if na <= 0.0 or nb <= 0.0 {
+        return 0.0
+    }
+    return dot / (na * nb)
+}
+
+fn token_overlap(query: string, doc: string) -> float {
+    let q = str_fields(str_to_lower(query))
+    if len(q) == 0 or str_len(doc) == 0 {
+        return 0.0
+    }
+    let d = str_to_lower(doc)
+    let mut hits = 0
+    let mut i = 0
+    while i < len(q) {
+        if str_len(q[i]) > 0 and str_contains(d, q[i]) {
+            hits = hits + 1
+        }
+        i = i + 1
+    }
+    return parse_float(format_int(hits)) / parse_float(format_int(len(q)))
+}
+
+fn json_esc(s: string) -> string {
+    let b = str_builder()
+    let mut i = 0
+    while i < str_len(s) {
+        let c = str_byte_at(s, i)
+        if c == 34 or c == 92 {
+            builder_write(b, "\\")
+            builder_write_byte(b, byte(c))
+        } else if c == 10 {
+            builder_write(b, "\\n")
+        } else if c == 13 {
+            builder_write(b, "\\r")
+        } else {
+            builder_write_byte(b, byte(c))
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn json_str(body: string, key: string) -> string {
+    let pat = "\"" + key + "\""
+    let i = str_index(body, pat)
+    if i < 0 {
+        return ""
+    }
+    let mut rest = body[i + str_len(pat):]
+    let c = str_index(rest, ":")
+    if c < 0 {
+        return ""
+    }
+    rest = rest[c + 1:]
+    let mut j = 0
+    while j < str_len(rest) {
+        let ch = str_byte_at(rest, j)
+        if ch != 32 and ch != 9 and ch != 10 and ch != 13 {
+            break
+        }
+        j = j + 1
+    }
+    rest = rest[j:]
+    if str_len(rest) == 0 {
+        return ""
+    }
+    if str_byte_at(rest, 0) != 34 {
+        let mut k = 0
+        while k < str_len(rest) {
+            let ch = str_byte_at(rest, k)
+            if ch == 44 or ch == 125 or ch == 93 or ch == 32 {
+                break
+            }
+            k = k + 1
+        }
+        return rest[:k]
+    }
+    let mut k = 1
+    while k < str_len(rest) {
+        if str_byte_at(rest, k) == 34 {
+            return rest[1:k]
+        }
+        if str_byte_at(rest, k) == 92 {
+            k = k + 1
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+fn json_int(body: string, key: string, fallback: int) -> int {
+    let s = json_str(body, key)
+    if str_len(s) == 0 {
+        return fallback
+    }
+    let n, ok = int_ok(s)
+    if ok == 0 {
+        return fallback
+    }
+    return n
+}
+
+fn json_vec(body: string, key: string) -> []float {
+    let none: []float = []
+    let pat = "\"" + key + "\""
+    let i = str_index(body, pat)
+    if i < 0 {
+        return none
+    }
+    let mut rest = body[i + str_len(pat):]
+    let lb = str_index(rest, "[")
+    if lb < 0 {
+        return none
+    }
+    rest = rest[lb + 1:]
+    let rb = str_index(rest, "]")
+    if rb < 0 {
+        return none
+    }
+    return unpack_floats(rest[:rb])
+}
+
+fn Store_ensure_vec(mut self: Store, ik: string, dim: int) -> int {
+    let t = self.kind(ik)
+    if t == T_NONE {
+        self.vecs[ik] = make(map[string]string)
+        self.vtxt[ik] = make(map[string]string)
+        self.vdim[ik] = dim
+        self.types[ik] = T_VEC
+        return 1
+    }
+    if t != T_VEC {
+        return 0
+    }
+    return 1
+}
+
+fn Store_cmd_vadd(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("vadd")
+    }
+    let ik = ikey(db, argv[1])
+    let elem = argv[2]
+    let xs = parse_float_args(argv, 3)
+    if len(xs) == 0 {
+        return r_err("ERR vector is empty")
+    }
+    if self.ensure_vec(ik, len(xs)) == 0 {
+        return r_wrongtype()
+    }
+    let mut dim = self.vdim[ik]
+    if dim == 0 {
+        self.vdim[ik] = len(xs)
+        dim = len(xs)
+    }
+    if dim != len(xs) {
+        return r_err("ERR vector dimension mismatch")
+    }
+    let mut v = self.vecs[ik]
+    let mut added = 1
+    if has(v, elem) {
+        added = 0
+    }
+    v[elem] = pack_floats(xs)
+    self.vecs[ik] = v
+    return r_int(added)
+}
+
+fn Store_cmd_vattr(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("vattr")
+    }
+    let ik = ikey(db, argv[1])
+    if self.ensure_vec(ik, 0) == 0 {
+        return r_wrongtype()
+    }
+    let mut t = self.vtxt[ik]
+    t[argv[2]] = argv[3]
+    self.vtxt[ik] = t
+    return r_ok()
+}
+
+fn Store_cmd_vgetattr(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("vgetattr")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_nil()
+    }
+    if t != T_VEC {
+        return r_wrongtype()
+    }
+    if not has(self.vtxt[ik], argv[2]) {
+        return r_nil()
+    }
+    return r_bulk(self.vtxt[ik][argv[2]])
+}
+
+fn Store_cmd_vrem(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("vrem")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_VEC {
+        return r_wrongtype()
+    }
+    let mut v = self.vecs[ik]
+    if not has(v, argv[2]) {
+        return r_int(0)
+    }
+    delete(v, argv[2])
+    self.vecs[ik] = v
+    if has(self.vtxt[ik], argv[2]) {
+        let mut tx = self.vtxt[ik]
+        delete(tx, argv[2])
+        self.vtxt[ik] = tx
+    }
+    if len(v) == 0 {
+        let _ = self.drop_key(ik)
+    }
+    return r_int(1)
+}
+
+fn Store_cmd_vcard(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("vcard")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_VEC {
+        return r_wrongtype()
+    }
+    return r_int(len(self.vecs[ik]))
+}
+
+fn Store_cmd_vdim(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("vdim")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_VEC {
+        return r_wrongtype()
+    }
+    return r_int(self.vdim[ik])
+}
+
+fn Store_vsim_rank(mut self: Store, ik: string, query: []float, qtext: string, topk: int) -> ([]string, []float) {
+    let none_s: []string = []
+    let none_f: []float = []
+    if not has(self.vecs, ik) {
+        return (none_s, none_f)
+    }
+    let v = self.vecs[ik]
+    let mut ids = make([]string, 0, 8)
+    let mut sc = make([]float, 0, 8)
+    for elem, packed in range v {
+        let mut s = 0.0
+        if len(query) > 0 {
+            s = vec_cosine(query, unpack_floats(packed))
+        }
+        if str_len(qtext) > 0 and has(self.vtxt[ik], elem) {
+            let ts = token_overlap(qtext, self.vtxt[ik][elem])
+            if ts > s {
+                s = ts
+            }
+            if len(query) > 0 {
+                s = 0.7 * vec_cosine(query, unpack_floats(packed)) + 0.3 * ts
+            }
+        }
+        ids = append(ids, elem)
+        sc = append(sc, s)
+    }
+    let n = len(ids)
+    let mut passes = n
+    if topk > 0 and topk < n {
+        passes = topk
+    }
+    let mut i = 0
+    while i < passes {
+        let mut j = 0
+        while j < n - 1 - i {
+            if sc[j] < sc[j + 1] {
+                let tm = ids[j]
+                ids[j] = ids[j + 1]
+                ids[j + 1] = tm
+                let ts = sc[j]
+                sc[j] = sc[j + 1]
+                sc[j + 1] = ts
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return (ids, sc)
+}
+
+fn Store_cmd_vsim(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("vsim")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let none: []string = []
+    if t == T_NONE {
+        return r_array_bulks(none)
+    }
+    if t != T_VEC {
+        return r_wrongtype()
+    }
+    let mut count = 5
+    let mut withscores = 0
+    let mut qi = 2
+    while qi < len(argv) {
+        let o = str_to_upper(argv[qi])
+        if str_eq(o, "COUNT") and qi + 1 < len(argv) {
+            let n, ok = int_ok(argv[qi + 1])
+            if ok == 1 and n > 0 {
+                count = n
+            }
+            qi = qi + 2
+        } else if str_eq(o, "WITHSCORES") {
+            withscores = 1
+            qi = qi + 1
+        } else {
+            break
+        }
+    }
+    let q = parse_float_args(argv, qi)
+    let ids, sc = self.vsim_rank(ik, q, "", count)
+    if count > len(ids) {
+        count = len(ids)
+    }
+    let mut out = make([]string, 0, count * 2)
+    let mut i = 0
+    while i < count {
+        out = append(out, ids[i])
+        if withscores == 1 {
+            out = append(out, format_float(sc[i], 4))
+        }
+        i = i + 1
+    }
+    return r_array_bulks(out)
+}
+
+fn Store_cmd_brain(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("brain")
+    }
+    let sub = str_to_upper(argv[1])
+    if str_eq(sub, "HELP") {
+        let mut items = make([]string, 0, 10)
+        items = append(items, "BRAIN REMEMBER ns id text [f1 f2 ...]")
+        items = append(items, "BRAIN RECALL ns [COUNT k] [QUERY text] [f1 f2 ...]")
+        items = append(items, "BRAIN SAY session role content")
+        items = append(items, "BRAIN CONTEXT session [COUNT n]")
+        items = append(items, "BRAIN PACK session ns [COUNT n] [QUERY text] [f1 f2 ...]")
+        items = append(items, "BRAIN CACHE SET hash response")
+        items = append(items, "BRAIN CACHE GET hash")
+        items = append(items, "BRAIN COMPACT ns")
+        items = append(items, "BRAIN TURN session ns [QUERY text] [COUNT n]")
+        return r_array_bulks(items)
+    }
+    if str_eq(sub, "REMEMBER") {
+        if len(argv) < 5 {
+            return r_arity("brain")
+        }
+        let ns = argv[2]
+        let id = argv[3]
+        let text = argv[4]
+        let xs = parse_float_args(argv, 5)
+        let ik = ikey(db, ns)
+        if self.ensure_vec(ik, len(xs)) == 0 {
+            return r_wrongtype()
+        }
+        if len(xs) > 0 {
+            if self.vdim[ik] == 0 {
+                self.vdim[ik] = len(xs)
+            }
+            if self.vdim[ik] != len(xs) {
+                return r_err("ERR vector dimension mismatch")
+            }
+            let mut v = self.vecs[ik]
+            v[id] = pack_floats(xs)
+            self.vecs[ik] = v
+        } else {
+            let mut v = self.vecs[ik]
+            if not has(v, id) {
+                v[id] = ""
+            }
+            self.vecs[ik] = v
+        }
+        let mut tx = self.vtxt[ik]
+        tx[id] = text
+        self.vtxt[ik] = tx
+        return r_ok()
+    }
+    if str_eq(sub, "RECALL") {
+        if len(argv) < 3 {
+            return r_arity("brain")
+        }
+        let ns = argv[2]
+        let ik = ikey(db, ns)
+        let t = self.kind(ik)
+        let none: []string = []
+        if t == T_NONE {
+            return r_array_bulks(none)
+        }
+        if t != T_VEC {
+            return r_wrongtype()
+        }
+        let mut count = 5
+        let mut qtext = ""
+        let mut qi = 3
+        while qi < len(argv) {
+            let o = str_to_upper(argv[qi])
+            if str_eq(o, "COUNT") and qi + 1 < len(argv) {
+                let n, ok = int_ok(argv[qi + 1])
+                if ok == 1 and n > 0 {
+                    count = n
+                }
+                qi = qi + 2
+            } else if str_eq(o, "QUERY") and qi + 1 < len(argv) {
+                qtext = argv[qi + 1]
+                qi = qi + 2
+            } else {
+                break
+            }
+        }
+        let q = parse_float_args(argv, qi)
+        let ids, sc = self.vsim_rank(ik, q, qtext, count)
+        if count > len(ids) {
+            count = len(ids)
+        }
+        let mut out = make([]string, 0, count * 3)
+        let mut i = 0
+        while i < count {
+            out = append(out, ids[i])
+            out = append(out, format_float(sc[i], 4))
+            let mut txt = ""
+            if has(self.vtxt[ik], ids[i]) {
+                txt = self.vtxt[ik][ids[i]]
+            }
+            out = append(out, txt)
+            i = i + 1
+        }
+        return r_array_bulks(out)
+    }
+    if str_eq(sub, "SAY") {
+        if len(argv) != 5 {
+            return r_arity("brain")
+        }
+        return self.cmd_lpush(db, ["RPUSH", argv[2], argv[3] + "\t" + argv[4]], 1)
+    }
+    if str_eq(sub, "CONTEXT") {
+        if len(argv) < 3 {
+            return r_arity("brain")
+        }
+        let mut n = 20
+        if len(argv) >= 5 and str_eq(str_to_upper(argv[3]), "COUNT") {
+            let c, ok = int_ok(argv[4])
+            if ok == 1 and c > 0 {
+                n = c
+            }
+        }
+        return self.cmd_lrange(db, ["LRANGE", argv[2], format_int(0 - n), "-1"])
+    }
+    if str_eq(sub, "PACK") {
+        if len(argv) < 4 {
+            return r_arity("brain")
+        }
+        let session = argv[2]
+        let ns = argv[3]
+        let mut count = 8
+        let mut qtext = ""
+        let mut qi = 4
+        while qi < len(argv) {
+            let o = str_to_upper(argv[qi])
+            if str_eq(o, "COUNT") and qi + 1 < len(argv) {
+                let n, ok = int_ok(argv[qi + 1])
+                if ok == 1 and n > 0 {
+                    count = n
+                }
+                qi = qi + 2
+            } else if str_eq(o, "QUERY") and qi + 1 < len(argv) {
+                qtext = argv[qi + 1]
+                qi = qi + 2
+            } else {
+                break
+            }
+        }
+        let q = parse_float_args(argv, qi)
+        let b = str_builder()
+        let nik = ikey(db, ns)
+        let sik = ikey(db, session)
+        if self.kind(nik) == T_VEC {
+            let ids, sc = self.vsim_rank(nik, q, qtext, count)
+            let mut take = count
+            if take > len(ids) {
+                take = len(ids)
+            }
+            if take > 0 {
+                builder_write(b, "# memories\n")
+                let mut i = 0
+                while i < take {
+                    builder_write(b, "- (")
+                    builder_write(b, format_float(sc[i], 3))
+                    builder_write(b, ") ")
+                    if has(self.vtxt[nik], ids[i]) {
+                        builder_write(b, self.vtxt[nik][ids[i]])
+                    } else {
+                        builder_write(b, ids[i])
+                    }
+                    builder_write(b, "\n")
+                    i = i + 1
+                }
+            }
+        }
+        if self.kind(sik) == T_LIST {
+            let xs = self.lists[sik]
+            if len(xs) > 0 {
+                builder_write(b, "# conversation\n")
+                let mut start = len(xs) - 20
+                if start < 0 {
+                    start = 0
+                }
+                let mut i = start
+                while i < len(xs) {
+                    builder_write(b, xs[i])
+                    builder_write(b, "\n")
+                    i = i + 1
+                }
+            }
+        }
+        let erows = edge_rows(self.xp[rk_out(sik)])
+        let frows = edge_rows(self.xp[rk_fact(sik)])
+        if len(erows) > 0 or len(frows) > 0 {
+            builder_write(b, "# related\n")
+            let mut ei = 0
+            while ei < len(erows) {
+                builder_write(b, session)
+                builder_write(b, " -")
+                builder_write(b, edge_ty(erows[ei]))
+                builder_write(b, "-> ")
+                builder_write(b, edge_nb(erows[ei]))
+                builder_write(b, "\n")
+                ei = ei + 1
+            }
+            ei = 0
+            while ei < len(frows) {
+                builder_write(b, session)
+                builder_write(b, " ")
+                builder_write(b, edge_nb(frows[ei]))
+                builder_write(b, " ")
+                builder_write(b, edge_ty(frows[ei]))
+                builder_write(b, "\n")
+                ei = ei + 1
+            }
+        }
+        return r_bulk(builder_string(b))
+    }
+    if str_eq(sub, "TURN") {
+        if len(argv) < 4 {
+            return r_arity("brain")
+        }
+        let mut targv = make([]string, 0, len(argv))
+        targv = append(targv, "TURN")
+        let mut ti = 2
+        while ti < len(argv) {
+            targv = append(targv, argv[ti])
+            ti = ti + 1
+        }
+        return self.cmd_turn(db, targv)
+    }
+    if str_eq(sub, "COMPACT") {
+        if len(argv) < 3 {
+            return r_arity("brain")
+        }
+        return self.cmd_brain_compact(db, argv[2])
+    }
+    if str_eq(sub, "CACHE") {
+        if len(argv) < 4 {
+            return r_arity("brain")
+        }
+        let op = str_to_upper(argv[2])
+        if str_eq(op, "SET") {
+            if len(argv) != 5 {
+                return r_arity("brain")
+            }
+            return self.cmd_hset(db, ["HSET", "brain:cache", argv[3], argv[4]], 0)
+        }
+        if str_eq(op, "GET") {
+            return self.cmd_hget(db, ["HGET", "brain:cache", argv[3]])
+        }
+        return r_syntax()
+    }
+    return r_err("ERR unknown BRAIN subcommand")
+}
+
+fn http_req_method(raw: string) -> string {
+    let sp = str_index(raw, " ")
+    if sp <= 0 {
+        return "GET"
+    }
+    return str_to_upper(raw[:sp])
+}
+
+fn http_req_body(raw: string) -> string {
+    let i = str_index(raw, "\r\n\r\n")
+    if i < 0 {
+        return ""
+    }
+    return raw[i + 4:]
+}
+
+fn http_json(status: int, body: string) -> string {
+    let mut reason = "OK"
+    if status == 404 {
+        reason = "Not Found"
+    }
+    if status == 400 {
+        reason = "Bad Request"
+    }
+    if status == 401 {
+        reason = "Unauthorized"
+    }
+    if status == 204 {
+        reason = "No Content"
+    }
+    let b = str_builder()
+    builder_write(b, "HTTP/1.1 ")
+    builder_write(b, format_int(status))
+    builder_write(b, " ")
+    builder_write(b, reason)
+    builder_write(b, "\r\nContent-Type: application/json\r\n")
+    builder_write(b, "Access-Control-Allow-Origin: *\r\n")
+    builder_write(b, "Access-Control-Allow-Headers: Content-Type, Authorization, X-Bonodis-Auth\r\n")
+    builder_write(b, "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
+    builder_write(b, "Content-Length: ")
+    builder_write(b, format_int(str_len(body)))
+    builder_write(b, "\r\nConnection: close\r\n\r\n")
+    builder_write(b, body)
+    return builder_string(b)
+}
+
+fn brain_http(raw: string, bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int) -> string {
+    let path = http_req_path(raw)
+    let qpos = str_index(path, "?")
+    let mut p = path
+    let mut qs = ""
+    if qpos >= 0 {
+        p = path[:qpos]
+        qs = path[qpos + 1:]
+    }
+    let method = http_req_method(raw)
+    let body = http_req_body(raw)
+    if str_eq(p, "/health") or str_eq(p, "/brain/health") {
+        return http_json(200, "{\"ok\":true,\"service\":\"bonodis\"}")
+    }
+    if str_eq(p, "/brain") or str_eq(p, "/brain/help") {
+        return http_json(200, "{\"ok\":true,\"commands\":[\"remember\",\"recall\",\"say\",\"context\",\"pack\",\"cache\",\"compact\"]}")
+    }
+    if str_eq(p, "/brain/remember") and str_eq(method, "POST") {
+        let ns = json_str(body, "ns")
+        let id = json_str(body, "id")
+        let text = json_str(body, "text")
+        if str_len(ns) == 0 or str_len(id) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"ns and id required\"}")
+        }
+        let mut argv = make([]string, 0, 8)
+        argv = append(argv, "BRAIN")
+        argv = append(argv, "REMEMBER")
+        argv = append(argv, ns)
+        argv = append(argv, id)
+        argv = append(argv, text)
+        let vec = json_vec(body, "vector")
+        let mut i = 0
+        while i < len(vec) {
+            argv = append(argv, format_float(vec[i], 6))
+            i = i + 1
+        }
+        let r = dispatch(bus, replies, ids, shards, 0, argv)
+        if str_has_prefix(r, "-") {
+            return http_json(400, "{\"ok\":false,\"error\":\"" + json_esc(reply_head(r)) + "\"}")
+        }
+        return http_json(200, "{\"ok\":true}")
+    }
+    if str_eq(p, "/brain/recall") and str_eq(method, "POST") {
+        let ns = json_str(body, "ns")
+        if str_len(ns) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"ns required\"}")
+        }
+        let mut argv = make([]string, 0, 8)
+        argv = append(argv, "BRAIN")
+        argv = append(argv, "RECALL")
+        argv = append(argv, ns)
+        argv = append(argv, "COUNT")
+        argv = append(argv, format_int(json_int(body, "k", 5)))
+        let q = json_str(body, "query")
+        if str_len(q) > 0 {
+            argv = append(argv, "QUERY")
+            argv = append(argv, q)
+        }
+        let vec = json_vec(body, "vector")
+        let mut i = 0
+        while i < len(vec) {
+            argv = append(argv, format_float(vec[i], 6))
+            i = i + 1
+        }
+        let r = dispatch(bus, replies, ids, shards, 0, argv)
+        return brain_http_recall_json(r)
+    }
+    if str_eq(p, "/brain/say") and str_eq(method, "POST") {
+        let sess = json_str(body, "session")
+        let role = json_str(body, "role")
+        let content = json_str(body, "content")
+        if str_len(sess) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"session required\"}")
+        }
+        let r = dispatch(bus, replies, ids, shards, 0, ["BRAIN", "SAY", sess, role, content])
+        if str_has_prefix(r, "-") {
+            return http_json(400, "{\"ok\":false,\"error\":\"" + json_esc(reply_head(r)) + "\"}")
+        }
+        return http_json(200, "{\"ok\":true}")
+    }
+    if str_eq(p, "/brain/context") {
+        let mut sess = json_str(body, "session")
+        if str_len(sess) == 0 {
+            sess = json_str(qs, "session")
+        }
+        if str_len(sess) == 0 {
+            let tag = "session="
+            let si = str_index(qs, tag)
+            if si >= 0 {
+                sess = qs[si + str_len(tag):]
+                let amp = str_index(sess, "&")
+                if amp >= 0 {
+                    sess = sess[:amp]
+                }
+            }
+        }
+        if str_len(sess) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"session required\"}")
+        }
+        let r = dispatch(bus, replies, ids, shards, 0, ["BRAIN", "CONTEXT", sess, "COUNT", "20"])
+        let items = parse_array_bulks(r)
+        let b = str_builder()
+        builder_write(b, "{\"ok\":true,\"messages\":[")
+        let mut i = 0
+        while i < len(items) {
+            if i > 0 {
+                builder_write(b, ",")
+            }
+            builder_write(b, "\"")
+            builder_write(b, json_esc(items[i]))
+            builder_write(b, "\"")
+            i = i + 1
+        }
+        builder_write(b, "]}")
+        return http_json(200, builder_string(b))
+    }
+    if str_eq(p, "/brain/pack") and str_eq(method, "POST") {
+        let sess = json_str(body, "session")
+        let ns = json_str(body, "ns")
+        if str_len(sess) == 0 or str_len(ns) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"session and ns required\"}")
+        }
+        let mut argv = make([]string, 0, 8)
+        argv = append(argv, "BRAIN")
+        argv = append(argv, "PACK")
+        argv = append(argv, sess)
+        argv = append(argv, ns)
+        argv = append(argv, "COUNT")
+        argv = append(argv, format_int(json_int(body, "k", 8)))
+        let q = json_str(body, "query")
+        if str_len(q) > 0 {
+            argv = append(argv, "QUERY")
+            argv = append(argv, q)
+        }
+        let r = dispatch(bus, replies, ids, shards, 0, argv)
+        let text = bulk_payload(r)
+        return http_json(200, "{\"ok\":true,\"text\":\"" + json_esc(text) + "\"}")
+    }
+    if str_eq(p, "/brain/cache") and str_eq(method, "POST") {
+        let h = json_str(body, "hash")
+        let resp = json_str(body, "response")
+        if str_len(h) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"hash required\"}")
+        }
+        let r = dispatch(bus, replies, ids, shards, 0, ["BRAIN", "CACHE", "SET", h, resp])
+        if str_has_prefix(r, "-") {
+            return http_json(400, "{\"ok\":false,\"error\":\"" + json_esc(reply_head(r)) + "\"}")
+        }
+        return http_json(200, "{\"ok\":true}")
+    }
+    if str_eq(p, "/brain/cache") {
+        let mut h = json_str(body, "hash")
+        if str_len(h) == 0 {
+            let tag = "hash="
+            let si = str_index(qs, tag)
+            if si >= 0 {
+                h = qs[si + str_len(tag):]
+                let amp = str_index(h, "&")
+                if amp >= 0 {
+                    h = h[:amp]
+                }
+            }
+        }
+        let r = dispatch(bus, replies, ids, shards, 0, ["BRAIN", "CACHE", "GET", h])
+        if str_has_prefix(r, "$-1") {
+            return http_json(200, "{\"ok\":true,\"hit\":false}")
+        }
+        return http_json(200, "{\"ok\":true,\"hit\":true,\"response\":\"" + json_esc(bulk_payload(r)) + "\"}")
+    }
+    return ""
+}
+
+fn brain_http_recall_json(r: string) -> string {
+    if str_has_prefix(r, "-") {
+        return http_json(400, "{\"ok\":false,\"error\":\"" + json_esc(reply_head(r)) + "\"}")
+    }
+    let items = parse_array_bulks(r)
+    let b = str_builder()
+    builder_write(b, "{\"ok\":true,\"items\":[")
+    let mut i = 0
+    let mut n = 0
+    while i + 2 < len(items) {
+        if n > 0 {
+            builder_write(b, ",")
+        }
+        builder_write(b, "{\"id\":\"")
+        builder_write(b, json_esc(items[i]))
+        builder_write(b, "\",\"score\":")
+        builder_write(b, items[i + 1])
+        builder_write(b, ",\"text\":\"")
+        builder_write(b, json_esc(items[i + 2]))
+        builder_write(b, "\"}")
+        i = i + 3
+        n = n + 1
+    }
+    builder_write(b, "]}")
+    return http_json(200, builder_string(b))
+}

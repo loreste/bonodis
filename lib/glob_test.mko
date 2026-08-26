@@ -1,0 +1,18 @@
+fn TestGlobStar() {
+    assert_eq(glob_match("*", "abc"), 1)
+    assert_eq(glob_match("a*", "abc"), 1)
+    assert_eq(glob_match("a*", "b"), 0)
+    assert_eq(glob_match("*c", "abc"), 1)
+    assert_eq(glob_match("a*c", "abbbc"), 1)
+}
+
+fn TestGlobQ() {
+    assert_eq(glob_match("a?c", "abc"), 1)
+    assert_eq(glob_match("a?c", "ac"), 0)
+    assert_eq(glob_match("??", "ab"), 1)
+}
+
+fn TestGlobExact() {
+    assert_eq(glob_match("user:1", "user:1"), 1)
+    assert_eq(glob_match("user:1", "user:2"), 0)
+}

@@ -1,0 +1,245 @@
+pack bonodis
+
+fn repl_publish(feed: CMap, db: int, argv: []string, reply: string) {
+    if int_of(cmap_get(feed, "nrepl")) <= 0 {
+        return
+    }
+    if str_has_prefix(reply, "-") {
+        return
+    }
+    if is_write_cmd(cmd_name(argv)) == 0 {
+        return
+    }
+    let off = int_of(cmap_get(feed, "off"))
+    cmap_set(feed, "e" + format_int(off % 4096), format_int(db) + "\n" + encode_array(argv))
+    cmap_set(feed, "off", format_int(off + 1))
+}
+
+fn replica_drop(feed: CMap) {
+    let mut n = int_of(cmap_get(feed, "nrepl")) - 1
+    if n < 0 {
+        n = 0
+    }
+    cmap_set(feed, "nrepl", format_int(n))
+}
+
+fn replica_serve(fd: int, feed: CMap, stop: AtomicInt, tls_on: int, tc: TlsConn) -> int {
+    cmap_set(feed, "nrepl", format_int(int_of(cmap_get(feed, "nrepl")) + 1))
+    let mut off = int_of(cmap_get(feed, "off"))
+    let mut last_db = 0
+    let _ = tcp_set_timeout(fd, 500)
+    while shutdown_requested() == 0 and atomic_load(stop) == 0 {
+        let cur = int_of(cmap_get(feed, "off"))
+        if cur < off {
+            off = cur
+        }
+        let mut dead = 0
+        while off < cur {
+            let rec = cmap_get(feed, "e" + format_int(off % 4096))
+            let nl = str_index(rec, "\n")
+            if nl > 0 {
+                let db = int_of(rec[:nl])
+                let body = rec[nl + 1:]
+                if db != last_db {
+                    let wn = conn_write(fd, tls_on, tc, encode_array(["SELECT", format_int(db)]))
+                    if wn < 0 {
+                        dead = 1
+                        break
+                    }
+                    last_db = db
+                }
+                let wn = conn_write(fd, tls_on, tc, body)
+                if wn < 0 {
+                    dead = 1
+                    break
+                }
+            }
+            off = off + 1
+        }
+        if dead == 1 {
+            break
+        }
+        sleep_ms(5)
+    }
+    replica_drop(feed)
+    return 0
+}
+
+fn psync_dump(fd: int, bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, tls_on: int, tc: TlsConn) -> int {
+    let mut db = 0
+    while db < 16 {
+        let r = dispatch(bus, replies, ids, shards, db, ["EXPORT"])
+        let payload = bulk_payload(r)
+        if str_len(payload) > 0 {
+            if db != 0 {
+                let n = conn_write(fd, tls_on, tc, encode_array(["SELECT", format_int(db)]))
+                if n < 0 {
+                    return 0
+                }
+            }
+            let n = conn_write(fd, tls_on, tc, payload)
+            if n < 0 {
+                return 0
+            }
+        }
+        db = db + 1
+    }
+    return 1
+}
+
+fn replica_ingest(fd: int, tls_on: int, tc: TlsConn, bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, replcfg: CMap, stop: AtomicInt) -> int {
+    let mut buf = ""
+    let mut db = 0
+    let mut empty = 0
+    while shutdown_requested() == 0 and atomic_load(stop) == 0 {
+        if str_len(cmap_get(replcfg, "master_host")) == 0 {
+            break
+        }
+        let chunk = conn_read(fd, tls_on, tc)
+        if str_len(chunk) == 0 {
+            empty = empty + 1
+            if empty > 6 {
+                slog_with("debug", "replica read idle", "host", cmap_get(replcfg, "master_host"))
+                break
+            }
+            continue
+        }
+        empty = 0
+        buf = buf + chunk
+        if str_len(buf) > MAX_QUERY_BUF {
+            buf = ""
+            break
+        }
+        while str_len(buf) > 0 {
+            if str_byte_at(buf, 0) == 43 or str_byte_at(buf, 0) == 45 {
+                let cr = find_crlf(buf, 0)
+                if cr < 0 {
+                    break
+                }
+                buf = buf[cr + 2:]
+                continue
+            }
+            let argv, used, st = parse_cmd(buf)
+            if st == 0 {
+                break
+            }
+            if st < 0 {
+                buf = ""
+                break
+            }
+            buf = buf[used:]
+            let cmd = cmd_name(argv)
+            if str_eq(cmd, "SELECT") {
+                if len(argv) >= 2 {
+                    db = int_of(argv[1])
+                }
+                log_replica_apply("SELECT", db)
+            } else {
+                log_replica_apply(cmd, db)
+                let _ = dispatch(bus, replies, ids, shards, db, argv)
+            }
+        }
+    }
+    return empty
+}
+
+fn replica_worker(s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string], replies: CMap, ids: AtomicInt, shards: int, replcfg: CMap, stop: AtomicInt, clus: CMap) -> int {
+    let bus = pack_bus(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15)
+    let mut fails = 0
+    while shutdown_requested() == 0 and atomic_load(stop) == 0 {
+        let host = cmap_get(replcfg, "master_host")
+        if str_len(host) == 0 {
+            cmap_set(replcfg, "role", "master")
+            fails = 0
+            sleep_ms(50)
+            continue
+        }
+        let port = int_of(cmap_get(replcfg, "master_port"))
+        cmap_set(replcfg, "role", "slave")
+        log_replica_connecting(host, port)
+        let tls_on = cfg_tls_on(replcfg)
+        let mut fd = -1
+        let mut tc = dummy_tls_conn()
+        if tls_on == 1 {
+            let pfd, ptc, pcli = peer_open(host, port, 1, cfg_tls_ca(replcfg))
+            if pfd < 0 {
+                peer_close(pfd, 0, ptc, pcli)
+                log_replica_connect_fail(host, port)
+                fails = fails + 1
+                if str_eq(cmap_get(clus, "on"), "1") {
+                    let _ = cluster_follow_new_master(clus, replcfg)
+                    if str_eq(cmap_get(replcfg, "autofail"), "1") and fails >= 15 {
+                        let _ = cluster_try_autofailover(clus, replcfg)
+                    }
+                } else {
+                    if str_eq(cmap_get(replcfg, "autofail"), "1") and fails >= 15 {
+                        cmap_set(replcfg, "master_host", "")
+                        cmap_set(replcfg, "master_port", "0")
+                        cmap_set(replcfg, "role", "master")
+                        slog_info("auto-failover: replica promoted (standalone)")
+                    }
+                }
+                sleep_ms(200)
+                continue
+            }
+            fd = pfd
+            tc = ptc
+            let n = conn_write(fd, 1, tc, encode_array(["PSYNC", "?", "-1"]))
+            if n < 0 {
+                log_replica_disconnect("psync write")
+                peer_close(fd, 1, tc, pcli)
+                sleep_ms(200)
+                continue
+            }
+            fails = 0
+            log_replica_psync(host, port)
+            let empty = replica_ingest(fd, 1, tc, bus, replies, ids, shards, replcfg, stop)
+            if empty <= 6 {
+                log_replica_disconnect("stream closed")
+            }
+            peer_close(fd, 1, tc, pcli)
+            sleep_ms(200)
+            continue
+        }
+        fd = tcp_connect(host, port)
+        if fd < 0 {
+            log_replica_connect_fail(host, port)
+            fails = fails + 1
+            if str_eq(cmap_get(clus, "on"), "1") {
+                let _ = cluster_follow_new_master(clus, replcfg)
+                if str_eq(cmap_get(replcfg, "autofail"), "1") and fails >= 15 {
+                    let _ = cluster_try_autofailover(clus, replcfg)
+                }
+            } else {
+                if str_eq(cmap_get(replcfg, "autofail"), "1") and fails >= 15 {
+                    cmap_set(replcfg, "master_host", "")
+                    cmap_set(replcfg, "master_port", "0")
+                    cmap_set(replcfg, "role", "master")
+                    slog_info("auto-failover: replica promoted (standalone)")
+                }
+            }
+            sleep_ms(200)
+            continue
+        }
+        let _ = tcp_nodelay(fd)
+        let _ = tcp_set_timeout(fd, 500)
+        let n = tcp_write_all(fd, encode_array(["PSYNC", "?", "-1"]))
+        if n < 0 {
+            log_replica_disconnect("psync write")
+            let _ = tcp_close(fd)
+            sleep_ms(200)
+            continue
+        }
+        fails = 0
+        log_replica_psync(host, port)
+        let empty = replica_ingest(fd, 0, tc, bus, replies, ids, shards, replcfg, stop)
+        if empty <= 6 {
+            log_replica_disconnect("stream closed")
+        }
+        let _ = tcp_close(fd)
+        sleep_ms(200)
+    }
+    cmap_set(replcfg, "role", "master")
+    log_replica_stop()
+    return 0
+}

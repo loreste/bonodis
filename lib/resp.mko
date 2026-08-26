@@ -1,0 +1,543 @@
+pack bonodis
+
+// RESP2 codec. Commands are arrays of bulk strings (or the inline telnet form).
+
+fn int_of(s: string) -> int {
+    match parse_int(s) {
+        Ok(n) => n,
+        Err(_) => 0,
+    }
+}
+
+fn int_ok(s: string) -> (int, int) {
+    match parse_int(s) {
+        Ok(n) => (n, 1),
+        Err(_) => (0, 0),
+    }
+}
+
+fn find_crlf(buf: string, pos: int) -> int {
+    let n = str_len(buf)
+    if pos < 0 or pos >= n {
+        return -1
+    }
+    return str_slice_index(buf, pos, n - pos, "\r\n")
+}
+
+fn find_nl(s: string, pos: int) -> int {
+    let n = str_len(s)
+    if pos < 0 or pos >= n {
+        return -1
+    }
+    return str_slice_index(s, pos, n - pos, "\n")
+}
+
+fn r_ok() -> string {
+    return "+OK\r\n"
+}
+
+fn r_pong() -> string {
+    return "+PONG\r\n"
+}
+
+fn r_queued() -> string {
+    return "+QUEUED\r\n"
+}
+
+fn r_nil() -> string {
+    return "$-1\r\n"
+}
+
+fn r_null_arr() -> string {
+    return "*-1\r\n"
+}
+
+fn r_simple(s: string) -> string {
+    return "+" + s + "\r\n"
+}
+
+fn r_err(msg: string) -> string {
+    return "-" + msg + "\r\n"
+}
+
+// Strip CR/LF from client-supplied text before it is interpolated into a
+// single-line RESP reply. A bulk containing "\r\n" would otherwise desync
+// the reply stream (response splitting) and forge log lines.
+fn resp_safe(s: string) -> string {
+    if not str_contains(s, "\r") and not str_contains(s, "\n") {
+        return s
+    }
+    let b = str_builder()
+    let mut i = 0
+    while i < str_len(s) {
+        let c = str_byte_at(s, i)
+        if c == 13 or c == 10 {
+            builder_write(b, "?")
+        } else {
+            builder_write_byte(b, byte(c))
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn r_wrongtype() -> string {
+    return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+}
+
+fn r_arity(cmd: string) -> string {
+    return "-ERR wrong number of arguments for '" + resp_safe(cmd) + "' command\r\n"
+}
+
+fn r_syntax() -> string {
+    return "-ERR syntax error\r\n"
+}
+
+fn r_notint() -> string {
+    return "-ERR value is not an integer or out of range\r\n"
+}
+
+fn r_nokey() -> string {
+    return "-ERR no such key\r\n"
+}
+
+fn r_unknown(cmd: string) -> string {
+    return "-ERR unknown command '" + resp_safe(cmd) + "'\r\n"
+}
+
+fn r_int(n: int) -> string {
+    let b = str_builder()
+    builder_write(b, ":")
+    builder_write(b, format_int(n))
+    builder_write(b, "\r\n")
+    return builder_string(b)
+}
+
+fn r_bulk(s: string) -> string {
+    let b = str_builder()
+    builder_write(b, "$")
+    builder_write(b, format_int(str_len(s)))
+    builder_write(b, "\r\n")
+    builder_write(b, s)
+    builder_write(b, "\r\n")
+    return builder_string(b)
+}
+
+fn r_array_bulks(items: []string) -> string {
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(len(items)))
+    builder_write(b, "\r\n")
+    let mut i = 0
+    while i < len(items) {
+        builder_write(b, r_bulk(items[i]))
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn r_array_opt(items: []string, hit: []int) -> string {
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(len(items)))
+    builder_write(b, "\r\n")
+    let mut i = 0
+    while i < len(items) {
+        if i < len(hit) and hit[i] == 0 {
+            builder_write(b, r_nil())
+        } else {
+            builder_write(b, r_bulk(items[i]))
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+// Returns a []int with 1 for each null-bulk element in a RESP array.
+fn resp_nil_mask(resp: string) -> []int {
+    let none = make([]int, 0, 0)
+    let n = str_len(resp)
+    if n == 0 or str_byte_at(resp, 0) != 42 {
+        return none
+    }
+    let cr = find_crlf(resp, 0)
+    if cr < 2 {
+        return none
+    }
+    let argc = int_of(resp[1:cr])
+    let mut out = make([]int, 0, argc)
+    let mut pos = cr + 2
+    let mut i = 0
+    while i < argc and pos < n {
+        if str_byte_at(resp, pos) == 36 {
+            let cr2 = find_crlf(resp, pos)
+            if cr2 < 0 {
+                break
+            }
+            let ln = int_of(resp[pos + 1:cr2])
+            if ln < 0 {
+                out = append(out, 1)
+                pos = cr2 + 2
+            } else {
+                out = append(out, 0)
+                pos = cr2 + 2 + ln + 2
+            }
+        } else {
+            out = append(out, 0)
+            let cr2 = find_crlf(resp, pos)
+            if cr2 < 0 {
+                break
+            }
+            pos = cr2 + 2
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn r_scan(cursor: string, keys: []string) -> string {
+    let b = str_builder()
+    builder_write(b, "*2\r\n")
+    builder_write(b, r_bulk(cursor))
+    builder_write(b, r_array_bulks(keys))
+    return builder_string(b)
+}
+
+fn encode_array(argv: []string) -> string {
+    return r_array_bulks(argv)
+}
+
+// Parse one command from the head of buf.
+// status: 1 complete, 0 need more bytes, -1 protocol error
+fn parse_cmd(buf: string) -> ([]string, int, int) {
+    let empty: []string = []
+    let n = str_len(buf)
+    if n == 0 {
+        return (empty, 0, 0)
+    }
+    let c0 = str_byte_at(buf, 0)
+    if c0 == 42 {
+        return parse_resp_array(buf)
+    }
+    return parse_inline(buf)
+}
+
+fn parse_inline(buf: string) -> ([]string, int, int) {
+    let empty: []string = []
+    let cr = find_crlf(buf, 0)
+    if cr < 0 {
+        return (empty, 0, 0)
+    }
+    let line = buf[:cr]
+    let parts = str_fields(line)
+    if len(parts) == 0 {
+        return (empty, cr + 2, -1)
+    }
+    return (parts, cr + 2, 1)
+}
+
+fn parse_resp_array(buf: string) -> ([]string, int, int) {
+    let empty: []string = []
+    let cr = find_crlf(buf, 0)
+    if cr < 0 {
+        return (empty, 0, 0)
+    }
+    if cr < 2 {
+        return (empty, 0, -1)
+    }
+    let nstr = buf[1:cr]
+    let argc, aok = int_ok(nstr)
+    if aok == 0 {
+        return (empty, 0, -1)
+    }
+    if argc < 0 {
+        return (empty, 0, -1)
+    }
+    if argc > 4096 {
+        return (empty, 0, -1)
+    }
+    let mut pos = cr + 2
+    let mut argv = make([]string, 0, argc)
+    let mut i = 0
+    let n = str_len(buf)
+    while i < argc {
+        if pos >= n {
+            return (empty, 0, 0)
+        }
+        if str_byte_at(buf, pos) != 36 {
+            return (empty, 0, -1)
+        }
+        let cr2 = find_crlf(buf, pos)
+        if cr2 < 0 {
+            return (empty, 0, 0)
+        }
+        let lstr = buf[pos + 1:cr2]
+        let blen, bok = int_ok(lstr)
+        if bok == 0 {
+            return (empty, 0, -1)
+        }
+        pos = cr2 + 2
+        if blen == 0 - 1 {
+            argv = append(argv, "")
+            i = i + 1
+            continue
+        }
+        if blen < 0 {
+            return (empty, 0, -1)
+        }
+        if blen > MAX_BULK {
+            return (empty, 0, -1)
+        }
+        if pos + blen + 2 > n {
+            return (empty, 0, 0)
+        }
+        let bulk = buf[pos:pos + blen]
+        pos = pos + blen
+        if str_byte_at(buf, pos) != 13 or str_byte_at(buf, pos + 1) != 10 {
+            return (empty, 0, -1)
+        }
+        pos = pos + 2
+        argv = append(argv, bulk)
+        i = i + 1
+    }
+    return (argv, pos, 1)
+}
+
+fn cmd_name(argv: []string) -> string {
+    if len(argv) == 0 {
+        return ""
+    }
+    let s = argv[0]
+    let n = str_len(s)
+    if n == 3 {
+        if str_slice_ci_eq(s, 0, 3, "GET") == 1 {
+            return "GET"
+        }
+        if str_slice_ci_eq(s, 0, 3, "SET") == 1 {
+            return "SET"
+        }
+        if str_slice_ci_eq(s, 0, 3, "DEL") == 1 {
+            return "DEL"
+        }
+        if str_slice_ci_eq(s, 0, 3, "TTL") == 1 {
+            return "TTL"
+        }
+    } else if n == 4 {
+        if str_slice_ci_eq(s, 0, 4, "PING") == 1 {
+            return "PING"
+        }
+        if str_slice_ci_eq(s, 0, 4, "INCR") == 1 {
+            return "INCR"
+        }
+        if str_slice_ci_eq(s, 0, 4, "DECR") == 1 {
+            return "DECR"
+        }
+        if str_slice_ci_eq(s, 0, 4, "MGET") == 1 {
+            return "MGET"
+        }
+        if str_slice_ci_eq(s, 0, 4, "MSET") == 1 {
+            return "MSET"
+        }
+        if str_slice_ci_eq(s, 0, 4, "AUTH") == 1 {
+            return "AUTH"
+        }
+        if str_slice_ci_eq(s, 0, 4, "QUIT") == 1 {
+            return "QUIT"
+        }
+        if str_slice_ci_eq(s, 0, 4, "SCAN") == 1 {
+            return "SCAN"
+        }
+        if str_slice_ci_eq(s, 0, 4, "TYPE") == 1 {
+            return "TYPE"
+        }
+        if str_slice_ci_eq(s, 0, 4, "HGET") == 1 {
+            return "HGET"
+        }
+        if str_slice_ci_eq(s, 0, 4, "HSET") == 1 {
+            return "HSET"
+        }
+        if str_slice_ci_eq(s, 0, 4, "INFO") == 1 {
+            return "INFO"
+        }
+        if str_slice_ci_eq(s, 0, 4, "KEYS") == 1 {
+            return "KEYS"
+        }
+        if str_slice_ci_eq(s, 0, 4, "ECHO") == 1 {
+            return "ECHO"
+        }
+    } else if n == 5 {
+        if str_slice_ci_eq(s, 0, 5, "LPUSH") == 1 {
+            return "LPUSH"
+        }
+        if str_slice_ci_eq(s, 0, 5, "RPUSH") == 1 {
+            return "RPUSH"
+        }
+        if str_slice_ci_eq(s, 0, 5, "LPOP") == 1 {
+            return "LPOP"
+        }
+        if str_slice_ci_eq(s, 0, 5, "RPOP") == 1 {
+            return "RPOP"
+        }
+        if str_slice_ci_eq(s, 0, 5, "SADD") == 1 {
+            return "SADD"
+        }
+        if str_slice_ci_eq(s, 0, 5, "ZADD") == 1 {
+            return "ZADD"
+        }
+        if str_slice_ci_eq(s, 0, 5, "HELLO") == 1 {
+            return "HELLO"
+        }
+        if str_slice_ci_eq(s, 0, 5, "MULTI") == 1 {
+            return "MULTI"
+        }
+        if str_slice_ci_eq(s, 0, 5, "EXEC") == 1 {
+            return "EXEC"
+        }
+        if str_slice_ci_eq(s, 0, 5, "PTTL") == 1 {
+            return "PTTL"
+        }
+    } else if n == 6 {
+        if str_slice_ci_eq(s, 0, 6, "EXISTS") == 1 {
+            return "EXISTS"
+        }
+        if str_slice_ci_eq(s, 0, 6, "EXPIRE") == 1 {
+            return "EXPIRE"
+        }
+        if str_slice_ci_eq(s, 0, 6, "APPEND") == 1 {
+            return "APPEND"
+        }
+        if str_slice_ci_eq(s, 0, 6, "SELECT") == 1 {
+            return "SELECT"
+        }
+        if str_slice_ci_eq(s, 0, 6, "STRLEN") == 1 {
+            return "STRLEN"
+        }
+        if str_slice_ci_eq(s, 0, 6, "INCRBY") == 1 {
+            return "INCRBY"
+        }
+        if str_slice_ci_eq(s, 0, 6, "DECRBY") == 1 {
+            return "DECRBY"
+        }
+        if str_slice_ci_eq(s, 0, 6, "GETSET") == 1 {
+            return "GETSET"
+        }
+        if str_slice_ci_eq(s, 0, 6, "SETNX") == 1 {
+            return "SETNX"
+        }
+        if str_slice_ci_eq(s, 0, 6, "SETEX") == 1 {
+            return "SETEX"
+        }
+        if str_slice_ci_eq(s, 0, 6, "UNLINK") == 1 {
+            return "UNLINK"
+        }
+        if str_slice_ci_eq(s, 0, 6, "PSYNC") == 1 {
+            return "PSYNC"
+        }
+    }
+    return str_to_upper(s)
+}
+
+fn command_names() -> []string {
+    return ["ping", "echo", "quit", "auth", "select", "hello", "command", "time", "client", "config", "info", "slowlog", "metrics", "memory", "lastsave", "save", "bgsave", "bgrewriteaof", "shutdown", "acl", "object", "latency", "pubsub", "monitor", "eval", "evalsha", "script", "get", "set", "setnx", "setex", "psetex", "getset", "getdel", "getex", "getrange", "setrange", "append", "strlen", "incr", "incrby", "incrbyfloat", "decr", "decrby", "mget", "mset", "msetnx", "copy", "touch", "dump", "restore", "del", "unlink", "exists", "type", "expire", "pexpire", "expireat", "pexpireat", "expiretime", "pexpiretime", "ttl", "pttl", "persist", "rename", "renamenx", "move", "swapdb", "keys", "scan", "hotkeys", "randomkey", "dbsize", "flushdb", "flushall", "hset", "hmset", "hsetnx", "hget", "hmget", "hgetall", "hdel", "hgetdel", "hexists", "hkeys", "hvals", "hlen", "hincrby", "hincrbyfloat", "hstrlen", "hrandfield", "hscan", "lpush", "rpush", "lpushx", "rpushx", "lpop", "rpop", "lmpop", "blpop", "brpop", "lrange", "llen", "lindex", "lpos", "lset", "ltrim", "lrem", "linsert", "lmove", "rpoplpush", "sadd", "srem", "sismember", "smismember", "smembers", "scard", "spop", "srandmember", "smove", "sunion", "sinter", "sdiff", "sintercard", "sunionstore", "sinterstore", "sdiffstore", "sscan", "zadd", "zrem", "zscore", "zmscore", "zcard", "zrange", "zrevrange", "zrangebyscore", "zrevrangebyscore", "zcount", "zpopmin", "zpopmax", "zmpop", "bzpopmin", "bzpopmax", "zrank", "zrevrank", "zincrby", "zrandmember", "zunion", "zinter", "zdiff", "zunionstore", "zinterstore", "zdiffstore", "zremrangebyscore", "zremrangebyrank", "zscan", "sort", "pfadd", "pfcount", "pfmerge", "vadd", "vsim", "vrem", "vcard", "vdim", "vattr", "vgetattr", "brain", "setbit", "getbit", "bitcount", "bitpos", "bitop", "bitfield", "geoadd", "geodist", "geopos", "georadius", "geosearch", "geosearchstore", "xadd", "xlen", "xrange", "xrevrange", "xread", "xdel", "xtrim", "xgroup", "xreadgroup", "xack", "xpending", "xclaim", "xautoclaim", "xinfo", "relate", "unrelate", "neighbors", "path", "fact", "why", "lease", "unlease", "leased", "believe", "tensions", "ask", "attend", "focus", "budget", "spend", "turn", "cluster", "role", "replicaof", "slaveof", "replconf", "psync", "sync", "wait", "readonly", "readwrite", "sentinel", "multi", "exec", "discard", "watch", "unwatch", "publish", "subscribe", "unsubscribe", "psubscribe", "punsubscribe", "react"]
+}
+
+fn is_hot_key_cmd(cmd: string) -> int {
+    if str_eq(cmd, "GET") or str_eq(cmd, "SET") or str_eq(cmd, "DEL") or str_eq(cmd, "INCR") {
+        return 1
+    }
+    if str_eq(cmd, "EXISTS") or str_eq(cmd, "HGET") or str_eq(cmd, "HSET") or str_eq(cmd, "MGET") {
+        return 1
+    }
+    if str_eq(cmd, "MSET") or str_eq(cmd, "LPUSH") or str_eq(cmd, "RPUSH") or str_eq(cmd, "SADD") or str_eq(cmd, "ZADD") {
+        return 1
+    }
+    return 0
+}
+
+fn is_write_cmd(cmd: string) -> int {
+    if str_eq(cmd, "SET") or str_eq(cmd, "SETNX") or str_eq(cmd, "SETEX") or str_eq(cmd, "PSETEX") {
+        return 1
+    }
+    if str_eq(cmd, "GETSET") or str_eq(cmd, "APPEND") or str_eq(cmd, "INCR") or str_eq(cmd, "INCRBY") {
+        return 1
+    }
+    if str_eq(cmd, "DECR") or str_eq(cmd, "DECRBY") or str_eq(cmd, "MSET") or str_eq(cmd, "MSETNX") {
+        return 1
+    }
+    if str_eq(cmd, "DEL") or str_eq(cmd, "UNLINK") or str_eq(cmd, "EXPIRE") or str_eq(cmd, "PEXPIRE") {
+        return 1
+    }
+    if str_eq(cmd, "EXPIREAT") or str_eq(cmd, "PEXPIREAT") or str_eq(cmd, "PERSIST") or str_eq(cmd, "RENAME") {
+        return 1
+    }
+    if str_eq(cmd, "RENAMENX") or str_eq(cmd, "FLUSHDB") or str_eq(cmd, "FLUSHALL") {
+        return 1
+    }
+    if str_eq(cmd, "HSET") or str_eq(cmd, "HMSET") or str_eq(cmd, "HDEL") or str_eq(cmd, "HINCRBY") {
+        return 1
+    }
+    if str_eq(cmd, "LPUSH") or str_eq(cmd, "RPUSH") or str_eq(cmd, "LPOP") or str_eq(cmd, "RPOP") {
+        return 1
+    }
+    if str_eq(cmd, "LSET") or str_eq(cmd, "LTRIM") {
+        return 1
+    }
+    if str_eq(cmd, "SADD") or str_eq(cmd, "SREM") or str_eq(cmd, "SPOP") {
+        return 1
+    }
+    if str_eq(cmd, "SUNIONSTORE") or str_eq(cmd, "SINTERSTORE") or str_eq(cmd, "SDIFFSTORE") {
+        return 1
+    }
+    if str_eq(cmd, "ZADD") or str_eq(cmd, "ZREM") or str_eq(cmd, "ZINCRBY") or str_eq(cmd, "ZPOPMIN") or str_eq(cmd, "ZPOPMAX") {
+        return 1
+    }
+    if str_eq(cmd, "SETBIT") or str_eq(cmd, "GEOADD") or str_eq(cmd, "XADD") {
+        return 1
+    }
+    if str_eq(cmd, "GETDEL") or str_eq(cmd, "GETEX") or str_eq(cmd, "COPY") or str_eq(cmd, "SORT") or str_eq(cmd, "PFADD") or str_eq(cmd, "PFMERGE") {
+        return 1
+    }
+    if str_eq(cmd, "SETRANGE") or str_eq(cmd, "INCRBYFLOAT") or str_eq(cmd, "LREM") or str_eq(cmd, "LINSERT") or str_eq(cmd, "LMOVE") or str_eq(cmd, "SMOVE") or str_eq(cmd, "BITOP") or str_eq(cmd, "ZUNIONSTORE") {
+        return 1
+    }
+    if str_eq(cmd, "RPOPLPUSH") or str_eq(cmd, "MOVE") or str_eq(cmd, "ZREMRANGEBYSCORE") or str_eq(cmd, "XDEL") or str_eq(cmd, "XTRIM") {
+        return 1
+    }
+    if str_eq(cmd, "VADD") or str_eq(cmd, "VREM") or str_eq(cmd, "VATTR") or str_eq(cmd, "BRAIN") {
+        return 1
+    }
+    if str_eq(cmd, "RESTORE") or str_eq(cmd, "HINCRBYFLOAT") or str_eq(cmd, "HSETNX") or str_eq(cmd, "LPUSHX") or str_eq(cmd, "RPUSHX") {
+        return 1
+    }
+    if str_eq(cmd, "ZINTERSTORE") or str_eq(cmd, "ZDIFFSTORE") or str_eq(cmd, "ZREMRANGEBYRANK") or str_eq(cmd, "SWAPDB") {
+        return 1
+    }
+    if str_eq(cmd, "XGROUP") or str_eq(cmd, "XREADGROUP") or str_eq(cmd, "XACK") or str_eq(cmd, "BITFIELD") {
+        return 1
+    }
+    if str_eq(cmd, "XCLAIM") or str_eq(cmd, "XAUTOCLAIM") {
+        return 1
+    }
+    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") {
+        return 1
+    }
+    if str_eq(cmd, "RELATE") or str_eq(cmd, "UNRELATE") or str_eq(cmd, "FACT") or str_eq(cmd, "LEASE") or str_eq(cmd, "UNLEASE") {
+        return 1
+    }
+    if str_eq(cmd, "BELIEVE") or str_eq(cmd, "ATTEND") or str_eq(cmd, "BUDGET") or str_eq(cmd, "SPEND") {
+        return 1
+    }
+    if str_eq(cmd, "LMPOP") or str_eq(cmd, "ZMPOP") or str_eq(cmd, "HGETDEL") or str_eq(cmd, "GEOSEARCHSTORE") {
+        return 1
+    }
+    if str_eq(cmd, "BLPOP") or str_eq(cmd, "BRPOP") or str_eq(cmd, "BZPOPMIN") or str_eq(cmd, "BZPOPMAX") {
+        return 1
+    }
+    if str_eq(cmd, "TOUCH") or str_eq(cmd, "PUBLISH") {
+        return 1
+    }
+    if str_eq(cmd, "REACT") {
+        return 1
+    }
+    return 0
+}

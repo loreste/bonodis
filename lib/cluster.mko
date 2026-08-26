@@ -1,0 +1,1422 @@
+pack bonodis
+
+// Redis-style cluster state lives in a CMap (native backend has no string struct fields).
+// n:<id> = ip \t port \t flags \t master \t slots \t epoch
+
+fn hex_nibble(n: int) -> byte {
+    let mut x = n % 16
+    if x < 0 {
+        x = 0 - x
+    }
+    x = x % 16
+    if x < 10 {
+        return byte(48 + x)
+    }
+    return byte(87 + x)
+}
+
+fn new_node_id() -> string {
+    let b = str_builder()
+    let mut i = 0
+    while i < 40 {
+        builder_write_byte(b, hex_nibble(rand_intn(16)))
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn cluster_announce(host: string, announce: string) -> string {
+    if str_len(announce) > 0 {
+        return announce
+    }
+    if str_eq(host, "0.0.0.0") or str_eq(host, "::") or str_eq(host, "") {
+        return "127.0.0.1"
+    }
+    return host
+}
+
+fn cluster_ids_list(clus: CMap) -> []string {
+    let raw = cmap_get(clus, "ids")
+    let none: []string = []
+    if str_len(raw) == 0 {
+        return none
+    }
+    return str_split(raw, ",")
+}
+
+fn cluster_remember(clus: CMap, id: string) {
+    if str_len(id) == 0 {
+        return
+    }
+    let ids = cluster_ids_list(clus)
+    let mut i = 0
+    while i < len(ids) {
+        if str_eq(ids[i], id) {
+            return
+        }
+        i = i + 1
+    }
+    let cur = cmap_get(clus, "ids")
+    if str_len(cur) == 0 {
+        cmap_set(clus, "ids", id)
+    } else {
+        cmap_set(clus, "ids", cur + "," + id)
+    }
+}
+
+fn cluster_put(clus: CMap, id: string, ip: string, port: string, flags: string, master: string, slots: string, epoch: string) {
+    cmap_set(clus, "n:" + id, ip + "\t" + port + "\t" + flags + "\t" + master + "\t" + slots + "\t" + epoch)
+    cluster_remember(clus, id)
+    if str_eq(id, cmap_get(clus, "id")) {
+        cmap_set(clus, "ip", ip)
+        cmap_set(clus, "port", port)
+        cmap_set(clus, "flags", flags)
+        cmap_set(clus, "master", master)
+        cmap_set(clus, "slots", slots)
+        cmap_set(clus, "epoch", epoch)
+    }
+}
+
+fn cluster_field(rec: string, idx: int) -> string {
+    let parts = str_split(rec, "\t")
+    if idx < 0 or idx >= len(parts) {
+        return ""
+    }
+    return parts[idx]
+}
+
+fn cluster_rec(clus: CMap, id: string) -> string {
+    return cmap_get(clus, "n:" + id)
+}
+
+fn ranges_has(ranges: string, slot: int) -> int {
+    if str_len(ranges) == 0 {
+        return 0
+    }
+    let mut parts = str_split(ranges, ",")
+    if len(parts) == 1 {
+        parts = str_split(ranges, " ")
+    }
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i]
+        if str_len(p) == 0 {
+            i = i + 1
+            continue
+        }
+        let dash = str_index(p, "-")
+        let mut a = 0
+        let mut b = 0
+        if dash < 0 {
+            a = int_of(p)
+            b = a
+        } else {
+            a = int_of(p[:dash])
+            b = int_of(p[dash + 1:])
+        }
+        if a > b {
+            let t = a
+            a = b
+            b = t
+        }
+        if slot >= a and slot <= b {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn ranges_add(ranges: string, start: int, stop: int) -> string {
+    let mut a = start
+    let mut b = stop
+    if a > b {
+        let t = a
+        a = b
+        b = t
+    }
+    let piece = format_int(a) + "-" + format_int(b)
+    if str_len(ranges) == 0 {
+        return piece
+    }
+    if str_contains(ranges, piece) {
+        return ranges
+    }
+    return ranges + "," + piece
+}
+
+fn ranges_count(ranges: string) -> int {
+    if str_len(ranges) == 0 {
+        return 0
+    }
+    let mut parts = str_split(ranges, ",")
+    if len(parts) == 1 {
+        parts = str_split(ranges, " ")
+    }
+    let mut n = 0
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i]
+        if str_len(p) == 0 {
+            i = i + 1
+            continue
+        }
+        let dash = str_index(p, "-")
+        if dash < 0 {
+            n = n + 1
+        } else {
+            let a = int_of(p[:dash])
+            let b = int_of(p[dash + 1:])
+            if b >= a {
+                n = n + (b - a + 1)
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn cluster_split_slots(n: int) -> []string {
+    let none: []string = []
+    if n <= 0 {
+        return none
+    }
+    let total = SLOT_COUNT
+    let base = total / n
+    let extra = total % n
+    let mut out = make([]string, 0, n)
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        let mut sz = base
+        if i < extra {
+            sz = sz + 1
+        }
+        let stop = start + sz - 1
+        out = append(out, format_int(start) + "-" + format_int(stop))
+        start = stop + 1
+        i = i + 1
+    }
+    return out
+}
+
+fn cluster_is_master_flags(flags: string) -> int {
+    if str_contains(flags, "slave") {
+        return 0
+    }
+    if str_contains(flags, "master") {
+        return 1
+    }
+    return 1
+}
+
+fn cluster_owner(clus: CMap, slot: int) -> (string, string, int, int) {
+    let ids = cluster_ids_list(clus)
+    let mut i = 0
+    while i < len(ids) {
+        let id = ids[i]
+        let rec = cluster_rec(clus, id)
+        let flags = cluster_field(rec, 2)
+        if cluster_is_master_flags(flags) == 0 {
+            i = i + 1
+            continue
+        }
+        let slots = cluster_field(rec, 4)
+        if ranges_has(slots, slot) == 1 {
+            return (id, cluster_field(rec, 0), int_of(cluster_field(rec, 1)), 1)
+        }
+        i = i + 1
+    }
+    return ("", "", 0, 0)
+}
+
+fn cluster_moved(slot: int, ip: string, port: int) -> string {
+    return r_err("MOVED " + format_int(slot) + " " + ip + ":" + format_int(port))
+}
+
+fn cluster_key_cmd(cmd: string) -> int {
+    if str_eq(cmd, "GET") or str_eq(cmd, "SET") or str_eq(cmd, "SETNX") or str_eq(cmd, "SETEX") or str_eq(cmd, "PSETEX") {
+        return 1
+    }
+    if str_eq(cmd, "GETSET") or str_eq(cmd, "APPEND") or str_eq(cmd, "STRLEN") or str_eq(cmd, "INCR") or str_eq(cmd, "INCRBY") {
+        return 1
+    }
+    if str_eq(cmd, "DECR") or str_eq(cmd, "DECRBY") or str_eq(cmd, "MGET") or str_eq(cmd, "MSET") or str_eq(cmd, "MSETNX") {
+        return 1
+    }
+    if str_eq(cmd, "DEL") or str_eq(cmd, "UNLINK") or str_eq(cmd, "EXISTS") or str_eq(cmd, "TYPE") or str_eq(cmd, "EXPIRE") {
+        return 1
+    }
+    if str_eq(cmd, "PEXPIRE") or str_eq(cmd, "EXPIREAT") or str_eq(cmd, "PEXPIREAT") or str_eq(cmd, "TTL") or str_eq(cmd, "PTTL") {
+        return 1
+    }
+    if str_eq(cmd, "PERSIST") or str_eq(cmd, "RENAME") or str_eq(cmd, "RENAMENX") {
+        return 1
+    }
+    if str_eq(cmd, "HSET") or str_eq(cmd, "HGET") or str_eq(cmd, "HMGET") or str_eq(cmd, "HGETALL") or str_eq(cmd, "HDEL") {
+        return 1
+    }
+    if str_eq(cmd, "HEXISTS") or str_eq(cmd, "HKEYS") or str_eq(cmd, "HVALS") or str_eq(cmd, "HLEN") or str_eq(cmd, "HINCRBY") or str_eq(cmd, "HMSET") {
+        return 1
+    }
+    if str_eq(cmd, "LPUSH") or str_eq(cmd, "RPUSH") or str_eq(cmd, "LPOP") or str_eq(cmd, "RPOP") or str_eq(cmd, "BLPOP") or str_eq(cmd, "BRPOP") {
+        return 1
+    }
+    if str_eq(cmd, "LRANGE") or str_eq(cmd, "LLEN") or str_eq(cmd, "LINDEX") or str_eq(cmd, "LSET") or str_eq(cmd, "LTRIM") {
+        return 1
+    }
+    if str_eq(cmd, "SADD") or str_eq(cmd, "SREM") or str_eq(cmd, "SISMEMBER") or str_eq(cmd, "SMEMBERS") or str_eq(cmd, "SCARD") or str_eq(cmd, "SPOP") or str_eq(cmd, "SRANDMEMBER") {
+        return 1
+    }
+    if str_eq(cmd, "SMISMEMBER") or str_eq(cmd, "SUNION") or str_eq(cmd, "SINTER") or str_eq(cmd, "SDIFF") or str_eq(cmd, "SUNIONSTORE") or str_eq(cmd, "SINTERSTORE") or str_eq(cmd, "SDIFFSTORE") {
+        return 1
+    }
+    if str_eq(cmd, "ZADD") or str_eq(cmd, "ZREM") or str_eq(cmd, "ZSCORE") or str_eq(cmd, "ZCARD") or str_eq(cmd, "ZRANGE") or str_eq(cmd, "ZREVRANGE") or str_eq(cmd, "ZRANK") or str_eq(cmd, "ZREVRANK") or str_eq(cmd, "ZINCRBY") {
+        return 1
+    }
+    if str_eq(cmd, "ZRANGEBYSCORE") or str_eq(cmd, "ZCOUNT") or str_eq(cmd, "ZPOPMIN") or str_eq(cmd, "ZPOPMAX") {
+        return 1
+    }
+    if str_eq(cmd, "GETDEL") or str_eq(cmd, "GETEX") or str_eq(cmd, "TOUCH") or str_eq(cmd, "COPY") or str_eq(cmd, "SORT") {
+        return 1
+    }
+    if str_eq(cmd, "GETRANGE") or str_eq(cmd, "SETRANGE") or str_eq(cmd, "INCRBYFLOAT") or str_eq(cmd, "LREM") or str_eq(cmd, "LINSERT") or str_eq(cmd, "LMOVE") or str_eq(cmd, "SMOVE") or str_eq(cmd, "BITOP") or str_eq(cmd, "ZUNIONSTORE") or str_eq(cmd, "__KVER") {
+        return 1
+    }
+    if str_eq(cmd, "HSCAN") or str_eq(cmd, "SSCAN") or str_eq(cmd, "ZSCAN") or str_eq(cmd, "HSTRLEN") or str_eq(cmd, "HRANDFIELD") or str_eq(cmd, "ZMSCORE") or str_eq(cmd, "ZREMRANGEBYSCORE") or str_eq(cmd, "MOVE") or str_eq(cmd, "RPOPLPUSH") or str_eq(cmd, "BITPOS") or str_eq(cmd, "XDEL") or str_eq(cmd, "XREVRANGE") or str_eq(cmd, "XTRIM") {
+        return 1
+    }
+    if str_eq(cmd, "PFADD") or str_eq(cmd, "PFCOUNT") or str_eq(cmd, "PFMERGE") {
+        return 1
+    }
+    if str_eq(cmd, "SETBIT") or str_eq(cmd, "GETBIT") or str_eq(cmd, "BITCOUNT") or str_eq(cmd, "GEOADD") or str_eq(cmd, "GEODIST") or str_eq(cmd, "GEOPOS") or str_eq(cmd, "GEORADIUS") {
+        return 1
+    }
+    if str_eq(cmd, "XADD") or str_eq(cmd, "XLEN") or str_eq(cmd, "XRANGE") or str_eq(cmd, "XREAD") {
+        return 1
+    }
+    if str_eq(cmd, "XGROUP") or str_eq(cmd, "XREADGROUP") or str_eq(cmd, "XACK") or str_eq(cmd, "XPENDING") or str_eq(cmd, "XINFO") or str_eq(cmd, "XCLAIM") or str_eq(cmd, "XAUTOCLAIM") {
+        return 1
+    }
+    if str_eq(cmd, "DUMP") or str_eq(cmd, "RESTORE") or str_eq(cmd, "EXPIRETIME") or str_eq(cmd, "PEXPIRETIME") or str_eq(cmd, "MEMORY") {
+        return 1
+    }
+    if str_eq(cmd, "LPOS") or str_eq(cmd, "HINCRBYFLOAT") or str_eq(cmd, "HSETNX") or str_eq(cmd, "LPUSHX") or str_eq(cmd, "RPUSHX") {
+        return 1
+    }
+    if str_eq(cmd, "SINTERCARD") or str_eq(cmd, "ZUNION") or str_eq(cmd, "ZINTER") or str_eq(cmd, "ZDIFF") or str_eq(cmd, "ZINTERSTORE") or str_eq(cmd, "ZDIFFSTORE") {
+        return 1
+    }
+    if str_eq(cmd, "ZREVRANGEBYSCORE") or str_eq(cmd, "ZREMRANGEBYRANK") or str_eq(cmd, "GEOSEARCH") or str_eq(cmd, "GEOSEARCHSTORE") {
+        return 1
+    }
+    if str_eq(cmd, "HGETDEL") or str_eq(cmd, "LMPOP") or str_eq(cmd, "ZMPOP") or str_eq(cmd, "BITFIELD") {
+        return 1
+    }
+    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") {
+        return 1
+    }
+    if str_eq(cmd, "VADD") or str_eq(cmd, "VSIM") or str_eq(cmd, "VREM") or str_eq(cmd, "VCARD") or str_eq(cmd, "VDIM") or str_eq(cmd, "VATTR") or str_eq(cmd, "VGETATTR") or str_eq(cmd, "BRAIN") {
+        return 1
+    }
+    if str_eq(cmd, "RELATE") or str_eq(cmd, "UNRELATE") or str_eq(cmd, "NEIGHBORS") or str_eq(cmd, "PATH") or str_eq(cmd, "FACT") or str_eq(cmd, "WHY") or str_eq(cmd, "LEASE") or str_eq(cmd, "UNLEASE") or str_eq(cmd, "LEASED") {
+        return 1
+    }
+    if str_eq(cmd, "BELIEVE") or str_eq(cmd, "TENSIONS") or str_eq(cmd, "ASK") or str_eq(cmd, "ATTEND") or str_eq(cmd, "FOCUS") or str_eq(cmd, "BUDGET") or str_eq(cmd, "SPEND") or str_eq(cmd, "TURN") {
+        return 1
+    }
+    return 0
+}
+
+fn cluster_key_slot_of(argv: []string) -> (int, int) {
+    let cmd = cmd_name(argv)
+    if str_eq(cmd, "COPY") or str_eq(cmd, "RELATE") or str_eq(cmd, "UNRELATE") or str_eq(cmd, "PATH") or str_eq(cmd, "TURN") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        if key_slot(argv[2]) != slot {
+            return (slot, -1)
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "FACT") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let sub = str_to_upper(argv[1])
+        if str_eq(sub, "WHO") {
+            if len(argv) < 4 {
+                return (0, 0)
+            }
+            return (key_slot(argv[2]), 1)
+        }
+        return (key_slot(argv[2]), 1)
+    }
+    if str_eq(cmd, "SUNION") or str_eq(cmd, "SINTER") or str_eq(cmd, "SDIFF") or str_eq(cmd, "PFCOUNT") {
+        if len(argv) < 2 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        let mut i = 2
+        while i < len(argv) {
+            if key_slot(argv[i]) != slot {
+                return (slot, -1)
+            }
+            i = i + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "SUNIONSTORE") or str_eq(cmd, "SINTERSTORE") or str_eq(cmd, "SDIFFSTORE") or str_eq(cmd, "PFMERGE") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        let mut i = 2
+        while i < len(argv) {
+            if key_slot(argv[i]) != slot {
+                return (slot, -1)
+            }
+            i = i + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "MGET") or str_eq(cmd, "DEL") or str_eq(cmd, "UNLINK") or str_eq(cmd, "EXISTS") or str_eq(cmd, "TOUCH") {
+        if len(argv) < 2 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        let mut i = 2
+        while i < len(argv) {
+            if key_slot(argv[i]) != slot {
+                return (slot, -1)
+            }
+            i = i + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "MSET") or str_eq(cmd, "MSETNX") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        let mut i = 3
+        while i < len(argv) {
+            if key_slot(argv[i]) != slot {
+                return (slot, -1)
+            }
+            i = i + 2
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "BITOP") {
+        if len(argv) < 4 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[2])
+        let mut i = 3
+        while i < len(argv) {
+            if key_slot(argv[i]) != slot {
+                return (slot, -1)
+            }
+            i = i + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "ZUNIONSTORE") {
+        if len(argv) < 4 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        let nk = int_of(argv[2])
+        let mut i = 0
+        while i < nk and 3 + i < len(argv) {
+            if key_slot(argv[3 + i]) != slot {
+                return (slot, -1)
+            }
+            i = i + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "LMOVE") or str_eq(cmd, "SMOVE") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        if key_slot(argv[2]) != slot {
+            return (slot, -1)
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "RENAME") or str_eq(cmd, "RENAMENX") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        if key_slot(argv[2]) != slot {
+            return (slot, -1)
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "BRAIN") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        return (key_slot(argv[2]), 1)
+    }
+    if str_eq(cmd, "XGROUP") or str_eq(cmd, "XINFO") or str_eq(cmd, "MEMORY") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        return (key_slot(argv[2]), 1)
+    }
+    if str_eq(cmd, "XREAD") or str_eq(cmd, "XREADGROUP") {
+        let mut xi = 1
+        while xi < len(argv) {
+            if str_eq(str_to_upper(argv[xi]), "STREAMS") and xi + 1 < len(argv) {
+                return (key_slot(argv[xi + 1]), 1)
+            }
+            xi = xi + 1
+        }
+        return (0, 0)
+    }
+    if str_eq(cmd, "LMPOP") or str_eq(cmd, "ZMPOP") or str_eq(cmd, "SINTERCARD") or str_eq(cmd, "ZUNION") or str_eq(cmd, "ZINTER") or str_eq(cmd, "ZDIFF") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let nk = int_of(argv[1])
+        if nk < 1 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[2])
+        let mut j = 1
+        while j < nk and 2 + j < len(argv) {
+            if key_slot(argv[2 + j]) != slot {
+                return (slot, 0 - 1)
+            }
+            j = j + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "ZINTERSTORE") or str_eq(cmd, "ZDIFFSTORE") {
+        if len(argv) < 4 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        let nk = int_of(argv[2])
+        let mut j = 0
+        while j < nk and 3 + j < len(argv) {
+            if key_slot(argv[3 + j]) != slot {
+                return (slot, 0 - 1)
+            }
+            j = j + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let nk = int_of(argv[2])
+        if nk < 1 {
+            return (0, 1)
+        }
+        if 3 + nk > len(argv) {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[3])
+        let mut j = 1
+        while j < nk {
+            if key_slot(argv[3 + j]) != slot {
+                return (slot, 0 - 1)
+            }
+            j = j + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "GEOSEARCHSTORE") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        if key_slot(argv[2]) != slot {
+            return (slot, 0 - 1)
+        }
+        return (slot, 1)
+    }
+    if len(argv) < 2 {
+        return (0, 0)
+    }
+    return (key_slot(argv[1]), 1)
+}
+
+fn cluster_redirect(clus: CMap, argv: []string) -> string {
+    if not str_eq(cmap_get(clus, "on"), "1") {
+        return ""
+    }
+    let cmd = cmd_name(argv)
+    if cluster_key_cmd(cmd) == 0 {
+        return ""
+    }
+    let slot, st = cluster_key_slot_of(argv)
+    if st == 0 {
+        return ""
+    }
+    if st < 0 {
+        log_crossslot(cmd)
+        return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+    }
+    let id, ip, port, ok = cluster_owner(clus, slot)
+    if ok == 0 {
+        log_clusterdown(cmd, slot)
+        return r_err("CLUSTERDOWN Hash slot not served")
+    }
+    let me = cmap_get(clus, "id")
+    if str_eq(id, me) {
+        let flags = cmap_get(clus, "flags")
+        if str_contains(flags, "slave") and is_write_cmd(cmd) == 1 {
+            let mid = cmap_get(clus, "master")
+            let rec = cluster_rec(clus, mid)
+            if str_len(rec) > 0 {
+                let dest = cluster_field(rec, 0) + ":" + cluster_field(rec, 1)
+                log_moved(cmd, slot, dest)
+                return cluster_moved(slot, cluster_field(rec, 0), int_of(cluster_field(rec, 1)))
+            }
+        }
+        return ""
+    }
+    log_moved(cmd, slot, ip + ":" + format_int(port))
+    return cluster_moved(slot, ip, port)
+}
+
+fn strip_myself(flags: string) -> string {
+    if str_has_prefix(flags, "myself,") {
+        return flags[7:]
+    }
+    return flags
+}
+
+fn cluster_nodes_blob(clus: CMap) -> string {
+    let ids = cluster_ids_list(clus)
+    let me = cmap_get(clus, "id")
+    let b = str_builder()
+    let mut i = 0
+    while i < len(ids) {
+        let id = ids[i]
+        let rec = cluster_rec(clus, id)
+        let ip = cluster_field(rec, 0)
+        let port = cluster_field(rec, 1)
+        let mut flags = cluster_field(rec, 2)
+        let mut master = cluster_field(rec, 3)
+        let slots = cluster_field(rec, 4)
+        let mut epoch = cluster_field(rec, 5)
+        if str_eq(id, me) {
+            if not str_contains(flags, "myself") {
+                flags = "myself," + flags
+            }
+        } else {
+            flags = strip_myself(flags)
+        }
+        if str_len(master) == 0 {
+            master = "-"
+        }
+        if str_len(epoch) == 0 {
+            epoch = "0"
+        }
+        builder_write(b, id)
+        builder_write(b, " ")
+        builder_write(b, ip)
+        builder_write(b, ":")
+        builder_write(b, port)
+        builder_write(b, "@")
+        builder_write(b, port)
+        builder_write(b, " ")
+        builder_write(b, flags)
+        builder_write(b, " ")
+        builder_write(b, master)
+        builder_write(b, " 0 0 ")
+        builder_write(b, epoch)
+        builder_write(b, " connected")
+        if str_len(slots) > 0 {
+            let mut parts = str_split(slots, ",")
+            let mut j = 0
+            while j < len(parts) {
+                if str_len(parts[j]) > 0 {
+                    builder_write(b, " ")
+                    builder_write(b, parts[j])
+                }
+                j = j + 1
+            }
+        }
+        builder_write(b, "\n")
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn parse_ipport(s: string) -> (string, string) {
+    let at = str_index(s, "@")
+    let mut hp = s
+    if at > 0 {
+        hp = s[:at]
+    }
+    if str_byte_at(hp, 0) == 91 {
+        let br = str_index(hp, "]")
+        if br > 1 {
+            let ip = hp[1:br]
+            if br + 1 < str_len(hp) and str_byte_at(hp, br + 1) == 58 {
+                return (ip, hp[br + 2:])
+            }
+            return (ip, "0")
+        }
+    }
+    let c = str_last_index(hp, ":")
+    if c < 0 {
+        return (hp, "0")
+    }
+    return (hp[:c], hp[c + 1:])
+}
+
+fn cluster_merge_line(clus: CMap, line: string) {
+    let f = str_fields(line)
+    if len(f) < 8 {
+        return
+    }
+    let id = f[0]
+    let me = cmap_get(clus, "id")
+    if str_eq(id, me) {
+        return
+    }
+    let ip, port = parse_ipport(f[1])
+    let flags = strip_myself(f[2])
+    let master = f[3]
+    let epoch = f[6]
+    let mut slots = ""
+    let mut i = 8
+    while i < len(f) {
+        if str_len(slots) == 0 {
+            slots = f[i]
+        } else {
+            slots = slots + "," + f[i]
+        }
+        i = i + 1
+    }
+    let cur = cluster_rec(clus, id)
+    if str_len(cur) > 0 {
+        let ce = int_of(cluster_field(cur, 5))
+        if int_of(epoch) < ce {
+            return
+        }
+    }
+    cluster_put(clus, id, ip, port, flags, master, slots, epoch)
+}
+
+fn cluster_merge_blob(clus: CMap, blob: string) {
+    let lines = str_split(blob, "\n")
+    let mut i = 0
+    while i < len(lines) {
+        if str_len(lines[i]) > 0 {
+            cluster_merge_line(clus, lines[i])
+        }
+        i = i + 1
+    }
+}
+
+fn cluster_save(clus: CMap) {
+    let dir = cmap_get(clus, "dir")
+    if str_len(dir) == 0 {
+        return
+    }
+    let path = dir + "/nodes.conf"
+    let _ = write_file(path, cluster_nodes_blob(clus))
+    log_cluster_save(path)
+}
+
+fn cluster_load(clus: CMap) {
+    let dir = cmap_get(clus, "dir")
+    if str_len(dir) == 0 {
+        return
+    }
+    let path = dir + "/nodes.conf"
+    if not file_exists(path) {
+        return
+    }
+    let blob = read_file(path)
+    if str_len(blob) == 0 {
+        return
+    }
+    let lines = str_split(blob, "\n")
+    let mut i = 0
+    while i < len(lines) {
+        let f = str_fields(lines[i])
+        if len(f) >= 8 {
+            if str_contains(f[2], "myself") {
+                cmap_set(clus, "id", f[0])
+                let ip, port = parse_ipport(f[1])
+                let mut slots = ""
+                let mut j = 8
+                while j < len(f) {
+                    if str_len(slots) == 0 {
+                        slots = f[j]
+                    } else {
+                        slots = slots + "," + f[j]
+                    }
+                    j = j + 1
+                }
+                cluster_put(clus, f[0], ip, port, strip_myself(f[2]), f[3], slots, f[6])
+            }
+        }
+        i = i + 1
+    }
+    cluster_merge_blob(clus, blob)
+}
+
+fn cluster_init(clus: CMap, host: string, port: int, announce: string, dir: string) {
+    cmap_set(clus, "on", "1")
+    cmap_set(clus, "dir", dir)
+    let ip = cluster_announce(host, announce)
+    cmap_set(clus, "ip", ip)
+    cmap_set(clus, "port", format_int(port))
+    if str_len(dir) > 0 {
+        let _ = mkdir_all(dir)
+        cluster_load(clus)
+    }
+    if str_len(cmap_get(clus, "id")) == 0 {
+        cmap_set(clus, "id", new_node_id())
+        cluster_put(clus, cmap_get(clus, "id"), ip, format_int(port), "master", "-", "", "0")
+        cluster_save(clus)
+    } else {
+        cluster_put(clus, cmap_get(clus, "id"), ip, format_int(port), cmap_get(clus, "flags"), cmap_get(clus, "master"), cmap_get(clus, "slots"), cmap_get(clus, "epoch"))
+    }
+    log_cluster_on(cmap_get(clus, "id"), ip, format_int(port))
+}
+
+fn cluster_info_text(clus: CMap) -> string {
+    let ids = cluster_ids_list(clus)
+    let mut assigned = 0
+    let mut masters = 0
+    let mut i = 0
+    while i < len(ids) {
+        let rec = cluster_rec(clus, ids[i])
+        if cluster_is_master_flags(cluster_field(rec, 2)) == 1 {
+            masters = masters + 1
+            assigned = assigned + ranges_count(cluster_field(rec, 4))
+        }
+        i = i + 1
+    }
+    let mut state = "fail"
+    if assigned >= SLOT_COUNT {
+        state = "ok"
+    }
+    let b = str_builder()
+    builder_write(b, "cluster_state:")
+    builder_write(b, state)
+    builder_write(b, "\r\ncluster_slots_assigned:")
+    builder_write(b, format_int(assigned))
+    builder_write(b, "\r\ncluster_slots_ok:")
+    builder_write(b, format_int(assigned))
+    builder_write(b, "\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:")
+    builder_write(b, format_int(len(ids)))
+    builder_write(b, "\r\ncluster_size:")
+    builder_write(b, format_int(masters))
+    builder_write(b, "\r\ncluster_current_epoch:")
+    builder_write(b, cmap_get(clus, "epoch"))
+    builder_write(b, "\r\ncluster_my_epoch:")
+    builder_write(b, cmap_get(clus, "epoch"))
+    builder_write(b, "\r\n")
+    return builder_string(b)
+}
+
+fn cluster_slots_resp(clus: CMap) -> string {
+    let ids = cluster_ids_list(clus)
+    let b = str_builder()
+    let chunks = str_builder()
+    let mut nrange = 0
+    let mut i = 0
+    while i < len(ids) {
+        let id = ids[i]
+        let rec = cluster_rec(clus, id)
+        if cluster_is_master_flags(cluster_field(rec, 2)) == 0 {
+            i = i + 1
+            continue
+        }
+        let slots = cluster_field(rec, 4)
+        if str_len(slots) == 0 {
+            i = i + 1
+            continue
+        }
+        let ip = cluster_field(rec, 0)
+        let port = cluster_field(rec, 1)
+        let mut reps = make([]string, 0, 4)
+        let mut j = 0
+        while j < len(ids) {
+            let rid = ids[j]
+            let rr = cluster_rec(clus, rid)
+            if str_contains(cluster_field(rr, 2), "slave") and str_eq(cluster_field(rr, 3), id) {
+                reps = append(reps, rid)
+            }
+            j = j + 1
+        }
+        let mut parts = str_split(slots, ",")
+        let mut p = 0
+        while p < len(parts) {
+            let rg = parts[p]
+            if str_len(rg) == 0 {
+                p = p + 1
+                continue
+            }
+            let dash = str_index(rg, "-")
+            let mut a = 0
+            let mut bb = 0
+            if dash < 0 {
+                a = int_of(rg)
+                bb = a
+            } else {
+                a = int_of(rg[:dash])
+                bb = int_of(rg[dash + 1:])
+            }
+            builder_write(chunks, "*")
+            builder_write(chunks, format_int(3 + len(reps)))
+            builder_write(chunks, "\r\n")
+            builder_write(chunks, r_int(a))
+            builder_write(chunks, r_int(bb))
+            builder_write(chunks, "*3\r\n")
+            builder_write(chunks, r_bulk(ip))
+            builder_write(chunks, r_int(int_of(port)))
+            builder_write(chunks, r_bulk(id))
+            let mut r = 0
+            while r < len(reps) {
+                let rr = cluster_rec(clus, reps[r])
+                builder_write(chunks, "*3\r\n")
+                builder_write(chunks, r_bulk(cluster_field(rr, 0)))
+                builder_write(chunks, r_int(int_of(cluster_field(rr, 1))))
+                builder_write(chunks, r_bulk(reps[r]))
+                r = r + 1
+            }
+            nrange = nrange + 1
+            p = p + 1
+        }
+        i = i + 1
+    }
+    builder_write(b, "*")
+    builder_write(b, format_int(nrange))
+    builder_write(b, "\r\n")
+    builder_write(b, builder_string(chunks))
+    return builder_string(b)
+}
+
+fn cluster_meet_peer(clus: CMap, ip: string, port: int) -> string {
+    let myid = cmap_get(clus, "id")
+    let myip = cmap_get(clus, "ip")
+    let myport = cmap_get(clus, "port")
+    if str_eq(ip, myip) and str_eq(format_int(port), myport) {
+        return r_err("ERR I tried to meet myself")
+    }
+    let tls_on = cfg_tls_on(clus)
+    if tls_on == 0 {
+        let fd = tcp_connect(ip, port)
+        if fd < 0 {
+            log_cluster_meet_fail(ip, port, "connect")
+            return r_err("ERR Meeting node " + ip + ":" + format_int(port) + " failed")
+        }
+        let _ = tcp_nodelay(fd)
+        let _ = tcp_set_timeout(fd, 2000)
+        let hello = resp_send(fd, ["CLUSTERX", "MEET", myid, myip, myport])
+        if str_has_prefix(hello, "-") {
+            let _ = tcp_close(fd)
+            return hello
+        }
+        let argv, _, st = parse_cmd(hello)
+        if st == 1 and len(argv) >= 3 {
+            cluster_put(clus, argv[0], argv[1], argv[2], "master", "-", "", "0")
+        } else {
+            cluster_put(clus, new_node_id(), ip, format_int(port), "master", "-", "", "0")
+        }
+        let g = resp_send(fd, ["CLUSTERX", "GOSSIP", cluster_nodes_blob(clus)])
+        if str_has_prefix(g, "$") {
+            cluster_merge_blob(clus, bulk_payload(g))
+        }
+        let _ = tcp_close(fd)
+        cluster_save(clus)
+        log_cluster_meet(ip, port)
+        return r_ok()
+    }
+    let fd, tc, cli = peer_open(ip, port, 1, cfg_tls_ca(clus))
+    if fd < 0 {
+        peer_close(fd, 0, tc, cli)
+        log_cluster_meet_fail(ip, port, "connect")
+        return r_err("ERR Meeting node " + ip + ":" + format_int(port) + " failed")
+    }
+    let hello = peer_send(fd, 1, tc, ["CLUSTERX", "MEET", myid, myip, myport])
+    if str_has_prefix(hello, "-") {
+        peer_close(fd, tls_on, tc, cli)
+        return hello
+    }
+    let argv, _, st = parse_cmd(hello)
+    if st == 1 and len(argv) >= 3 {
+        cluster_put(clus, argv[0], argv[1], argv[2], "master", "-", "", "0")
+    } else {
+        cluster_put(clus, new_node_id(), ip, format_int(port), "master", "-", "", "0")
+    }
+    let g = peer_send(fd, tls_on, tc, ["CLUSTERX", "GOSSIP", cluster_nodes_blob(clus)])
+    if str_has_prefix(g, "$") {
+        cluster_merge_blob(clus, bulk_payload(g))
+    } else if str_has_prefix(g, "+") {
+        let g2 = conn_read(fd, tls_on, tc)
+        if str_has_prefix(g2, "$") {
+            cluster_merge_blob(clus, bulk_payload(g2))
+        }
+    }
+    peer_close(fd, tls_on, tc, cli)
+    cluster_save(clus)
+    log_cluster_meet(ip, port)
+    return r_ok()
+}
+
+fn cluster_replicate(clus: CMap, replcfg: CMap, master_id: string) -> string {
+    if str_eq(master_id, cmap_get(clus, "id")) {
+        return r_err("ERR Can't replicate myself")
+    }
+    let rec = cluster_rec(clus, master_id)
+    if str_len(rec) == 0 {
+        return r_err("ERR Unknown node " + master_id)
+    }
+    if cluster_is_master_flags(cluster_field(rec, 2)) == 0 {
+        return r_err("ERR Node is not a master")
+    }
+    let ip = cluster_field(rec, 0)
+    let port = cluster_field(rec, 1)
+    cluster_put(clus, cmap_get(clus, "id"), cmap_get(clus, "ip"), cmap_get(clus, "port"), "slave", master_id, "", cmap_get(clus, "epoch"))
+    cmap_set(replcfg, "master_host", ip)
+    cmap_set(replcfg, "master_port", port)
+    cmap_set(replcfg, "role", "slave")
+    cluster_save(clus)
+    cluster_push_all(clus)
+    log_cluster_replicate(master_id, ip + ":" + port)
+    return r_ok()
+}
+
+fn cluster_failover(clus: CMap, replcfg: CMap) -> string {
+    let flags = cmap_get(clus, "flags")
+    if not str_contains(flags, "slave") {
+        return r_err("ERR You should run FAILOVER on a replica")
+    }
+    let mid = cmap_get(clus, "master")
+    let rec = cluster_rec(clus, mid)
+    let slots = cluster_field(rec, 4)
+    let epoch = format_int(int_of(cmap_get(clus, "epoch")) + 1)
+    cluster_put(clus, cmap_get(clus, "id"), cmap_get(clus, "ip"), cmap_get(clus, "port"), "master", "-", slots, epoch)
+    if str_len(rec) > 0 {
+        cluster_put(clus, mid, cluster_field(rec, 0), cluster_field(rec, 1), "slave", cmap_get(clus, "id"), "", epoch)
+    }
+    cmap_set(replcfg, "master_host", "")
+    cmap_set(replcfg, "master_port", "0")
+    cmap_set(replcfg, "role", "master")
+    cluster_save(clus)
+    cluster_push_all(clus)
+    log_cluster_failover(epoch)
+    return r_ok()
+}
+
+fn cluster_quorum_needed(n: int) -> int {
+    if n <= 1 {
+        return 1
+    }
+    return n / 2 + 1
+}
+
+fn cluster_replica_ids(clus: CMap, master_id: string) -> []string {
+    let none: []string = []
+    if str_len(master_id) == 0 or str_eq(master_id, "-") {
+        return none
+    }
+    let ids = cluster_ids_list(clus)
+    let mut out = make([]string, 0, 4)
+    let mut i = 0
+    while i < len(ids) {
+        let rec = cluster_rec(clus, ids[i])
+        if str_contains(cluster_field(rec, 2), "slave") and str_eq(cluster_field(rec, 3), master_id) {
+            out = append(out, ids[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn cluster_grant_vote(clus: CMap, candidate: string, epoch_s: string, master_id: string) -> string {
+    if str_len(candidate) == 0 or str_len(master_id) == 0 {
+        return r_syntax()
+    }
+    let e = int_of(epoch_s)
+    if e <= 0 {
+        return r_err("ERR invalid vote epoch")
+    }
+    let last = int_of(cmap_get(clus, "vote_epoch"))
+    let last_for = cmap_get(clus, "vote_for")
+    if e < last {
+        return r_err("ERR stale vote epoch")
+    }
+    if e == last and str_len(last_for) > 0 and not str_eq(last_for, candidate) {
+        return r_err("ERR already voted")
+    }
+    let me = cmap_get(clus, "id")
+    let flags = cmap_get(clus, "flags")
+    let mid = cmap_get(clus, "master")
+    if str_contains(flags, "slave") {
+        if not str_eq(mid, master_id) {
+            return r_err("ERR not my master")
+        }
+    } else {
+        if not str_eq(me, master_id) {
+            return r_err("ERR not my master")
+        }
+    }
+    cmap_set(clus, "vote_epoch", epoch_s)
+    cmap_set(clus, "vote_for", candidate)
+    slog_with2("info", "failover vote granted", "candidate", candidate, "epoch", epoch_s)
+    return r_ok()
+}
+
+fn cluster_ask_vote(ip: string, port: int, candidate: string, epoch: int, master_id: string, tls_on: int, ca: string) -> int {
+    if str_len(ip) == 0 or port <= 0 {
+        return 0
+    }
+    let r = peer_call(ip, port, ["CLUSTERX", "VOTE", candidate, format_int(epoch), master_id], tls_on, ca)
+    if str_has_prefix(r, "+OK") {
+        return 1
+    }
+    return 0
+}
+
+fn cluster_collect_votes(clus: CMap, candidate: string, epoch: int, master_id: string) -> int {
+    let replicas = cluster_replica_ids(clus, master_id)
+    let mut votes = 0
+    let mut i = 0
+    while i < len(replicas) {
+        if str_eq(replicas[i], candidate) {
+            votes = votes + 1
+            i = i + 1
+            continue
+        }
+        let rec = cluster_rec(clus, replicas[i])
+        votes = votes + cluster_ask_vote(cluster_field(rec, 0), int_of(cluster_field(rec, 1)), candidate, epoch, master_id, cfg_tls_on(clus), cfg_tls_ca(clus))
+        i = i + 1
+    }
+    return votes
+}
+
+fn cluster_lowest_replica(clus: CMap, master_id: string) -> string {
+    let me = cmap_get(clus, "id")
+    let mut lowest = me
+    let ids = cluster_ids_list(clus)
+    let mut i = 0
+    while i < len(ids) {
+        let rec = cluster_rec(clus, ids[i])
+        if str_contains(cluster_field(rec, 2), "slave") and str_eq(cluster_field(rec, 3), master_id) {
+            if str_lt(ids[i], lowest) == 1 {
+                lowest = ids[i]
+            }
+        }
+        i = i + 1
+    }
+    return lowest
+}
+
+fn cluster_try_autofailover(clus: CMap, replcfg: CMap) -> int {
+    if not str_contains(cmap_get(clus, "flags"), "slave") {
+        return 0
+    }
+    let mid = cmap_get(clus, "master")
+    if str_len(mid) == 0 or str_eq(mid, "-") {
+        return 0
+    }
+    let me = cmap_get(clus, "id")
+    let lowest = cluster_lowest_replica(clus, mid)
+    if not str_eq(lowest, me) {
+        return 0
+    }
+    let replicas = cluster_replica_ids(clus, mid)
+    let n = len(replicas)
+    let need = cluster_quorum_needed(n)
+    let epoch = int_of(cmap_get(clus, "epoch")) + 1
+    let grant = cluster_grant_vote(clus, me, format_int(epoch), mid)
+    if str_has_prefix(grant, "-") {
+        return 0
+    }
+    let votes = cluster_collect_votes(clus, me, epoch, mid)
+    slog_with3("info", "failover quorum", "votes", format_int(votes), "need", format_int(need), "replicas", format_int(n))
+    if votes < need {
+        slog_with("warn", "auto-failover quorum not reached", "id", me)
+        return 0
+    }
+    let r = cluster_failover(clus, replcfg)
+    if str_has_prefix(r, "-") {
+        return 0
+    }
+    slog_with("info", "auto-failover promoted", "id", me)
+    return 1
+}
+
+fn cluster_follow_new_master(clus: CMap, replcfg: CMap) -> int {
+    let mid = cmap_get(clus, "master")
+    if str_len(mid) == 0 or str_eq(mid, "-") {
+        return 0
+    }
+    let rec = cluster_rec(clus, mid)
+    if str_len(rec) == 0 {
+        return 0
+    }
+    if not str_contains(cluster_field(rec, 2), "slave") {
+        return 0
+    }
+    let nm = cluster_field(rec, 3)
+    if str_len(nm) < 2 or str_eq(nm, "-") or str_eq(nm, cmap_get(clus, "id")) {
+        return 0
+    }
+    let rr = cluster_replicate(clus, replcfg, nm)
+    if str_has_prefix(rr, "-") {
+        return 0
+    }
+    slog_with("info", "following new master", "id", nm)
+    return 1
+}
+
+fn cluster_addslots(clus: CMap, argv: []string, as_range: int) -> string {
+    if str_contains(cmap_get(clus, "flags"), "slave") {
+        return r_err("ERR Replica nodes cannot own slots")
+    }
+    let mut slots = cmap_get(clus, "slots")
+    if as_range == 1 {
+        if len(argv) != 4 {
+            return r_arity("cluster")
+        }
+        let a, oka = int_ok(argv[2])
+        let b, okb = int_ok(argv[3])
+        if oka == 0 or okb == 0 or a < 0 or b >= SLOT_COUNT {
+            return r_err("ERR Invalid slot")
+        }
+        slots = ranges_add(slots, a, b)
+    } else {
+        let mut i = 2
+        while i < len(argv) {
+            let s, ok = int_ok(argv[i])
+            if ok == 0 or s < 0 or s >= SLOT_COUNT {
+                return r_err("ERR Invalid slot")
+            }
+            slots = ranges_add(slots, s, s)
+            i = i + 1
+        }
+    }
+    let epoch = format_int(int_of(cmap_get(clus, "epoch")) + 1)
+    cluster_put(clus, cmap_get(clus, "id"), cmap_get(clus, "ip"), cmap_get(clus, "port"), "master", "-", slots, epoch)
+    cluster_save(clus)
+    cluster_push_all(clus)
+    log_cluster_slots(ranges_count(slots))
+    return r_ok()
+}
+
+fn gossip_bulk_body(r: string) -> string {
+    if str_has_prefix(r, "$") {
+        return bulk_payload(r)
+    }
+    return r
+}
+
+fn cluster_push_one(clus: CMap, ip: string, port: int) {
+    if str_len(ip) == 0 or port <= 0 {
+        return
+    }
+    let tls_on = cfg_tls_on(clus)
+    let g = peer_call(ip, port, ["CLUSTERX", "GOSSIP", cluster_nodes_blob(clus)], tls_on, cfg_tls_ca(clus))
+    log_cluster_gossip(ip, port)
+    let body = gossip_bulk_body(g)
+    if str_len(body) > 0 and not str_has_prefix(body, "-") {
+        cluster_merge_blob(clus, body)
+        cluster_save(clus)
+    }
+}
+
+fn cluster_push_all(clus: CMap) {
+    let me = cmap_get(clus, "id")
+    let ids = cluster_ids_list(clus)
+    let mut i = 0
+    while i < len(ids) {
+        if not str_eq(ids[i], me) {
+            let rec = cluster_rec(clus, ids[i])
+            cluster_push_one(clus, cluster_field(rec, 0), int_of(cluster_field(rec, 1)))
+        }
+        i = i + 1
+    }
+}
+
+fn gossip_loop(clus: CMap, stop: AtomicInt) -> int {
+    let mut n = 0
+    while shutdown_requested() == 0 and atomic_load(stop) == 0 {
+        if str_eq(cmap_get(clus, "on"), "1") and n % 10 == 0 {
+            cluster_push_all(clus)
+        }
+        n = n + 1
+        sleep_ms(50)
+    }
+    return 0
+}
+
+fn cluster_cmd_standalone(argv: []string, host: string, port: int) -> string {
+    if len(argv) < 2 {
+        return r_arity("cluster")
+    }
+    let sub = str_to_upper(argv[1])
+    if str_eq(sub, "KEYSLOT") {
+        if len(argv) != 3 {
+            return r_arity("cluster")
+        }
+        return r_int(key_slot(argv[2]))
+    }
+    if str_eq(sub, "INFO") {
+        return r_bulk("cluster_state:ok\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_known_nodes:1\r\ncluster_size:1\r\n")
+    }
+    if str_eq(sub, "SLOTS") {
+        return cluster_slots_reply(host, port)
+    }
+    if str_eq(sub, "NODES") {
+        let mut ip = host
+        if str_eq(ip, "0.0.0.0") or str_eq(ip, "::") or str_eq(ip, "") {
+            ip = "127.0.0.1"
+        }
+        return r_bulk("0000000000000000000000000000000000000001 " + ip + ":" + format_int(port) + "@1 myself,master - 0 0 1 connected 0-16383\r\n")
+    }
+    if str_eq(sub, "MYID") {
+        return r_bulk("0000000000000000000000000000000000000001")
+    }
+    return r_err("ERR This instance has cluster support disabled")
+}
+
+fn cluster_cmd(argv: []string, clus: CMap, replcfg: CMap) -> string {
+    if not str_eq(cmap_get(clus, "on"), "1") {
+        return cluster_cmd_standalone(argv, cmap_get(replcfg, "host"), int_of(cmap_get(replcfg, "port")))
+    }
+    if len(argv) < 2 {
+        return r_arity("cluster")
+    }
+    let sub = str_to_upper(argv[1])
+    if str_eq(sub, "KEYSLOT") {
+        if len(argv) != 3 {
+            return r_arity("cluster")
+        }
+        return r_int(key_slot(argv[2]))
+    }
+    if str_eq(sub, "MYID") {
+        return r_bulk(cmap_get(clus, "id"))
+    }
+    if str_eq(sub, "INFO") {
+        return r_bulk(cluster_info_text(clus))
+    }
+    if str_eq(sub, "NODES") {
+        return r_bulk(cluster_nodes_blob(clus))
+    }
+    if str_eq(sub, "SLOTS") {
+        return cluster_slots_resp(clus)
+    }
+    if str_eq(sub, "MEET") {
+        if len(argv) != 4 {
+            return r_arity("cluster")
+        }
+        let p, ok = int_ok(argv[3])
+        if ok == 0 {
+            return r_err("ERR Invalid port")
+        }
+        return cluster_meet_peer(clus, argv[2], p)
+    }
+    if str_eq(sub, "ADDSLOTS") {
+        return cluster_addslots(clus, argv, 0)
+    }
+    if str_eq(sub, "ADDSLOTSRANGE") {
+        return cluster_addslots(clus, argv, 1)
+    }
+    if str_eq(sub, "REPLICATE") {
+        if len(argv) != 3 {
+            return r_arity("cluster")
+        }
+        return cluster_replicate(clus, replcfg, argv[2])
+    }
+    if str_eq(sub, "FAILOVER") {
+        return cluster_failover(clus, replcfg)
+    }
+    if str_eq(sub, "SAVECONFIG") {
+        cluster_save(clus)
+        return r_ok()
+    }
+    if str_eq(sub, "COUNTKEYSINSLOT") {
+        return r_int(0)
+    }
+    if str_eq(sub, "GETKEYSINSLOT") {
+        let none: []string = []
+        return r_array_bulks(none)
+    }
+    if str_eq(sub, "REPLICAS") or str_eq(sub, "SLAVES") {
+        if len(argv) != 3 {
+            return r_arity("cluster")
+        }
+        let ids = cluster_ids_list(clus)
+        let mut lines = make([]string, 0, 4)
+        let mut i = 0
+        while i < len(ids) {
+            let rec = cluster_rec(clus, ids[i])
+            if str_eq(cluster_field(rec, 3), argv[2]) {
+                lines = append(lines, ids[i] + " " + cluster_field(rec, 0) + ":" + cluster_field(rec, 1) + " slave")
+            }
+            i = i + 1
+        }
+        return r_array_bulks(lines)
+    }
+    if str_eq(sub, "FORGET") {
+        if len(argv) != 3 {
+            return r_arity("cluster")
+        }
+        if str_eq(argv[2], cmap_get(clus, "id")) {
+            return r_err("ERR I will not forget myself")
+        }
+        cmap_set(clus, "n:" + argv[2], "")
+        return r_ok()
+    }
+    return r_err("ERR unknown CLUSTER subcommand")
+}
+
+fn clusterx_cmd(argv: []string, clus: CMap) -> string {
+    if not str_eq(cmap_get(clus, "on"), "1") {
+        return r_err("ERR This instance has cluster support disabled")
+    }
+    if len(argv) < 2 {
+        return r_arity("clusterx")
+    }
+    let sub = str_to_upper(argv[1])
+    if str_eq(sub, "MEET") {
+        if len(argv) < 5 {
+            return r_syntax()
+        }
+        log_clusterx("MEET", argv[2])
+        cluster_put(clus, argv[2], argv[3], argv[4], "master", "-", "", "0")
+        cluster_save(clus)
+        let mut items = make([]string, 0, 4)
+        items = append(items, cmap_get(clus, "id"))
+        items = append(items, cmap_get(clus, "ip"))
+        items = append(items, cmap_get(clus, "port"))
+        return r_array_bulks(items)
+    }
+    if str_eq(sub, "GOSSIP") {
+        log_clusterx("GOSSIP", cmap_get(clus, "id"))
+        if len(argv) >= 3 {
+            cluster_merge_blob(clus, argv[2])
+            cluster_save(clus)
+        }
+        return r_bulk(cluster_nodes_blob(clus))
+    }
+    if str_eq(sub, "VOTE") {
+        if len(argv) < 5 {
+            return r_syntax()
+        }
+        log_clusterx("VOTE", argv[2])
+        return cluster_grant_vote(clus, argv[2], argv[3], argv[4])
+    }
+    return r_err("ERR unknown CLUSTERX subcommand")
+}

@@ -1,0 +1,178 @@
+pack bonodis
+
+const HLL_M = 1024
+
+fn hll_mix(s: string) -> int {
+    let a = crc16(s)
+    let b = crc16(s + "#")
+    return ((a * 65599) + b) & 2147483647
+}
+
+fn hll_rho(x: int) -> int {
+    let mut v = x
+    let mut r = 1
+    while r < 32 {
+        if (v & 1) == 1 {
+            return r
+        }
+        v = v / 2
+        r = r + 1
+    }
+    return r
+}
+
+fn hll_new() -> string {
+    let b = str_builder()
+    builder_write(b, "HL")
+    let mut i = 0
+    while i < HLL_M {
+        builder_write_byte(b, byte(0))
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn Store_cmd_pfadd(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("pfadd")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let mut raw = ""
+    if t == T_NONE {
+        raw = hll_new()
+        self.strs[ik] = raw
+        self.types[ik] = T_STR
+    } else if t == T_STR {
+        raw = self.strs[ik]
+        if str_len(raw) != HLL_M + 2 or not str_has_prefix(raw, "HL") {
+            return r_wrongtype()
+        }
+    } else {
+        return r_wrongtype()
+    }
+    let mut changed = 0
+    let mut i = 2
+    while i < len(argv) {
+        let h = hll_mix(argv[i])
+        let mut idx = h % HLL_M
+        if idx < 0 {
+            idx = 0 - idx
+        }
+        let rho = hll_rho(h / HLL_M)
+        let pos = 2 + idx
+        let cur = str_byte_at(raw, pos)
+        if rho > cur {
+            let prefix = raw[:pos]
+            let suffix = raw[pos + 1:]
+            let b = str_builder()
+            builder_write(b, prefix)
+            builder_write_byte(b, byte(rho))
+            builder_write(b, suffix)
+            raw = builder_string(b)
+            changed = 1
+        }
+        i = i + 1
+    }
+    self.strs[ik] = raw
+    return r_int(changed)
+}
+
+fn hll_count(raw: string) -> int {
+    if str_len(raw) != HLL_M + 2 {
+        return 0
+    }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < HLL_M {
+        let r = str_byte_at(raw, 2 + i)
+        let mut p = 1.0
+        let mut k = 0
+        while k < r {
+            p = p * 2.0
+            k = k + 1
+        }
+        sum = sum + 1.0 / p
+        i = i + 1
+    }
+    if sum <= 0.0 {
+        return 0
+    }
+    let m = parse_float(format_int(HLL_M) + ".0")
+    let est = 0.72134752 * m * m / sum
+    let s = format_float(est, 0)
+    let dot = str_index(s, ".")
+    if dot > 0 {
+        return int_of(s[:dot])
+    }
+    return int_of(s)
+}
+
+fn Store_cmd_pfcount(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("pfcount")
+    }
+    let mut total = 0
+    let mut i = 1
+    while i < len(argv) {
+        let ik = ikey(db, argv[i])
+        let t = self.kind(ik)
+        if t == T_NONE {
+            i = i + 1
+            continue
+        }
+        if t != T_STR {
+            return r_wrongtype()
+        }
+        total = total + hll_count(self.strs[ik])
+        i = i + 1
+    }
+    return r_int(total)
+}
+
+fn Store_cmd_pfmerge(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("pfmerge")
+    }
+    let dest = argv[1]
+    let dik = ikey(db, dest)
+    let mut raw = hll_new()
+    if self.kind(dik) == T_STR and str_has_prefix(self.strs[dik], "HL") {
+        raw = self.strs[dik]
+    }
+    let mut i = 2
+    while i < len(argv) {
+        let ik = ikey(db, argv[i])
+        let t = self.kind(ik)
+        if t == T_NONE {
+            i = i + 1
+            continue
+        }
+        if t != T_STR or str_len(self.strs[ik]) != HLL_M + 2 {
+            return r_wrongtype()
+        }
+        let src = self.strs[ik]
+        let mut j = 0
+        while j < HLL_M {
+            let a = str_byte_at(raw, 2 + j)
+            let b = str_byte_at(src, 2 + j)
+            if b > a {
+                let prefix = raw[:2 + j]
+                let suffix = raw[3 + j:]
+                let sb = str_builder()
+                builder_write(sb, prefix)
+                builder_write_byte(sb, byte(b))
+                builder_write(sb, suffix)
+                raw = builder_string(sb)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if self.live(dik) == 1 {
+        let _ = self.drop_key(dik)
+    }
+    self.strs[dik] = raw
+    self.types[dik] = T_STR
+    return r_ok()
+}

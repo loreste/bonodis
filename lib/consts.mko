@@ -1,0 +1,64 @@
+pack bonodis
+
+// Bonodis — Redis-protocol compatible, multi-core in-memory store.
+// Shared constants. Implementation lives in sibling pack files.
+
+const SHARD_COUNT = 16
+const SLOT_COUNT = 16384
+const DEFAULT_PORT = 6379
+const PROTO_VER = "7.2.4"
+const MAX_QUERY_BUF = 16777216
+const MAX_UNAUTH_BUF = 65536
+const MAX_BULK = 4194304
+const DEFAULT_MAXCLIENTS = 50000
+const KEYS_HARD_LIMIT = 4096
+const ACCEPT_RATE_MAX = 50000
+const LISTEN_BACKLOG = 16384
+const ACCEPT_THREADS = 4
+const SHARD_CHAN = 8192
+const WAL_CHAN = 16384
+const SOCK_BUF = 131072
+const WAIT_SPIN = 256
+const WAIT_NEAR = 2048
+const WAIT_MAX = 80000
+const DEFAULT_UNIX_PERM = 448
+
+fn version() -> string {
+    return "0.14.0"
+}
+
+fn parse_octal(s: string) -> int {
+    if str_len(s) == 0 {
+        return 0 - 1
+    }
+    let mut n = 0
+    let mut i = 0
+    while i < str_len(s) {
+        let d = str_byte_at(s, i) - 48
+        if d < 0 or d > 7 {
+            return 0 - 1
+        }
+        n = n * 8 + d
+        i = i + 1
+    }
+    return n
+}
+
+fn os_name() -> string {
+    return syscall_uname_sysname()
+}
+
+fn os_supported() -> int {
+    let s = os_name()
+    if str_eq(s, "Darwin") or str_eq(s, "Linux") {
+        return 1
+    }
+    return 0
+}
+
+fn require_supported_os() {
+    if os_supported() == 0 {
+        print("bonodis: linux and macOS only (this is " + os_name() + ")")
+        exit(1)
+    }
+}

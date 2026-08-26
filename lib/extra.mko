@@ -1,0 +1,1733 @@
+pack bonodis
+
+fn Store_cmd_getdel(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("getdel")
+    }
+    let g = self.cmd_get(db, ["GET", argv[1]])
+    if str_has_prefix(g, "-") {
+        return g
+    }
+    if not str_eq(g, r_nil()) {
+        let _ = self.cmd_del(db, ["DEL", argv[1]])
+    }
+    return g
+}
+
+fn Store_cmd_getex(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("getex")
+    }
+    let g = self.cmd_get(db, ["GET", argv[1]])
+    if str_has_prefix(g, "-") or str_eq(g, r_nil()) {
+        return g
+    }
+    let ik = ikey(db, argv[1])
+    let mut i = 2
+    while i < len(argv) {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "PERSIST") {
+            delete(self.expire, ik)
+            i = i + 1
+        } else if str_eq(o, "EX") or str_eq(o, "PX") or str_eq(o, "EXAT") or str_eq(o, "PXAT") {
+            if i + 1 >= len(argv) {
+                return r_syntax()
+            }
+            let n, ok = int_ok(argv[i + 1])
+            if ok == 0 {
+                return r_notint()
+            }
+            if str_eq(o, "EX") {
+                self.set_expire_at(ik, wall_ms() + n * 1000)
+            } else if str_eq(o, "PX") {
+                self.set_expire_at(ik, wall_ms() + n)
+            } else if str_eq(o, "EXAT") {
+                self.set_expire_at(ik, n * 1000)
+            } else {
+                self.set_expire_at(ik, n)
+            }
+            i = i + 2
+        } else {
+            return r_syntax()
+        }
+    }
+    return g
+}
+
+fn Store_cmd_touch(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("touch")
+    }
+    let mut n = 0
+    let mut i = 1
+    while i < len(argv) {
+        let ik = ikey(db, argv[i])
+        if self.live(ik) == 1 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return r_int(n)
+}
+
+fn Store_cmd_copy(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("copy")
+    }
+    let src = ikey(db, argv[1])
+    let dst = ikey(db, argv[2])
+    if str_eq(src, dst) {
+        return r_err("ERR source and destination objects are the same")
+    }
+    let mut nx = 0
+    let mut i = 3
+    while i < len(argv) {
+        if str_eq(str_to_upper(argv[i]), "NX") {
+            nx = 1
+        }
+        i = i + 1
+    }
+    if self.live(src) == 0 {
+        return r_int(0)
+    }
+    if self.live(dst) == 1 {
+        if nx == 1 {
+            return r_int(0)
+        }
+        let _ = self.drop_key(dst)
+    }
+    let t = self.types[src]
+    self.types[dst] = t
+    if t == T_STR {
+        self.strs[dst] = self.strs[src]
+    } else if t == T_HASH {
+        self.hashes[dst] = self.hashes[src]
+    } else if t == T_LIST {
+        self.lists[dst] = self.lists[src]
+    } else if t == T_SET {
+        self.sets[dst] = self.sets[src]
+    } else if t == T_ZSET {
+        self.zsets[dst] = self.zsets[src]
+    }
+    if has(self.expire, src) {
+        self.expire[dst] = self.expire[src]
+    }
+    return r_int(1)
+}
+
+fn Store_cmd_smismember(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("smismember")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let mut items = make([]string, 0, len(argv) - 2)
+    let mut i = 2
+    while i < len(argv) {
+        let mut hit = 0
+        if t == T_SET {
+            if has(self.sets[ik], argv[i]) {
+                hit = 1
+            }
+        } else if t != T_NONE {
+            return r_wrongtype()
+        }
+        items = append(items, format_int(hit))
+        i = i + 1
+    }
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(len(items)))
+    builder_write(b, "\r\n")
+    i = 0
+    while i < len(items) {
+        builder_write(b, r_int(int_of(items[i])))
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn Store_cmd_sunion(mut self: Store, db: int, argv: []string, mode: int) -> string {
+    if len(argv) < 2 {
+        return r_arity("sunion")
+    }
+    let mut acc = make(map[string]int)
+    let mut first = 1
+    let mut i = 1
+    while i < len(argv) {
+        let ik = ikey(db, argv[i])
+        let t = self.kind(ik)
+        if t != T_NONE and t != T_SET {
+            return r_wrongtype()
+        }
+        let mut cur = make(map[string]int)
+        if t == T_SET {
+            cur = self.sets[ik]
+        }
+        if mode == 0 {
+            for m, _ in range cur {
+                acc[m] = 1
+            }
+        } else if mode == 1 {
+            if first == 1 {
+                for m, _ in range cur {
+                    acc[m] = 1
+                }
+                first = 0
+            } else {
+                let mut nxt = make(map[string]int)
+                for m, _ in range acc {
+                    if has(cur, m) {
+                        nxt[m] = 1
+                    }
+                }
+                acc = nxt
+            }
+        } else {
+            if first == 1 {
+                for m, _ in range cur {
+                    acc[m] = 1
+                }
+                first = 0
+            } else {
+                for m, _ in range cur {
+                    if has(acc, m) {
+                        delete(acc, m)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return r_array_bulks(set_members(acc))
+}
+
+fn Store_cmd_sunionstore(mut self: Store, db: int, argv: []string, mode: int) -> string {
+    if len(argv) < 3 {
+        return r_arity("sunionstore")
+    }
+    let dest = argv[1]
+    let mut src = make([]string, 0, len(argv) - 1)
+    src = append(src, "X")
+    let mut i = 2
+    while i < len(argv) {
+        src = append(src, argv[i])
+        i = i + 1
+    }
+    let body = self.cmd_sunion(db, src, mode)
+    if str_has_prefix(body, "-") {
+        return body
+    }
+    let ks = parse_array_bulks(body)
+    let dik = ikey(db, dest)
+    if self.live(dik) == 1 {
+        let _ = self.drop_key(dik)
+    }
+    if len(ks) == 0 {
+        return r_int(0)
+    }
+    let mut sadd = make([]string, 0, len(ks) + 2)
+    sadd = append(sadd, "SADD")
+    sadd = append(sadd, dest)
+    i = 0
+    while i < len(ks) {
+        sadd = append(sadd, ks[i])
+        i = i + 1
+    }
+    let _ = self.cmd_sadd(db, sadd)
+    return r_int(len(ks))
+}
+
+fn z_bound_ok(sc: string, minv: string, maxv: string) -> int {
+    let sv = parse_float(sc)
+    if not str_eq(str_to_lower(minv), "-inf") {
+        if sv < parse_float(minv) {
+            return 0
+        }
+    }
+    if not str_eq(str_to_lower(maxv), "+inf") and not str_eq(str_to_lower(maxv), "inf") {
+        if sv > parse_float(maxv) {
+            return 0
+        }
+    }
+    return 1
+}
+
+fn Store_cmd_zrangebyscore(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("zrangebyscore")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        let none: []string = []
+        return r_array_bulks(none)
+    }
+    if t != T_ZSET {
+        return r_wrongtype()
+    }
+    let mut withscores = 0
+    let mut i = 4
+    while i < len(argv) {
+        if str_eq(str_to_upper(argv[i]), "WITHSCORES") {
+            withscores = 1
+        }
+        i = i + 1
+    }
+    let mems, scs = z_sorted(self.zsets[ik])
+    let mut items = make([]string, 0, len(mems) * 2)
+    i = 0
+    while i < len(mems) {
+        if z_bound_ok(scs[i], argv[2], argv[3]) == 1 {
+            items = append(items, mems[i])
+            if withscores == 1 {
+                items = append(items, scs[i])
+            }
+        }
+        i = i + 1
+    }
+    return r_array_bulks(items)
+}
+
+fn Store_cmd_zcount(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("zcount")
+    }
+    let r = self.cmd_zrangebyscore(db, argv)
+    if str_has_prefix(r, "-") {
+        return r
+    }
+    return r_int(len(parse_array_bulks(r)))
+}
+
+fn Store_cmd_zpop(mut self: Store, db: int, argv: []string, rev: int) -> string {
+    if len(argv) < 2 or len(argv) > 3 {
+        return r_arity("zpopmin")
+    }
+    let mut n = 1
+    if len(argv) == 3 {
+        let c, ok = int_ok(argv[2])
+        if ok == 0 or c < 0 {
+            return r_notint()
+        }
+        n = c
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        let none: []string = []
+        return r_array_bulks(none)
+    }
+    if t != T_ZSET {
+        return r_wrongtype()
+    }
+    let mems, scs = z_sorted(self.zsets[ik])
+    if n > len(mems) {
+        n = len(mems)
+    }
+    let mut z = self.zsets[ik]
+    let mut out = make([]string, 0, n * 2)
+    let mut i = 0
+    while i < n {
+        let mut idx = i
+        if rev == 1 {
+            idx = len(mems) - 1 - i
+        }
+        out = append(out, mems[idx])
+        out = append(out, scs[idx])
+        delete(z, mems[idx])
+        i = i + 1
+    }
+    if len(z) == 0 {
+        let _ = self.drop_key(ik)
+    } else {
+        self.zsets[ik] = z
+    }
+    return r_array_bulks(out)
+}
+
+fn sort_vals(mut xs: []string, alpha: int, desc: int) -> []string {
+    let n = len(xs)
+    let mut p = 0
+    while p < n {
+        let mut j = 0
+        while j < n - 1 {
+            let mut sw = 0
+            if alpha == 1 {
+                if desc == 1 {
+                    if str_lt(xs[j], xs[j + 1]) == 1 {
+                        sw = 1
+                    }
+                } else {
+                    if str_lt(xs[j + 1], xs[j]) == 1 {
+                        sw = 1
+                    }
+                }
+            } else {
+                let a = parse_float(xs[j])
+                let b = parse_float(xs[j + 1])
+                if desc == 1 {
+                    if a < b {
+                        sw = 1
+                    }
+                } else {
+                    if a > b {
+                        sw = 1
+                    }
+                }
+            }
+            if sw == 1 {
+                let t = xs[j]
+                xs[j] = xs[j + 1]
+                xs[j + 1] = t
+            }
+            j = j + 1
+        }
+        p = p + 1
+    }
+    return xs
+}
+
+fn Store_cmd_sort(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("sort")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        let none: []string = []
+        return r_array_bulks(none)
+    }
+    let mut xs = make([]string, 0, 8)
+    if t == T_LIST {
+        xs = self.lists[ik]
+    } else if t == T_SET {
+        xs = set_members(self.sets[ik])
+    } else if t == T_ZSET {
+        let mems, _ = z_sorted(self.zsets[ik])
+        xs = mems
+    } else {
+        return r_wrongtype()
+    }
+    let mut alpha = 0
+    let mut desc = 0
+    let mut store = ""
+    let mut off = 0
+    let mut cnt = -1
+    let mut i = 2
+    while i < len(argv) {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "ALPHA") {
+            alpha = 1
+            i = i + 1
+        } else if str_eq(o, "DESC") {
+            desc = 1
+            i = i + 1
+        } else if str_eq(o, "ASC") {
+            desc = 0
+            i = i + 1
+        } else if str_eq(o, "LIMIT") {
+            if i + 2 >= len(argv) {
+                return r_syntax()
+            }
+            off = int_of(argv[i + 1])
+            cnt = int_of(argv[i + 2])
+            i = i + 3
+        } else if str_eq(o, "STORE") {
+            if i + 1 >= len(argv) {
+                return r_syntax()
+            }
+            store = argv[i + 1]
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    xs = sort_vals(xs, alpha, desc)
+    if cnt >= 0 {
+        xs = slice_skip_take(xs, off, cnt)
+    }
+    if str_len(store) > 0 {
+        let dik = ikey(db, store)
+        if self.live(dik) == 1 {
+            let _ = self.drop_key(dik)
+        }
+        if len(xs) == 0 {
+            return r_int(0)
+        }
+        self.lists[dik] = xs
+        self.types[dik] = T_LIST
+        return r_int(len(xs))
+    }
+    return r_array_bulks(xs)
+}
+
+fn Store_cmd_getrange(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("getrange")
+    }
+    let a, ao = int_ok(argv[2])
+    let b, bo = int_ok(argv[3])
+    if ao == 0 or bo == 0 {
+        return r_notint()
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_bulk("")
+    }
+    if t != T_STR {
+        return r_wrongtype()
+    }
+    let s = self.strs[ik]
+    let n = str_len(s)
+    let mut start = a
+    let mut stop = b
+    if start < 0 {
+        start = n + start
+    }
+    if stop < 0 {
+        stop = n + stop
+    }
+    if start < 0 {
+        start = 0
+    }
+    if stop >= n {
+        stop = n - 1
+    }
+    if n == 0 or start > stop or start >= n {
+        return r_bulk("")
+    }
+    return r_bulk(s[start:stop + 1])
+}
+
+fn Store_cmd_setrange(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("setrange")
+    }
+    let off, ok = int_ok(argv[2])
+    if ok == 0 or off < 0 {
+        return r_notint()
+    }
+    if off > 536870912 {
+        return r_err("ERR string exceeds maximum allowed size (512MB)")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t != T_NONE and t != T_STR {
+        return r_wrongtype()
+    }
+    let mut s = ""
+    if t == T_STR {
+        s = self.strs[ik]
+    }
+    let ins = argv[3]
+    let need = off + str_len(ins)
+    if str_len(s) < need {
+        s = grow_bytes(s, need)
+    }
+    let b = str_builder()
+    builder_write(b, s[:off])
+    builder_write(b, ins)
+    if off + str_len(ins) < str_len(s) {
+        builder_write(b, s[off + str_len(ins):])
+    }
+    let nv = builder_string(b)
+    self.strs[ik] = nv
+    self.types[ik] = T_STR
+    return r_int(str_len(nv))
+}
+
+fn Store_cmd_incrbyfloat(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("incrbyfloat")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let mut cur = 0.0
+    if t == T_STR {
+        cur = parse_float(self.strs[ik])
+    } else if t != T_NONE {
+        return r_wrongtype()
+    }
+    let d = parse_float(argv[2])
+    let n = cur + d
+    let s = format_float(n, 6)
+    self.strs[ik] = s
+    self.types[ik] = T_STR
+    return r_bulk(s)
+}
+
+fn Store_cmd_lrem(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("lrem")
+    }
+    let count, ok = int_ok(argv[2])
+    if ok == 0 {
+        return r_notint()
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_LIST {
+        return r_wrongtype()
+    }
+    let xs = self.lists[ik]
+    let val = argv[3]
+    let mut out = make([]string, 0, len(xs))
+    let mut n = 0
+    if count >= 0 {
+        let mut i = 0
+        while i < len(xs) {
+            if str_eq(xs[i], val) and (count == 0 or n < count) {
+                n = n + 1
+            } else {
+                out = append(out, xs[i])
+            }
+            i = i + 1
+        }
+    } else {
+        let lim = 0 - count
+        let mut i = len(xs) - 1
+        let mut keep = make([]int, 0, len(xs))
+        let mut j = 0
+        while j < len(xs) {
+            keep = append(keep, 1)
+            j = j + 1
+        }
+        while i >= 0 {
+            if str_eq(xs[i], val) and n < lim {
+                keep[i] = 0
+                n = n + 1
+            }
+            i = i - 1
+        }
+        i = 0
+        while i < len(xs) {
+            if keep[i] == 1 {
+                out = append(out, xs[i])
+            }
+            i = i + 1
+        }
+    }
+    if len(out) == 0 {
+        let _ = self.drop_key(ik)
+    } else {
+        self.lists[ik] = out
+    }
+    return r_int(n)
+}
+
+fn Store_cmd_linsert(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 5 {
+        return r_arity("linsert")
+    }
+    let where = str_to_upper(argv[2])
+    let mut before = 0
+    if str_eq(where, "BEFORE") {
+        before = 1
+    } else if not str_eq(where, "AFTER") {
+        return r_syntax()
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_LIST {
+        return r_wrongtype()
+    }
+    let xs = self.lists[ik]
+    let mut idx = -1
+    let mut i = 0
+    while i < len(xs) {
+        if str_eq(xs[i], argv[3]) {
+            idx = i
+            break
+        }
+        i = i + 1
+    }
+    if idx < 0 {
+        return r_int(0 - 1)
+    }
+    if before == 0 {
+        idx = idx + 1
+    }
+    let mut out = make([]string, 0, len(xs) + 1)
+    i = 0
+    while i < idx {
+        out = append(out, xs[i])
+        i = i + 1
+    }
+    out = append(out, argv[4])
+    while i < len(xs) {
+        out = append(out, xs[i])
+        i = i + 1
+    }
+    self.lists[ik] = out
+    return r_int(len(out))
+}
+
+fn Store_cmd_lmove(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 5 {
+        return r_arity("lmove")
+    }
+    let from = str_to_upper(argv[3])
+    let to = str_to_upper(argv[4])
+    let mut right_from = 0
+    if str_eq(from, "RIGHT") {
+        right_from = 1
+    } else if not str_eq(from, "LEFT") {
+        return r_syntax()
+    }
+    let mut right_to = 0
+    if str_eq(to, "RIGHT") {
+        right_to = 1
+    } else if not str_eq(to, "LEFT") {
+        return r_syntax()
+    }
+    let pop = self.cmd_lpop(db, ["LPOP", argv[1]], right_from)
+    if str_has_prefix(pop, "-") or str_eq(pop, r_nil()) {
+        return pop
+    }
+    let v = bulk_payload(pop)
+    if right_to == 1 {
+        let _ = self.cmd_lpush(db, ["RPUSH", argv[2], v], 1)
+    } else {
+        let _ = self.cmd_lpush(db, ["LPUSH", argv[2], v], 0)
+    }
+    return r_bulk(v)
+}
+
+fn Store_cmd_smove(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("smove")
+    }
+    let rem = self.cmd_srem(db, ["SREM", argv[1], argv[3]])
+    if str_eq(rem, ":0\r\n") {
+        return r_int(0)
+    }
+    if str_has_prefix(rem, "-") {
+        return rem
+    }
+    let _ = self.cmd_sadd(db, ["SADD", argv[2], argv[3]])
+    return r_int(1)
+}
+
+fn Store_cmd_zunionstore(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("zunionstore")
+    }
+    let dest = argv[1]
+    let nk, ok = int_ok(argv[2])
+    if ok == 0 or nk < 1 or 3 + nk > len(argv) {
+        return r_syntax()
+    }
+    let mut acc = make(map[string]string)
+    let mut i = 0
+    while i < nk {
+        let ik = ikey(db, argv[3 + i])
+        let t = self.kind(ik)
+        if t == T_ZSET {
+            let z = self.zsets[ik]
+            for m, sc in range z {
+                if has(acc, m) {
+                    let a = parse_float(acc[m])
+                    let b = parse_float(sc)
+                    acc[m] = format_float(a + b, 6)
+                } else {
+                    acc[m] = sc
+                }
+            }
+        } else if t == T_SET {
+            let s = self.sets[ik]
+            for m, _ in range s {
+                if not has(acc, m) {
+                    acc[m] = "1"
+                }
+            }
+        } else if t != T_NONE {
+            return r_wrongtype()
+        }
+        i = i + 1
+    }
+    let dik = ikey(db, dest)
+    if self.live(dik) == 1 {
+        let _ = self.drop_key(dik)
+    }
+    if len(acc) == 0 {
+        return r_int(0)
+    }
+    self.zsets[dik] = acc
+    self.types[dik] = T_ZSET
+    return r_int(len(acc))
+}
+
+fn scan_page(all: []string, argv: []string) -> string {
+    let mut cursor = 0
+    if len(argv) >= 3 {
+        cursor = int_of(argv[2])
+    }
+    let mut count = 10
+    let mut i = 3
+    while i + 1 < len(argv) {
+        if str_eq(str_to_upper(argv[i]), "COUNT") {
+            let n, ok = int_ok(argv[i + 1])
+            if ok == 1 and n > 0 {
+                count = n
+            }
+        }
+        i = i + 2
+    }
+    let chunk = slice_skip_take(all, cursor, count)
+    let mut next = cursor + len(chunk)
+    if next >= len(all) {
+        next = 0
+    }
+    return r_scan(format_int(next), chunk)
+}
+
+fn Store_cmd_hscan(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("hscan")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let mut all = make([]string, 0, 8)
+    if t == T_HASH {
+        let h = self.hashes[ik]
+        for f, v in range h {
+            all = append(all, f)
+            all = append(all, v)
+        }
+    } else if t != T_NONE {
+        return r_wrongtype()
+    }
+    return scan_page(all, argv)
+}
+
+fn Store_cmd_sscan(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("sscan")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let mut all = make([]string, 0, 8)
+    if t == T_SET {
+        all = set_members(self.sets[ik])
+    } else if t != T_NONE {
+        return r_wrongtype()
+    }
+    return scan_page(all, argv)
+}
+
+fn Store_cmd_zscan(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("zscan")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let mut all = make([]string, 0, 8)
+    if t == T_ZSET {
+        let mems, scs = z_sorted(self.zsets[ik])
+        let mut i = 0
+        while i < len(mems) {
+            all = append(all, mems[i])
+            all = append(all, scs[i])
+            i = i + 1
+        }
+    } else if t != T_NONE {
+        return r_wrongtype()
+    }
+    return scan_page(all, argv)
+}
+
+fn Store_cmd_hstrlen(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("hstrlen")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_HASH {
+        return r_wrongtype()
+    }
+    let h = self.hashes[ik]
+    if not has(h, argv[2]) {
+        return r_int(0)
+    }
+    return r_int(str_len(h[argv[2]]))
+}
+
+fn Store_cmd_hrandfield(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("hrandfield")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_nil()
+    }
+    if t != T_HASH {
+        return r_wrongtype()
+    }
+    let h = self.hashes[ik]
+    let mut fs = make([]string, 0, len(h))
+    for f, _ in range h {
+        fs = append(fs, f)
+    }
+    if len(fs) == 0 {
+        return r_nil()
+    }
+    if len(argv) >= 3 {
+        let n0, ok = int_ok(argv[2])
+        if ok == 0 {
+            return r_notint()
+        }
+        let mut n = n0
+        if n < 0 {
+            n = 0 - n
+        }
+        if n == 0 {
+            let none: []string = []
+            return r_array_bulks(none)
+        }
+        let mut out = make([]string, 0, n)
+        let mut i = 0
+        while i < n {
+            out = append(out, fs[rand_intn(len(fs))])
+            i = i + 1
+        }
+        return r_array_bulks(out)
+    }
+    return r_bulk(fs[rand_intn(len(fs))])
+}
+
+fn Store_cmd_zmscore(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("zmscore")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let mut items = make([]string, 0, len(argv) - 2)
+    let mut hit = make([]int, 0, len(argv) - 2)
+    let mut i = 2
+    while i < len(argv) {
+        if t == T_ZSET and has(self.zsets[ik], argv[i]) {
+            items = append(items, self.zsets[ik][argv[i]])
+            hit = append(hit, 1)
+        } else if t != T_NONE and t != T_ZSET {
+            return r_wrongtype()
+        } else {
+            items = append(items, "")
+            hit = append(hit, 0)
+        }
+        i = i + 1
+    }
+    return r_array_opt(items, hit)
+}
+
+fn Store_cmd_zremrangebyscore(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("zremrangebyscore")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_ZSET {
+        return r_wrongtype()
+    }
+    let mut z = self.zsets[ik]
+    let mut n = 0
+    let mut drop: []string = []
+    for m, sc in range z {
+        if z_bound_ok(sc, argv[2], argv[3]) == 1 {
+            drop = append(drop, m)
+        }
+    }
+    let mut i = 0
+    while i < len(drop) {
+        delete(z, drop[i])
+        n = n + 1
+        i = i + 1
+    }
+    if len(z) == 0 {
+        let _ = self.drop_key(ik)
+    } else {
+        self.zsets[ik] = z
+    }
+    return r_int(n)
+}
+
+fn Store_cmd_move(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("move")
+    }
+    let ndb, ok = int_ok(argv[2])
+    if ok == 0 or ndb < 0 or ndb > 15 {
+        return r_err("ERR DB index is out of range")
+    }
+    if ndb == db {
+        return r_int(0)
+    }
+    let src = ikey(db, argv[1])
+    let dst = ikey(ndb, argv[1])
+    if self.live(src) == 0 {
+        return r_int(0)
+    }
+    if self.live(dst) == 1 {
+        return r_int(0)
+    }
+    let t = self.types[src]
+    self.types[dst] = t
+    if t == T_STR {
+        self.strs[dst] = self.strs[src]
+    } else if t == T_HASH {
+        self.hashes[dst] = self.hashes[src]
+    } else if t == T_LIST {
+        self.lists[dst] = self.lists[src]
+    } else if t == T_SET {
+        self.sets[dst] = self.sets[src]
+    } else if t == T_ZSET {
+        self.zsets[dst] = self.zsets[src]
+    }
+    if has(self.expire, src) {
+        self.expire[dst] = self.expire[src]
+    }
+    let _ = self.drop_key(src)
+    return r_int(1)
+}
+
+fn Store_cmd_rpoplpush(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("rpoplpush")
+    }
+    return self.cmd_lmove(db, ["LMOVE", argv[1], argv[2], "RIGHT", "LEFT"])
+}
+
+fn Store_cmd_expiretime(mut self: Store, db: int, argv: []string, div: int) -> string {
+    if len(argv) != 2 {
+        return r_arity("expiretime")
+    }
+    let ik = ikey(db, argv[1])
+    if self.live(ik) == 0 {
+        return r_int(0 - 2)
+    }
+    if not has(self.expire, ik) {
+        return r_int(0 - 1)
+    }
+    let at = self.expire[ik]
+    if div == 1 {
+        return r_int(at)
+    }
+    return r_int(at / 1000)
+}
+
+fn Store_export_one(mut self: Store, db: int, k: string) -> string {
+    let ik = ikey(db, k)
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return ""
+    }
+    let b = str_builder()
+    if t == T_STR {
+        let mut a = make([]string, 0, 5)
+        a = append(a, "SET")
+        a = append(a, k)
+        a = append(a, self.strs[ik])
+        if has(self.expire, ik) {
+            a = append(a, "PXAT")
+            a = append(a, format_int(self.expire[ik]))
+        }
+        builder_write(b, encode_array(a))
+    } else if t == T_HASH {
+        let h = self.hashes[ik]
+        let mut a = make([]string, 0, 8)
+        a = append(a, "HSET")
+        a = append(a, k)
+        for f, v in range h {
+            a = append(a, f)
+            a = append(a, v)
+        }
+        if len(a) > 2 {
+            builder_write(b, encode_array(a))
+        }
+    } else if t == T_LIST {
+        let xs = self.lists[ik]
+        if len(xs) > 0 {
+            let mut a = make([]string, 0, len(xs) + 2)
+            a = append(a, "RPUSH")
+            a = append(a, k)
+            let mut j = 0
+            while j < len(xs) {
+                a = append(a, xs[j])
+                j = j + 1
+            }
+            builder_write(b, encode_array(a))
+        }
+    } else if t == T_SET {
+        let s = self.sets[ik]
+        let mut a = make([]string, 0, 8)
+        a = append(a, "SADD")
+        a = append(a, k)
+        for m, _ in range s {
+            a = append(a, m)
+        }
+        if len(a) > 2 {
+            builder_write(b, encode_array(a))
+        }
+    } else if t == T_ZSET {
+        let z = self.zsets[ik]
+        let mut a = make([]string, 0, 8)
+        a = append(a, "ZADD")
+        a = append(a, k)
+        for m, sc in range z {
+            a = append(a, sc)
+            a = append(a, m)
+        }
+        if len(a) > 2 {
+            builder_write(b, encode_array(a))
+        }
+    }
+    return builder_string(b)
+}
+
+fn Store_cmd_dump(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("dump")
+    }
+    let payload = self.export_one(db, argv[1])
+    if str_len(payload) == 0 {
+        return r_nil()
+    }
+    return r_bulk("BND1\n" + payload)
+}
+
+fn Store_cmd_restore(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("restore")
+    }
+    let k = argv[1]
+    let ttl, ok = int_ok(argv[2])
+    if ok == 0 {
+        return r_notint()
+    }
+    let mut payload = argv[3]
+    if str_has_prefix(payload, "BND1\n") {
+        payload = payload[5:]
+    }
+    let ik = ikey(db, k)
+    if self.live(ik) == 1 {
+        let mut replace = 0
+        let mut i = 4
+        while i < len(argv) {
+            if str_eq(str_to_upper(argv[i]), "REPLACE") {
+                replace = 1
+            }
+            i = i + 1
+        }
+        if replace == 0 {
+            return r_err("BUSYKEY Target key name already exists.")
+        }
+        let _ = self.drop_key(ik)
+    }
+    let mut pos = 0
+    let n = str_len(payload)
+    while pos < n {
+        let parsed, used, st = parse_cmd(payload[pos:])
+        if st != 1 or used <= 0 {
+            break
+        }
+        let mut cmdv = make([]string, 0, len(parsed))
+        let mut ci = 0
+        while ci < len(parsed) {
+            if ci == 1 {
+                cmdv = append(cmdv, k)
+            } else {
+                cmdv = append(cmdv, parsed[ci])
+            }
+            ci = ci + 1
+        }
+        let _ = self.apply(db, cmdv)
+        pos = pos + used
+    }
+    if ttl > 0 {
+        let _ = self.cmd_expire(db, ["PEXPIRE", k, format_int(ttl)], 1)
+    }
+    return r_ok()
+}
+
+fn Store_cmd_zrandmember(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("zrandmember")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_nil()
+    }
+    if t != T_ZSET {
+        return r_wrongtype()
+    }
+    let mems, _ = z_sorted(self.zsets[ik])
+    if len(mems) == 0 {
+        return r_nil()
+    }
+    return r_bulk(mems[rand_intn(len(mems))])
+}
+
+fn Store_cmd_lpos(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("lpos")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_nil()
+    }
+    if t != T_LIST {
+        return r_wrongtype()
+    }
+    let xs = self.lists[ik]
+    let mut i = 0
+    while i < len(xs) {
+        if str_eq(xs[i], argv[2]) {
+            return r_int(i)
+        }
+        i = i + 1
+    }
+    return r_nil()
+}
+
+fn Store_cmd_hincrbyfloat(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("hincrbyfloat")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t != T_NONE and t != T_HASH {
+        return r_wrongtype()
+    }
+    let _ = self.ensure_hash(ik)
+    let mut h = self.hashes[ik]
+    let mut cur = 0.0
+    if has(h, argv[2]) {
+        cur = parse_float(h[argv[2]])
+    }
+    let n = parse_float(argv[3])
+    let v = format_float(cur + n, 6)
+    h[argv[2]] = v
+    self.hashes[ik] = h
+    return r_bulk(v)
+}
+
+fn Store_cmd_hsetnx(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("hsetnx")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t != T_NONE and t != T_HASH {
+        return r_wrongtype()
+    }
+    let _ = self.ensure_hash(ik)
+    let mut h = self.hashes[ik]
+    if has(h, argv[2]) {
+        return r_int(0)
+    }
+    h[argv[2]] = argv[3]
+    self.hashes[ik] = h
+    return r_int(1)
+}
+
+fn Store_cmd_lpushx(mut self: Store, db: int, argv: []string, right: int) -> string {
+    if len(argv) < 3 {
+        return r_arity("lpushx")
+    }
+    let ik = ikey(db, argv[1])
+    if self.kind(ik) != T_LIST {
+        return r_int(0)
+    }
+    return self.cmd_lpush(db, argv, right)
+}
+
+fn Store_cmd_sintercard(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("sintercard")
+    }
+    let nk, ok = int_ok(argv[1])
+    if ok == 0 or nk < 1 or 2 + nk > len(argv) {
+        return r_syntax()
+    }
+    let ik0 = ikey(db, argv[2])
+    if self.kind(ik0) != T_SET {
+        return r_int(0)
+    }
+    let first = set_members(self.sets[ik0])
+    let mut n = 0
+    let mut fi = 0
+    while fi < len(first) {
+        let mut in_all = 1
+        let mut j = 1
+        while j < nk {
+            let ik = ikey(db, argv[2 + j])
+            if self.kind(ik) != T_SET {
+                in_all = 0
+            } else if not has(self.sets[ik], first[fi]) {
+                in_all = 0
+            }
+            j = j + 1
+        }
+        if in_all == 1 {
+            n = n + 1
+        }
+        fi = fi + 1
+    }
+    return r_int(n)
+}
+
+fn Store_cmd_zunion(mut self: Store, db: int, argv: []string, mode: int) -> string {
+    if len(argv) < 3 {
+        return r_arity("zunion")
+    }
+    let nk, ok = int_ok(argv[1])
+    if ok == 0 or nk < 1 or 2 + nk > len(argv) {
+        return r_syntax()
+    }
+    let mut acc = make(map[string]string)
+    let mut i = 0
+    while i < nk {
+        let ik = ikey(db, argv[2 + i])
+        let t = self.kind(ik)
+        let mut cur = make(map[string]string)
+        if t == T_ZSET {
+            cur = self.zsets[ik]
+        } else if t == T_SET {
+            let s = self.sets[ik]
+            for m, _ in range s {
+                cur[m] = "1"
+            }
+        } else if t != T_NONE {
+            return r_wrongtype()
+        }
+        if mode == 0 {
+            for m, sc in range cur {
+                if has(acc, m) {
+                    acc[m] = format_float(parse_float(acc[m]) + parse_float(sc), 6)
+                } else {
+                    acc[m] = sc
+                }
+            }
+        } else if mode == 1 {
+            if i == 0 {
+                acc = cur
+            } else {
+                let mut nxt = make(map[string]string)
+                for m, sc in range acc {
+                    if has(cur, m) {
+                        nxt[m] = format_float(parse_float(sc) + parse_float(cur[m]), 6)
+                    }
+                }
+                acc = nxt
+            }
+        } else {
+            if i == 0 {
+                acc = cur
+            } else {
+                for m, _ in range cur {
+                    if has(acc, m) {
+                        delete(acc, m)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    let mut items = make([]string, 0, len(acc))
+    for m, _ in range acc {
+        items = append(items, m)
+    }
+    return r_array_bulks(items)
+}
+
+fn Store_cmd_zunionstore_mode(mut self: Store, db: int, argv: []string, mode: int) -> string {
+    if mode == 0 {
+        return self.cmd_zunionstore(db, argv)
+    }
+    if len(argv) < 4 {
+        return r_arity("zinterstore")
+    }
+    let dest = argv[1]
+    let nk, ok = int_ok(argv[2])
+    if ok == 0 or nk < 1 or 3 + nk > len(argv) {
+        return r_syntax()
+    }
+    let mut zargv = make([]string, 0, nk + 2)
+    zargv = append(zargv, "ZUNION")
+    zargv = append(zargv, argv[2])
+    let mut i = 0
+    while i < nk {
+        zargv = append(zargv, argv[3 + i])
+        i = i + 1
+    }
+    let r = self.cmd_zunion(db, zargv, mode)
+    if str_has_prefix(r, "-") {
+        return r
+    }
+    let mems = parse_array_bulks(r)
+    let dik = ikey(db, dest)
+    if self.live(dik) == 1 {
+        let _ = self.drop_key(dik)
+    }
+    if len(mems) == 0 {
+        return r_int(0)
+    }
+    let mut z = make(map[string]string)
+    i = 0
+    while i < len(mems) {
+        z[mems[i]] = "1"
+        i = i + 1
+    }
+    self.zsets[dik] = z
+    self.types[dik] = T_ZSET
+    return r_int(len(mems))
+}
+
+fn Store_cmd_zrevrangebyscore(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("zrevrangebyscore")
+    }
+    let r = self.cmd_zrangebyscore(db, ["ZRANGEBYSCORE", argv[1], argv[3], argv[2]])
+    if str_has_prefix(r, "-") {
+        return r
+    }
+    let xs = parse_array_bulks(r)
+    let mut out = make([]string, 0, len(xs))
+    let mut i = len(xs) - 1
+    while i >= 0 {
+        out = append(out, xs[i])
+        i = i - 1
+    }
+    return r_array_bulks(out)
+}
+
+fn Store_cmd_zremrangebyrank(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 4 {
+        return r_arity("zremrangebyrank")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_ZSET {
+        return r_wrongtype()
+    }
+    let a0, oka = int_ok(argv[2])
+    let b0, okb = int_ok(argv[3])
+    if oka == 0 or okb == 0 {
+        return r_notint()
+    }
+    let mut a = a0
+    let mut b = b0
+    let mems, _ = z_sorted(self.zsets[ik])
+    let n = len(mems)
+    if a < 0 {
+        a = n + a
+    }
+    if b < 0 {
+        b = n + b
+    }
+    if a < 0 {
+        a = 0
+    }
+    if b >= n {
+        b = n - 1
+    }
+    if a > b or n == 0 {
+        return r_int(0)
+    }
+    let mut z = self.zsets[ik]
+    let mut i = a
+    let mut dropped = 0
+    while i <= b {
+        delete(z, mems[i])
+        dropped = dropped + 1
+        i = i + 1
+    }
+    if len(z) == 0 {
+        let _ = self.drop_key(ik)
+    } else {
+        self.zsets[ik] = z
+    }
+    return r_int(dropped)
+}
+
+fn Store_rekey(mut self: Store, src: string, dst: string) {
+    if str_eq(src, dst) or not has(self.types, src) {
+        return
+    }
+    let t = self.types[src]
+    self.types[dst] = t
+    if t == T_STR and has(self.strs, src) {
+        self.strs[dst] = self.strs[src]
+    } else if t == T_HASH and has(self.hashes, src) {
+        self.hashes[dst] = self.hashes[src]
+    } else if t == T_LIST and has(self.lists, src) {
+        self.lists[dst] = self.lists[src]
+    } else if t == T_SET and has(self.sets, src) {
+        self.sets[dst] = self.sets[src]
+    } else if t == T_ZSET and has(self.zsets, src) {
+        self.zsets[dst] = self.zsets[src]
+    } else if t == T_STREAM and has(self.streams, src) {
+        self.streams[dst] = self.streams[src]
+        if has(self.xseq, src) {
+            self.xseq[dst] = self.xseq[src]
+        }
+    }
+    if has(self.expire, src) {
+        self.expire[dst] = self.expire[src]
+    }
+    let _ = self.drop_key(src)
+}
+
+fn Store_cmd_swapdb(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("swapdb")
+    }
+    let a, oka = int_ok(argv[1])
+    let b, okb = int_ok(argv[2])
+    if oka == 0 or okb == 0 or a < 0 or b < 0 or a > 15 or b > 15 {
+        return r_err("ERR DB index is out of range")
+    }
+    if a == b {
+        return r_ok()
+    }
+    let ka = self.collect_keys(a, "*")
+    let kb = self.collect_keys(b, "*")
+    let tmp = 99
+    let mut i = 0
+    while i < len(ka) {
+        self.rekey(ikey(a, ka[i]), ikey(tmp, ka[i]))
+        i = i + 1
+    }
+    i = 0
+    while i < len(kb) {
+        self.rekey(ikey(b, kb[i]), ikey(a, kb[i]))
+        i = i + 1
+    }
+    i = 0
+    while i < len(ka) {
+        self.rekey(ikey(tmp, ka[i]), ikey(b, ka[i]))
+        i = i + 1
+    }
+    return r_ok()
+}
+
+fn Store_payload_bytes(mut self: Store, ik: string) -> int {
+    if not has(self.types, ik) {
+        return 0
+    }
+    let t = self.types[ik]
+    let mut n = str_len(ukey(ik)) + 16
+    if t == T_STR {
+        if has(self.strs, ik) {
+            n = n + str_len(self.strs[ik])
+        }
+    } else if t == T_HASH {
+        if has(self.hashes, ik) {
+            let h = self.hashes[ik]
+            for f, v in range h {
+                n = n + str_len(f) + str_len(v) + 8
+            }
+        }
+    } else if t == T_LIST {
+        if has(self.lists, ik) {
+            let xs = self.lists[ik]
+            let mut i = 0
+            while i < len(xs) {
+                n = n + str_len(xs[i]) + 8
+                i = i + 1
+            }
+        }
+    } else if t == T_SET {
+        if has(self.sets, ik) {
+            let s = self.sets[ik]
+            for m, _ in range s {
+                n = n + str_len(m) + 8
+            }
+        }
+    } else if t == T_ZSET {
+        if has(self.zsets, ik) {
+            let z = self.zsets[ik]
+            for m, sc in range z {
+                n = n + str_len(m) + str_len(sc) + 8
+            }
+        }
+    } else if t == T_STREAM {
+        if has(self.streams, ik) {
+            let xs = self.streams[ik]
+            let mut i = 0
+            while i < len(xs) {
+                n = n + str_len(xs[i]) + 8
+                i = i + 1
+            }
+        }
+        let pref = ik + "\u001e"
+        for gk, last in range self.xg {
+            if str_has_prefix(gk, pref) {
+                n = n + str_len(gk) + str_len(last)
+            }
+        }
+        for gk, pend in range self.xp {
+            if str_has_prefix(gk, pref) {
+                n = n + str_len(pend)
+            }
+        }
+    } else if t == T_VEC {
+        if has(self.vecs, ik) {
+            let v = self.vecs[ik]
+            for id, s in range v {
+                n = n + str_len(id) + str_len(s) + 8
+            }
+        }
+        if has(self.vtxt, ik) {
+            let tx = self.vtxt[ik]
+            for id, s in range tx {
+                n = n + str_len(id) + str_len(s)
+            }
+        }
+    }
+    return n
+}
+
+fn Store_recount(mut self: Store, _n: int) -> int {
+    let mut keys = make([]string, 0, 8)
+    for ik, _ in range self.types {
+        keys = append(keys, ik)
+    }
+    let mut n = 0
+    let mut i = 0
+    while i < len(keys) {
+        n = n + self.payload_bytes(keys[i])
+        i = i + 1
+    }
+    let _ = self.charge(n - self.used)
+    return self.used
+}
+
+fn Store_cmd_memory(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) >= 3 and str_eq(str_to_upper(argv[1]), "USAGE") {
+        let ik = ikey(db, argv[2])
+        if self.live(ik) == 0 {
+            return r_nil()
+        }
+        return r_int(self.payload_bytes(ik))
+    }
+    return r_int(self.recount(0))
+}
+
+fn Store_cmd_hgetdel(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("hgetdel")
+    }
+    let g = self.cmd_hget(db, ["HGET", argv[1], argv[2]])
+    if str_has_prefix(g, "$") and not str_eq(g, r_nil()) {
+        let _ = self.cmd_hdel(db, ["HDEL", argv[1], argv[2]])
+    }
+    return g
+}
+
+fn Store_cmd_lmpop(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("lmpop")
+    }
+    let nk, ok = int_ok(argv[1])
+    if ok == 0 or nk < 1 or 2 + nk >= len(argv) {
+        return r_syntax()
+    }
+    let mut right = 0
+    let mut count = 1
+    let mut i = 2 + nk
+    while i < len(argv) {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "RIGHT") {
+            right = 1
+        } else if str_eq(o, "LEFT") {
+            right = 0
+        } else if str_eq(o, "COUNT") and i + 1 < len(argv) {
+            count = int_of(argv[i + 1])
+            i = i + 1
+        }
+        i = i + 1
+    }
+    let mut k = 0
+    while k < nk {
+        let key = argv[2 + k]
+        let ik = ikey(db, key)
+        if self.kind(ik) == T_LIST and len(self.lists[ik]) > 0 {
+            let mut pop = "LPOP"
+            if right == 1 {
+                pop = "RPOP"
+            }
+            let r = self.cmd_lpop(db, [pop, key, format_int(count)], right)
+            if str_has_prefix(r, "*") and not str_has_prefix(r, "*0") {
+                let b = str_builder()
+                builder_write(b, "*2\r\n")
+                builder_write(b, r_bulk(key))
+                builder_write(b, r)
+                return builder_string(b)
+            }
+        }
+        k = k + 1
+    }
+    return r_nil()
+}
+
+fn Store_cmd_zmpop(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("zmpop")
+    }
+    let nk, ok = int_ok(argv[1])
+    if ok == 0 or nk < 1 or 2 + nk >= len(argv) {
+        return r_syntax()
+    }
+    let mut rev = 0
+    let mut count = 1
+    let mut i = 2 + nk
+    while i < len(argv) {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "MAX") {
+            rev = 1
+        } else if str_eq(o, "MIN") {
+            rev = 0
+        } else if str_eq(o, "COUNT") and i + 1 < len(argv) {
+            count = int_of(argv[i + 1])
+            i = i + 1
+        }
+        i = i + 1
+    }
+    let mut k = 0
+    while k < nk {
+        let key = argv[2 + k]
+        let ik = ikey(db, key)
+        if self.kind(ik) == T_ZSET {
+            let r = self.cmd_zpop(db, ["ZPOPMIN", key, format_int(count)], rev)
+            if str_has_prefix(r, "*") and not str_has_prefix(r, "*0") {
+                let b = str_builder()
+                builder_write(b, "*2\r\n")
+                builder_write(b, r_bulk(key))
+                builder_write(b, r)
+                return builder_string(b)
+            }
+        }
+        k = k + 1
+    }
+    return r_nil()
+}

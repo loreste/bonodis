@@ -1,0 +1,41 @@
+pack bonodis
+
+// Redis-style glob: * and ? (no character classes).
+
+fn glob_match(pat: string, s: string) -> int {
+    return glob_at(pat, 0, s, 0)
+}
+
+fn glob_at(pat: string, pi0: int, s: string, si0: int) -> int {
+    let pn = str_len(pat)
+    let sn = str_len(s)
+    let mut pi = pi0
+    let mut si = si0
+    // ponytail: iterative backtracking with one star-restart slot, O(n*m) worst case
+    let mut star_pi = -1
+    let mut star_si = -1
+    while pi < pn or si < sn {
+        if pi < pn {
+            let pc = str_byte_at(pat, pi)
+            if pc == 42 {
+                star_pi = pi
+                star_si = si
+                pi = pi + 1
+                continue
+            }
+            if si < sn and (pc == 63 or pc == str_byte_at(s, si)) {
+                pi = pi + 1
+                si = si + 1
+                continue
+            }
+        }
+        if star_pi >= 0 and star_si < sn {
+            pi = star_pi + 1
+            star_si = star_si + 1
+            si = star_si
+            continue
+        }
+        return 0
+    }
+    return 1
+}

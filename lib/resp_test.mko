@@ -1,0 +1,112 @@
+fn TestCmdNameIntern() {
+    assert_eq_str(cmd_name(["GET"]), "GET")
+    assert_eq_str(cmd_name(["get"]), "GET")
+    assert_eq_str(cmd_name(["Set"]), "SET")
+    assert_eq_str(cmd_name(["PING"]), "PING")
+    assert_eq_str(cmd_name(["unknowncmd"]), "UNKNOWNCMD")
+}
+
+fn TestHotKeyCmd() {
+    assert_eq(is_hot_key_cmd("GET"), 1)
+    assert_eq(is_hot_key_cmd("SET"), 1)
+    assert_eq(is_hot_key_cmd("PING"), 0)
+    assert_eq(is_hot_key_cmd("CONFIG"), 0)
+    assert_eq(DEFAULT_MAXCLIENTS, 50000)
+    assert_eq(ACCEPT_RATE_MAX, 50000)
+    assert(WAIT_SPIN < 32768)
+    assert(len(command_names()) > 100)
+    assert_eq(parse_octal("700"), 448)
+    assert_eq(DEFAULT_UNIX_PERM, 448)
+}
+
+fn TestFindCrlf() {
+    assert_eq(find_crlf("*1\r\n$4\r\nPING\r\n", 0), 2)
+    assert_eq(find_nl("a\nb\n", 0), 1)
+    assert_eq(find_nl("a\nb\n", 2), 3)
+}
+
+fn TestRespPing() {
+    let argv, n, st = parse_cmd("*1\r\n$4\r\nPING\r\n")
+    assert_eq(st, 1)
+    assert_eq(n, 14)
+    assert_eq(len(argv), 1)
+    assert_eq_str(argv[0], "PING")
+}
+
+fn TestRespSet() {
+    let raw = "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"
+    let argv, n, st = parse_cmd(raw)
+    assert_eq(st, 1)
+    assert_eq(n, str_len(raw))
+    assert_eq(len(argv), 3)
+    assert_eq_str(argv[0], "SET")
+    assert_eq_str(argv[1], "key")
+    assert_eq_str(argv[2], "value")
+}
+
+fn TestRespIncomplete() {
+    let argv, n, st = parse_cmd("*2\r\n$3\r\nGET\r\n")
+    assert_eq(st, 0)
+    assert_eq(n, 0)
+    assert_eq(len(argv), 0)
+}
+
+fn TestRespInline() {
+    let argv, n, st = parse_cmd("PING\r\n")
+    assert_eq(st, 1)
+    assert_eq(n, 6)
+    assert_eq_str(argv[0], "PING")
+}
+
+fn TestRespBulkBinary() {
+    let raw = "*2\r\n$3\r\nGET\r\n$4\r\na\r\nb\r\n"
+    let argv, n, st = parse_cmd(raw)
+    assert_eq(st, 1)
+    assert_eq(n, str_len(raw))
+    assert_eq_str(argv[1], "a\r\nb")
+}
+
+fn TestEncodeRoundtrip() {
+    let raw = encode_array(["SET", "k", "v"])
+    let argv, _, st = parse_cmd(raw)
+    assert_eq(st, 1)
+    assert_eq_str(argv[0], "SET")
+    assert_eq_str(argv[2], "v")
+}
+
+fn TestReplies() {
+    assert_eq_str(r_ok(), "+OK\r\n")
+    assert_eq_str(r_pong(), "+PONG\r\n")
+    assert_eq_str(r_nil(), "$-1\r\n")
+    assert_eq_str(r_int(7), ":7\r\n")
+    assert_eq_str(r_bulk("ab"), "$2\r\nab\r\n")
+}
+
+fn TestApiJsonCodec() {
+    let argv = json_argv("{\"argv\":[\"SET\",\"k\",\"v\"]}")
+    assert_eq(len(argv), 3)
+    assert_eq_str(argv[0], "SET")
+    assert_eq_str(argv[2], "v")
+    let cmd = json_argv("{\"cmd\":\"INCRBY\",\"args\":[\"n\",\"2\"]}")
+    assert_eq(len(cmd), 3)
+    assert_eq_str(cmd[0], "INCRBY")
+    let pong = resp_to_json("+PONG\r\n")
+    assert(str_contains(pong, "\"ok\":true"))
+    assert(str_contains(pong, "PONG"))
+    let n = resp_to_json(":3\r\n")
+    assert(str_contains(n, "\"result\":3"))
+    let nilv = resp_to_json("$-1\r\n")
+    assert(str_contains(nilv, "null"))
+    let err = resp_to_json("-ERR nope\r\n")
+    assert(str_contains(err, "\"ok\":false"))
+    let d = api_discover()
+    assert(str_contains(d, "bonodis"))
+    assert(str_contains(d, "RESP2"))
+    let fake = "GET /api HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    assert_eq_str(http_req_path(fake), "/api")
+    assert_eq_str(http_req_method(fake), "GET")
+    let nested = "{\"params\":{\"name\":\"turn\",\"arguments\":{\"session\":\"s\",\"ns\":\"m\"}}}"
+    let params = json_obj(nested, "params")
+    assert(str_contains(params, "turn"))
+    assert_eq_str(json_str(json_obj(params, "arguments"), "session"), "s")
+}

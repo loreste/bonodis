@@ -1,0 +1,566 @@
+pack bonodis
+
+// HTTP JSON command API on --metrics-port so Lua and other languages
+// can talk without a Redis driver. RESP2 on --port remains the native API.
+
+fn json_skip_ws(s: string, p: int) -> int {
+    let n = str_len(s)
+    let mut i = p
+    while i < n {
+        let c = str_byte_at(s, i)
+        if c != 32 and c != 9 and c != 10 and c != 13 {
+            break
+        }
+        i = i + 1
+    }
+    return i
+}
+
+fn json_after_key(body: string, key: string) -> int {
+    let pat = "\"" + key + "\""
+    let i = str_index(body, pat)
+    if i < 0 {
+        return 0 - 1
+    }
+    let rest_i = i + str_len(pat)
+    let mut j = rest_i
+    while j < str_len(body) {
+        if str_byte_at(body, j) == 58 {
+            return json_skip_ws(body, j + 1)
+        }
+        j = j + 1
+    }
+    return 0 - 1
+}
+
+fn json_parse_string(s: string, p0: int) -> (string, int, int) {
+    let p = json_skip_ws(s, p0)
+    let n = str_len(s)
+    if p >= n or str_byte_at(s, p) != 34 {
+        return ("", p, 1)
+    }
+    let b = str_builder()
+    let mut i = p + 1
+    while i < n {
+        let c = str_byte_at(s, i)
+        if c == 34 {
+            return (builder_string(b), i + 1, 0)
+        }
+        if c == 92 and i + 1 < n {
+            let e = str_byte_at(s, i + 1)
+            if e == 110 {
+                builder_write(b, "\n")
+            } else if e == 116 {
+                builder_write(b, "\t")
+            } else if e == 114 {
+                builder_write(b, "\r")
+            } else {
+                builder_write_byte(b, byte(e))
+            }
+            i = i + 2
+        } else {
+            builder_write_byte(b, byte(c))
+            i = i + 1
+        }
+    }
+    return ("", p, 1)
+}
+
+fn json_parse_token(s: string, p0: int) -> (string, int, int) {
+    let p = json_skip_ws(s, p0)
+    let n = str_len(s)
+    if p >= n {
+        return ("", p, 1)
+    }
+    if str_byte_at(s, p) == 34 {
+        return json_parse_string(s, p)
+    }
+    let mut i = p
+    while i < n {
+        let c = str_byte_at(s, i)
+        if c == 44 or c == 93 or c == 125 or c == 32 or c == 9 or c == 10 or c == 13 {
+            break
+        }
+        i = i + 1
+    }
+    if i == p {
+        return ("", p, 1)
+    }
+    return (s[p:i], i, 0)
+}
+
+fn json_parse_str_array(s: string, p0: int) -> ([]string, int, int) {
+    let mut out = make([]string, 0, 4)
+    let mut p = json_skip_ws(s, p0)
+    let n = str_len(s)
+    if p >= n or str_byte_at(s, p) != 91 {
+        return (out, p, 1)
+    }
+    p = json_skip_ws(s, p + 1)
+    if p < n and str_byte_at(s, p) == 93 {
+        return (out, p + 1, 0)
+    }
+    while p < n {
+        let v, np, e = json_parse_token(s, p)
+        if e != 0 {
+            return (out, p, 1)
+        }
+        out = append(out, v)
+        p = json_skip_ws(s, np)
+        if p < n and str_byte_at(s, p) == 44 {
+            p = json_skip_ws(s, p + 1)
+            continue
+        }
+        if p < n and str_byte_at(s, p) == 93 {
+            return (out, p + 1, 0)
+        }
+        return (out, p, 1)
+    }
+    return (out, p, 1)
+}
+
+fn json_argv(body: string) -> []string {
+    let none: []string = []
+    let mut p = json_after_key(body, "argv")
+    if p < 0 {
+        p = json_after_key(body, "command")
+    }
+    if p >= 0 {
+        let argv, _, e = json_parse_str_array(body, p)
+        if e == 0 and len(argv) > 0 {
+            return argv
+        }
+        if e != 0 {
+            let cmd, _, ce = json_parse_string(body, p)
+            if ce == 0 and str_len(cmd) > 0 {
+                return str_fields(cmd)
+            }
+        }
+    }
+    let mut cmd = json_str(body, "cmd")
+    if str_len(cmd) == 0 {
+        cmd = json_str(body, "command")
+    }
+    if str_len(cmd) == 0 {
+        return none
+    }
+    let mut argv = make([]string, 0, 4)
+    argv = append(argv, cmd)
+    let ap = json_after_key(body, "args")
+    if ap >= 0 {
+        let args, _, e = json_parse_str_array(body, ap)
+        if e == 0 {
+            let mut i = 0
+            while i < len(args) {
+                argv = append(argv, args[i])
+                i = i + 1
+            }
+        }
+    }
+    return argv
+}
+
+fn http_header(raw: string, name: string) -> string {
+    let nl = str_index(raw, "\r\n")
+    if nl < 0 {
+        return ""
+    }
+    let want = str_to_lower(name) + ":"
+    let mut rest = raw[nl + 2:]
+    while str_len(rest) > 0 {
+        let cr = str_index(rest, "\r\n")
+        let mut line = rest
+        if cr >= 0 {
+            line = rest[:cr]
+            rest = rest[cr + 2:]
+        } else {
+            rest = ""
+        }
+        if str_len(line) == 0 {
+            break
+        }
+        let low = str_to_lower(line)
+        if str_has_prefix(low, want) {
+            let mut v = line[str_len(want):]
+            let mut i = 0
+            while i < str_len(v) and (str_byte_at(v, i) == 32 or str_byte_at(v, i) == 9) {
+                i = i + 1
+            }
+            return v[i:]
+        }
+    }
+    return ""
+}
+
+fn api_auth(raw: string, body: string, replcfg: CMap) -> int {
+    if not str_eq(cmap_get(replcfg, "needauth"), "1") {
+        return 1
+    }
+    let pass = cmap_get(replcfg, "requirepass")
+    if str_len(pass) == 0 {
+        return 0
+    }
+    if str_eq(json_str(body, "auth"), pass) {
+        return 1
+    }
+    if str_eq(http_header(raw, "x-bonodis-auth"), pass) {
+        return 1
+    }
+    let h = http_header(raw, "authorization")
+    if str_has_prefix(str_to_lower(h), "bearer ") {
+        if str_eq(h[7:], pass) {
+            return 1
+        }
+    }
+    if str_eq(h, pass) {
+        return 1
+    }
+    return 0
+}
+
+fn resp_json_node(r: string, p0: int) -> (string, int) {
+    let n = str_len(r)
+    if p0 < 0 or p0 >= n {
+        return ("null", p0)
+    }
+    let c = str_byte_at(r, p0)
+    if c == 43 {
+        let cr = find_crlf(r, p0)
+        if cr < 0 {
+            return ("null", n)
+        }
+        return ("\"" + json_esc(r[p0 + 1:cr]) + "\"", cr + 2)
+    }
+    if c == 45 {
+        let cr = find_crlf(r, p0)
+        if cr < 0 {
+            return ("null", n)
+        }
+        return ("{\"error\":\"" + json_esc(r[p0 + 1:cr]) + "\"}", cr + 2)
+    }
+    if c == 58 {
+        let cr = find_crlf(r, p0)
+        if cr < 0 {
+            return ("0", n)
+        }
+        return (r[p0 + 1:cr], cr + 2)
+    }
+    if c == 36 {
+        if str_has_prefix(r[p0:], "$-1") {
+            let cr = find_crlf(r, p0)
+            if cr < 0 {
+                return ("null", n)
+            }
+            return ("null", cr + 2)
+        }
+        let cr = find_crlf(r, p0)
+        if cr < 2 {
+            return ("null", n)
+        }
+        let ln = int_of(r[p0 + 1:cr])
+        let start = cr + 2
+        if ln < 0 {
+            return ("null", start)
+        }
+        if start + ln > n {
+            return ("\"" + json_esc(r[start:]) + "\"", n)
+        }
+        return ("\"" + json_esc(r[start:start + ln]) + "\"", start + ln + 2)
+    }
+    if c == 42 {
+        if str_has_prefix(r[p0:], "*-1") {
+            let cr = find_crlf(r, p0)
+            if cr < 0 {
+                return ("null", n)
+            }
+            return ("null", cr + 2)
+        }
+        let cr = find_crlf(r, p0)
+        if cr < 2 {
+            return ("[]", n)
+        }
+        let cnt = int_of(r[p0 + 1:cr])
+        let mut p = cr + 2
+        if cnt < 0 {
+            return ("null", p)
+        }
+        let b = str_builder()
+        builder_write(b, "[")
+        let mut i = 0
+        while i < cnt {
+            if i > 0 {
+                builder_write(b, ",")
+            }
+            let piece, np = resp_json_node(r, p)
+            builder_write(b, piece)
+            p = np
+            i = i + 1
+        }
+        builder_write(b, "]")
+        return (builder_string(b), p)
+    }
+    return ("\"" + json_esc(r[p0:]) + "\"", n)
+}
+
+fn resp_to_json(r: string) -> string {
+    if str_len(r) == 0 {
+        return "{\"ok\":false,\"error\":\"empty reply\"}"
+    }
+    if str_byte_at(r, 0) == 45 {
+        let cr = find_crlf(r, 0)
+        let mut msg = r[1:]
+        if cr > 1 {
+            msg = r[1:cr]
+        }
+        return "{\"ok\":false,\"error\":\"" + json_esc(msg) + "\"}"
+    }
+    let node, _ = resp_json_node(r, 0)
+    return "{\"ok\":true,\"result\":" + node + "}"
+}
+
+fn json_obj(body: string, key: string) -> string {
+    let mut p = json_after_key(body, key)
+    if p < 0 {
+        return ""
+    }
+    p = json_skip_ws(body, p)
+    let n = str_len(body)
+    if p >= n or str_byte_at(body, p) != 123 {
+        return ""
+    }
+    let mut depth = 0
+    let mut i = p
+    while i < n {
+        let c = str_byte_at(body, i)
+        if c == 34 {
+            i = i + 1
+            while i < n {
+                let e = str_byte_at(body, i)
+                if e == 34 {
+                    break
+                }
+                if e == 92 {
+                    i = i + 1
+                }
+                i = i + 1
+            }
+        } else if c == 123 {
+            depth = depth + 1
+        } else if c == 125 {
+            depth = depth - 1
+            if depth == 0 {
+                return body[p:i + 1]
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn qs_get(qs: string, key: string) -> string {
+    let tag = key + "="
+    let i = str_index(qs, tag)
+    if i < 0 {
+        return ""
+    }
+    let mut v = qs[i + str_len(tag):]
+    let amp = str_index(v, "&")
+    if amp >= 0 {
+        v = v[:amp]
+    }
+    return v
+}
+
+fn api_discover() -> string {
+    return "{\"ok\":true,\"service\":\"bonodis\",\"version\":\"" + version() + "\",\"protocol\":\"RESP2\",\"http\":{\"command\":\"POST /api\",\"pipeline\":\"POST /api/pipeline\",\"ping\":\"GET /api/ping\"}}"
+}
+
+fn api_run(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, argv: []string) -> string {
+    if len(argv) == 0 {
+        return "{\"ok\":false,\"error\":\"empty command\"}"
+    }
+    let cmd = cmd_name(argv)
+    if str_eq(cmd, "PING") {
+        if len(argv) >= 2 {
+            return resp_to_json(r_bulk(argv[1]))
+        }
+        return resp_to_json(r_pong())
+    }
+    if str_eq(cmd, "ECHO") {
+        if len(argv) < 2 {
+            return resp_to_json(r_arity("echo"))
+        }
+        return resp_to_json(r_bulk(argv[1]))
+    }
+    if str_eq(cmd, "TIME") {
+        let ms = wall_ms()
+        let b = str_builder()
+        builder_write(b, "*2\r\n")
+        builder_write(b, r_bulk(format_int(ms / 1000)))
+        builder_write(b, r_bulk(format_int((ms % 1000) * 1000)))
+        return resp_to_json(builder_string(b))
+    }
+    let r = dispatch(bus, replies, ids, shards, 0, argv)
+    return resp_to_json(r)
+}
+
+fn api_http(raw: string, bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, replcfg: CMap) -> string {
+    let path = http_req_path(raw)
+    let qpos = str_index(path, "?")
+    let mut p = path
+    if qpos >= 0 {
+        p = path[:qpos]
+    }
+    let mut isapi = 0
+    if str_eq(p, "/api") {
+        isapi = 1
+    }
+    if str_has_prefix(p, "/api/") {
+        isapi = 1
+    }
+    if str_eq(p, "/mcp") or str_eq(p, "/play") or str_eq(p, "/turn") {
+        isapi = 1
+    }
+    if isapi == 0 {
+        return ""
+    }
+    let method = http_req_method(raw)
+    if str_eq(method, "OPTIONS") {
+        return http_json(200, "{\"ok\":true}")
+    }
+    if str_eq(p, "/play") and str_eq(method, "GET") {
+        return http_html(play_html())
+    }
+    if str_eq(p, "/mcp") {
+        if str_eq(method, "GET") {
+            return http_json(200, "{\"ok\":true,\"transport\":\"HTTP POST JSON-RPC 2.0 (not Streamable HTTP/SSE)\",\"methods\":[\"initialize\",\"tools/list\",\"tools/call\",\"ping\"],\"tools\":[\"turn\",\"remember\",\"believe\",\"ask\",\"relate\"]}")
+        }
+        if str_eq(method, "POST") {
+            if api_auth(raw, http_req_body(raw), replcfg) == 0 {
+                return http_json(401, "{\"ok\":false,\"error\":\"NOAUTH Authentication required.\"}")
+            }
+            return http_json(200, mcp_handle(http_req_body(raw), bus, replies, ids, shards))
+        }
+    }
+    if str_eq(p, "/turn") and str_eq(method, "POST") {
+        let body = http_req_body(raw)
+        if api_auth(raw, body, replcfg) == 0 {
+            return http_json(401, "{\"ok\":false,\"error\":\"NOAUTH Authentication required.\"}")
+        }
+        let session = json_str(body, "session")
+        let ns = json_str(body, "ns")
+        let q = json_str(body, "query")
+        if str_len(session) == 0 or str_len(ns) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"session and ns required\"}")
+        }
+        let mut argv = make([]string, 0, 8)
+        argv = append(argv, "TURN")
+        argv = append(argv, session)
+        argv = append(argv, ns)
+        if str_len(q) > 0 {
+            argv = append(argv, "QUERY")
+            argv = append(argv, q)
+        }
+        return http_json(200, api_run(bus, replies, ids, shards, argv))
+    }
+    if str_eq(p, "/api") or str_eq(p, "/api/") or str_eq(p, "/api/help") {
+        if str_eq(method, "GET") {
+            return http_json(200, api_discover())
+        }
+    }
+    if str_eq(p, "/api/ping") and str_eq(method, "GET") {
+        return http_json(200, api_run(bus, replies, ids, shards, ["PING"]))
+    }
+    let mut qs = ""
+    if qpos >= 0 {
+        qs = path[qpos + 1:]
+    }
+    if str_eq(method, "GET") and str_eq(p, "/api/why") {
+        let k = qs_get(qs, "key")
+        if str_len(k) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"key required\"}")
+        }
+        if api_auth(raw, "", replcfg) == 0 {
+            return http_json(401, "{\"ok\":false,\"error\":\"NOAUTH Authentication required.\"}")
+        }
+        return http_json(200, api_run(bus, replies, ids, shards, ["WHY", k]))
+    }
+    if str_eq(method, "GET") and str_eq(p, "/api/ask") {
+        let k = qs_get(qs, "key")
+        let q = qs_get(qs, "q")
+        if str_len(k) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"key required\"}")
+        }
+        if api_auth(raw, "", replcfg) == 0 {
+            return http_json(401, "{\"ok\":false,\"error\":\"NOAUTH Authentication required.\"}")
+        }
+        if str_len(q) == 0 {
+            return http_json(200, api_run(bus, replies, ids, shards, ["ASK", k, "OF"]))
+        }
+        return http_json(200, api_run(bus, replies, ids, shards, ["ASK", k, "QUERY", q]))
+    }
+    if str_eq(method, "GET") and str_eq(p, "/api/neighbors") {
+        let k = qs_get(qs, "key")
+        if str_len(k) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"key required\"}")
+        }
+        if api_auth(raw, "", replcfg) == 0 {
+            return http_json(401, "{\"ok\":false,\"error\":\"NOAUTH Authentication required.\"}")
+        }
+        return http_json(200, api_run(bus, replies, ids, shards, ["NEIGHBORS", k]))
+    }
+    let body = http_req_body(raw)
+    if str_eq(p, "/api/pipeline") and str_eq(method, "POST") {
+        if api_auth(raw, body, replcfg) == 0 {
+            return http_json(401, "{\"ok\":false,\"error\":\"NOAUTH Authentication required.\"}")
+        }
+        let ap = json_after_key(body, "commands")
+        if ap < 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"commands array required\"}")
+        }
+        let mut pos = json_skip_ws(body, ap)
+        if pos >= str_len(body) or str_byte_at(body, pos) != 91 {
+            return http_json(400, "{\"ok\":false,\"error\":\"commands must be an array\"}")
+        }
+        pos = json_skip_ws(body, pos + 1)
+        let b = str_builder()
+        builder_write(b, "{\"ok\":true,\"replies\":[")
+        let mut n = 0
+        while pos < str_len(body) {
+            pos = json_skip_ws(body, pos)
+            if pos < str_len(body) and str_byte_at(body, pos) == 93 {
+                break
+            }
+            let argv, np, e = json_parse_str_array(body, pos)
+            if e != 0 {
+                return http_json(400, "{\"ok\":false,\"error\":\"bad command array\"}")
+            }
+            if n > 0 {
+                builder_write(b, ",")
+            }
+            builder_write(b, api_run(bus, replies, ids, shards, argv))
+            n = n + 1
+            pos = json_skip_ws(body, np)
+            if pos < str_len(body) and str_byte_at(body, pos) == 44 {
+                pos = pos + 1
+            }
+        }
+        builder_write(b, "]}")
+        return http_json(200, builder_string(b))
+    }
+    if str_eq(method, "POST") and (str_eq(p, "/api") or str_eq(p, "/api/") or str_eq(p, "/api/command") or str_eq(p, "/api/cmd")) {
+        if api_auth(raw, body, replcfg) == 0 {
+            return http_json(401, "{\"ok\":false,\"error\":\"NOAUTH Authentication required.\"}")
+        }
+        let argv = json_argv(body)
+        if len(argv) == 0 {
+            return http_json(400, "{\"ok\":false,\"error\":\"argv or cmd required\"}")
+        }
+        let out = api_run(bus, replies, ids, shards, argv)
+        if str_has_prefix(out, "{\"ok\":false") {
+            return http_json(400, out)
+        }
+        return http_json(200, out)
+    }
+    return http_json(404, "{\"ok\":false,\"error\":\"not found\"}")
+}

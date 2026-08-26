@@ -1,0 +1,124 @@
+fn TestRangesHas() {
+    assert_eq(ranges_has("0-5460", 0), 1)
+    assert_eq(ranges_has("0-5460", 5460), 1)
+    assert_eq(ranges_has("0-5460", 5461), 0)
+    assert_eq(ranges_has("0-100,200-300", 250), 1)
+    assert_eq(ranges_has("", 1), 0)
+}
+
+fn TestRangesAdd() {
+    let r = ranges_add("", 0, 10)
+    assert_eq_str(r, "0-10")
+    let r2 = ranges_add(r, 20, 30)
+    assert(str_contains(r2, "20-30"))
+}
+
+fn TestSplitSlotsCover() {
+    let parts = cluster_split_slots(3)
+    assert_eq(len(parts), 3)
+    let mut n = 0
+    let mut i = 0
+    while i < len(parts) {
+        n = n + ranges_count(parts[i])
+        i = i + 1
+    }
+    assert_eq(n, 16384)
+    assert_eq(ranges_has(parts[0], 0), 1)
+    assert_eq(ranges_has(parts[2], 16383), 1)
+}
+
+fn TestNodeIdLen() {
+    let id = new_node_id()
+    assert_eq(str_len(id), 40)
+}
+
+fn TestParseIpPort() {
+    let h, p = parse_ipport("127.0.0.1:7001@17001")
+    assert_eq_str(h, "127.0.0.1")
+    assert_eq_str(p, "7001")
+}
+
+fn TestLowestReplica() {
+    let clus = cmap_new()
+    cmap_set(clus, "id", "ccc")
+    cluster_put(clus, "aaa", "127.0.0.1", "7000", "master", "-", "0-100", "1")
+    cluster_put(clus, "bbb", "127.0.0.1", "7001", "slave", "aaa", "", "1")
+    cluster_put(clus, "ccc", "127.0.0.1", "7002", "slave", "aaa", "", "1")
+    assert_eq_str(cluster_lowest_replica(clus, "aaa"), "bbb")
+    cmap_set(clus, "flags", "slave")
+    cmap_set(clus, "master", "aaa")
+    let repl = cmap_new()
+    assert_eq(cluster_try_autofailover(clus, repl), 0)
+    cmap_set(clus, "id", "bbb")
+    cmap_set(clus, "flags", "master")
+    assert_eq(cluster_try_autofailover(clus, repl), 0)
+}
+
+fn TestQuorumNeeded() {
+    assert_eq(cluster_quorum_needed(0), 1)
+    assert_eq(cluster_quorum_needed(1), 1)
+    assert_eq(cluster_quorum_needed(2), 2)
+    assert_eq(cluster_quorum_needed(3), 2)
+    assert_eq(cluster_quorum_needed(4), 3)
+    assert_eq(cluster_quorum_needed(5), 3)
+}
+
+fn TestGrantVote() {
+    let clus = cmap_new()
+    cmap_set(clus, "id", "bbb")
+    cmap_set(clus, "flags", "slave")
+    cmap_set(clus, "master", "aaa")
+    cluster_put(clus, "aaa", "127.0.0.1", "7000", "master", "-", "0-100", "1")
+    cluster_put(clus, "bbb", "127.0.0.1", "7001", "slave", "aaa", "", "1")
+    assert(str_has_prefix(cluster_grant_vote(clus, "bbb", "2", "aaa"), "+OK"))
+    assert_eq_str(cmap_get(clus, "vote_for"), "bbb")
+    assert(str_has_prefix(cluster_grant_vote(clus, "ccc", "2", "aaa"), "-ERR"))
+    assert(str_has_prefix(cluster_grant_vote(clus, "ccc", "3", "zzz"), "-ERR"))
+    assert(str_has_prefix(cluster_grant_vote(clus, "bbb", "3", "aaa"), "+OK"))
+}
+
+fn TestAutofailOneReplica() {
+    let clus = cmap_new()
+    cmap_set(clus, "id", "bbb")
+    cmap_set(clus, "flags", "slave")
+    cmap_set(clus, "master", "aaa")
+    cmap_set(clus, "epoch", "1")
+    cmap_set(clus, "ip", "127.0.0.1")
+    cmap_set(clus, "port", "7001")
+    cluster_put(clus, "aaa", "127.0.0.1", "7000", "master", "-", "0-100", "1")
+    cluster_put(clus, "bbb", "127.0.0.1", "7001", "slave", "aaa", "", "1")
+    let repl = cmap_new()
+    assert_eq(len(cluster_replica_ids(clus, "aaa")), 1)
+    assert_eq(cluster_try_autofailover(clus, repl), 1)
+    assert(str_contains(cmap_get(clus, "flags"), "master"))
+    assert_eq_str(cmap_get(repl, "role"), "master")
+}
+
+fn TestAutofailNeedsQuorum() {
+    let clus = cmap_new()
+    cmap_set(clus, "id", "bbb")
+    cmap_set(clus, "flags", "slave")
+    cmap_set(clus, "master", "aaa")
+    cmap_set(clus, "epoch", "1")
+    cmap_set(clus, "ip", "127.0.0.1")
+    cmap_set(clus, "port", "7001")
+    cluster_put(clus, "aaa", "127.0.0.1", "7000", "master", "-", "0-100", "1")
+    cluster_put(clus, "bbb", "127.0.0.1", "7001", "slave", "aaa", "", "1")
+    cluster_put(clus, "ccc", "127.0.0.1", "7002", "slave", "aaa", "", "1")
+    let repl = cmap_new()
+    assert_eq(len(cluster_replica_ids(clus, "aaa")), 2)
+    assert_eq(cluster_quorum_needed(2), 2)
+    assert_eq(cluster_try_autofailover(clus, repl), 0)
+    assert(str_contains(cmap_get(clus, "flags"), "slave"))
+}
+
+fn TestFollowNewMasterSkip() {
+    let clus = cmap_new()
+    cmap_set(clus, "id", "ccc")
+    cmap_set(clus, "flags", "slave")
+    cmap_set(clus, "master", "aaa")
+    cluster_put(clus, "aaa", "127.0.0.1", "7000", "master", "-", "0-100", "1")
+    cluster_put(clus, "ccc", "127.0.0.1", "7002", "slave", "aaa", "", "1")
+    let repl = cmap_new()
+    assert_eq(cluster_follow_new_master(clus, repl), 0)
+}

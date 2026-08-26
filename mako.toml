@@ -1,0 +1,6 @@
+# Bonodis workspace
+name = "bonodis"
+version = "0.14.0"
+
+[workspace]
+members = ["lib", "cli"]

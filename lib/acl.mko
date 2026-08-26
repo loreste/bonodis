@@ -1,0 +1,390 @@
+pack bonodis
+
+fn acl_user_key(name: string, field: string) -> string {
+    return "acl.u." + name + "." + field
+}
+
+fn acl_enabled(replcfg: CMap) -> int {
+    if str_eq(cmap_get(replcfg, "acl.on"), "1") {
+        return 1
+    }
+    return 0
+}
+
+fn acl_remember(replcfg: CMap, name: string) {
+    let cur = cmap_get(replcfg, "acl.users")
+    let xs = str_split(cur, ",")
+    let mut i = 0
+    while i < len(xs) {
+        if str_eq(xs[i], name) {
+            return
+        }
+        i = i + 1
+    }
+    if str_len(cur) == 0 {
+        cmap_set(replcfg, "acl.users", name)
+    } else {
+        cmap_set(replcfg, "acl.users", cur + "," + name)
+    }
+}
+
+fn acl_ensure_default(replcfg: CMap) {
+    if str_len(cmap_get(replcfg, acl_user_key("default", "cmds"))) > 0 {
+        return
+    }
+    cmap_set(replcfg, acl_user_key("default", "on"), "1")
+    cmap_set(replcfg, acl_user_key("default", "cmds"), "+@all")
+    let p = cmap_get(replcfg, "requirepass")
+    if str_len(p) > 0 {
+        cmap_set(replcfg, acl_user_key("default", "pass"), p)
+        cmap_set(replcfg, acl_user_key("default", "nopass"), "0")
+    } else {
+        cmap_set(replcfg, acl_user_key("default", "pass"), "")
+        cmap_set(replcfg, acl_user_key("default", "nopass"), "1")
+    }
+    acl_remember(replcfg, "default")
+}
+
+fn acl_is_admin_cmd(cmd: string) -> int {
+    if str_eq(cmd, "ACL") or str_eq(cmd, "CONFIG") or str_eq(cmd, "SHUTDOWN") or str_eq(cmd, "SAVE") {
+        return 1
+    }
+    if str_eq(cmd, "BGSAVE") or str_eq(cmd, "BGREWRITEAOF") or str_eq(cmd, "REPLICAOF") or str_eq(cmd, "SLAVEOF") {
+        return 1
+    }
+    if str_eq(cmd, "FLUSHALL") or str_eq(cmd, "FLUSHDB") or str_eq(cmd, "CLUSTER") or str_eq(cmd, "MODULE") {
+        return 1
+    }
+    if str_eq(cmd, "PSYNC") or str_eq(cmd, "SYNC") or str_eq(cmd, "REPLCONF") or str_eq(cmd, "DEBUG") {
+        return 1
+    }
+    if str_eq(cmd, "MONITOR") or str_eq(cmd, "CLIENT") or str_eq(cmd, "SLOWLOG") or str_eq(cmd, "SCRIPT") or str_eq(cmd, "CLUSTERX") {
+        return 1
+    }
+    return 0
+}
+
+fn acl_cmd_ok(spec: string, cmd: string) -> int {
+    if str_len(spec) == 0 {
+        return 1
+    }
+    let c = str_to_lower(cmd)
+    if str_contains(spec, "-" + c) {
+        return 0
+    }
+    if str_contains(spec, "+" + c) {
+        return 1
+    }
+    if str_contains(spec, "-@all") and not str_contains(spec, "+@all") {
+        if str_contains(spec, "+@read") and is_write_cmd(cmd) == 0 and acl_is_admin_cmd(cmd) == 0 {
+            return 1
+        }
+        if str_contains(spec, "+@write") and is_write_cmd(cmd) == 1 {
+            return 1
+        }
+        if str_contains(spec, "+@admin") and acl_is_admin_cmd(cmd) == 1 {
+            return 1
+        }
+        return 0
+    }
+    if str_contains(spec, "+@all") {
+        return 1
+    }
+    if str_contains(spec, "+@admin") and acl_is_admin_cmd(cmd) == 1 {
+        return 1
+    }
+    if str_contains(spec, "+@write") and is_write_cmd(cmd) == 1 {
+        return 1
+    }
+    if str_contains(spec, "+@read") and is_write_cmd(cmd) == 0 and acl_is_admin_cmd(cmd) == 0 {
+        return 1
+    }
+    return 0
+}
+
+fn acl_allows(replcfg: CMap, user: string, cmd: string) -> int {
+    if acl_enabled(replcfg) == 0 {
+        return 1
+    }
+    if str_eq(cmd, "AUTH") or str_eq(cmd, "HELLO") or str_eq(cmd, "QUIT") or str_eq(cmd, "PING") {
+        return 1
+    }
+    let mut name = user
+    if str_len(name) == 0 {
+        name = "default"
+    }
+    if not str_eq(cmap_get(replcfg, acl_user_key(name, "on")), "1") {
+        return 0
+    }
+    return acl_cmd_ok(cmap_get(replcfg, acl_user_key(name, "cmds")), cmd)
+}
+
+fn acl_check_pass(replcfg: CMap, user: string, pass: string) -> int {
+    let mut name = user
+    if str_len(name) == 0 {
+        name = "default"
+    }
+    if not str_eq(cmap_get(replcfg, acl_user_key(name, "on")), "1") {
+        return 0
+    }
+    if str_eq(cmap_get(replcfg, acl_user_key(name, "nopass")), "1") {
+        return 1
+    }
+    let p = cmap_get(replcfg, acl_user_key(name, "pass"))
+    if str_len(p) == 0 {
+        let rp = cmap_get(replcfg, "requirepass")
+        if str_eq(name, "default") and str_eq(pass, rp) and str_len(rp) > 0 {
+            return 1
+        }
+        return 0
+    }
+    if str_eq(p, pass) {
+        return 1
+    }
+    return 0
+}
+
+fn acl_setuser_apply(replcfg: CMap, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("acl")
+    }
+    let name = argv[2]
+    if str_len(name) == 0 {
+        return r_syntax()
+    }
+    acl_ensure_default(replcfg)
+    cmap_set(replcfg, "acl.on", "1")
+    if str_len(cmap_get(replcfg, acl_user_key(name, "cmds"))) == 0 {
+        cmap_set(replcfg, acl_user_key(name, "on"), "1")
+        cmap_set(replcfg, acl_user_key(name, "cmds"), "")
+        cmap_set(replcfg, acl_user_key(name, "nopass"), "0")
+        cmap_set(replcfg, acl_user_key(name, "pass"), "")
+    }
+    let mut i = 3
+    let mut cmds = cmap_get(replcfg, acl_user_key(name, "cmds"))
+    while i < len(argv) {
+        let t = argv[i]
+        if str_eq(t, "on") {
+            cmap_set(replcfg, acl_user_key(name, "on"), "1")
+        } else if str_eq(t, "off") {
+            cmap_set(replcfg, acl_user_key(name, "on"), "0")
+        } else if str_eq(t, "nopass") {
+            cmap_set(replcfg, acl_user_key(name, "nopass"), "1")
+            cmap_set(replcfg, acl_user_key(name, "pass"), "")
+        } else if str_eq(t, "reset") {
+            cmap_set(replcfg, acl_user_key(name, "on"), "0")
+            cmap_set(replcfg, acl_user_key(name, "cmds"), "")
+            cmap_set(replcfg, acl_user_key(name, "pass"), "")
+            cmap_set(replcfg, acl_user_key(name, "nopass"), "0")
+            cmds = ""
+        } else if str_len(t) > 0 and str_byte_at(t, 0) == 62 {
+            cmap_set(replcfg, acl_user_key(name, "pass"), t[1:])
+            cmap_set(replcfg, acl_user_key(name, "nopass"), "0")
+        } else if str_len(t) > 0 and (str_byte_at(t, 0) == 43 or str_byte_at(t, 0) == 45) {
+            if str_len(cmds) == 0 {
+                cmds = t
+            } else {
+                cmds = cmds + " " + t
+            }
+        } else if str_len(t) > 0 and str_byte_at(t, 0) == 126 {
+            cmap_set(replcfg, acl_user_key(name, "keys"), t)
+        }
+        i = i + 1
+    }
+    cmap_set(replcfg, acl_user_key(name, "cmds"), cmds)
+    acl_remember(replcfg, name)
+    slog_with("info", "ACL SETUSER", "user", name)
+    return r_ok()
+}
+
+fn acl_list_user(replcfg: CMap, name: string) -> string {
+    let b = str_builder()
+    builder_write(b, "user ")
+    builder_write(b, name)
+    if str_eq(cmap_get(replcfg, acl_user_key(name, "on")), "1") {
+        builder_write(b, " on")
+    } else {
+        builder_write(b, " off")
+    }
+    if str_eq(cmap_get(replcfg, acl_user_key(name, "nopass")), "1") {
+        builder_write(b, " nopass")
+    } else if str_len(cmap_get(replcfg, acl_user_key(name, "pass"))) > 0 {
+        builder_write(b, " >")
+        builder_write(b, cmap_get(replcfg, acl_user_key(name, "pass")))
+    }
+    let cmds = cmap_get(replcfg, acl_user_key(name, "cmds"))
+    if str_len(cmds) > 0 {
+        builder_write(b, " ")
+        builder_write(b, cmds)
+    }
+    return builder_string(b)
+}
+
+fn acl_list_all(replcfg: CMap) -> string {
+    acl_ensure_default(replcfg)
+    let names = str_split(cmap_get(replcfg, "acl.users"), ",")
+    let mut out = make([]string, 0, len(names))
+    let mut i = 0
+    while i < len(names) {
+        if str_len(names[i]) > 0 {
+            out = append(out, acl_list_user(replcfg, names[i]))
+        }
+        i = i + 1
+    }
+    return r_array_bulks(out)
+}
+
+fn acl_getuser(replcfg: CMap, name: string) -> string {
+    if str_len(cmap_get(replcfg, acl_user_key(name, "cmds"))) == 0 and not str_eq(name, "default") {
+        return r_nil()
+    }
+    acl_ensure_default(replcfg)
+    let mut items = make([]string, 0, 8)
+    items = append(items, "flags")
+    if str_eq(cmap_get(replcfg, acl_user_key(name, "on")), "1") {
+        items = append(items, "on")
+    } else {
+        items = append(items, "off")
+    }
+    items = append(items, "passwords")
+    if str_eq(cmap_get(replcfg, acl_user_key(name, "nopass")), "1") {
+        items = append(items, "nopass")
+    } else {
+        items = append(items, cmap_get(replcfg, acl_user_key(name, "pass")))
+    }
+    items = append(items, "commands")
+    items = append(items, cmap_get(replcfg, acl_user_key(name, "cmds")))
+    return r_array_bulks(items)
+}
+
+fn acl_deluser(replcfg: CMap, name: string) -> string {
+    if str_eq(name, "default") {
+        return r_err("ERR The 'default' user cannot be removed")
+    }
+    cmap_set(replcfg, acl_user_key(name, "on"), "0")
+    cmap_set(replcfg, acl_user_key(name, "cmds"), "")
+    cmap_set(replcfg, acl_user_key(name, "pass"), "")
+    return r_int(1)
+}
+
+fn acl_save_file(replcfg: CMap) -> string {
+    let mut dir = cmap_get(replcfg, "dir")
+    if str_len(dir) == 0 {
+        dir = "."
+    }
+    let path = dir + "/users.acl"
+    acl_ensure_default(replcfg)
+    let names = str_split(cmap_get(replcfg, "acl.users"), ",")
+    let b = str_builder()
+    let mut i = 0
+    while i < len(names) {
+        if str_len(names[i]) > 0 {
+            builder_write(b, acl_list_user(replcfg, names[i]))
+            builder_write(b, "\n")
+        }
+        i = i + 1
+    }
+    let rc = atomic_write_file(path, builder_string(b))
+    if rc != 0 {
+        return r_err("ERR ACL SAVE failed")
+    }
+    slog_with("info", "ACL saved", "path", path)
+    return r_ok()
+}
+
+fn acl_load_line(replcfg: CMap, line: string) {
+    let t = str_fields(line)
+    if len(t) < 2 {
+        return
+    }
+    if not str_eq(t[0], "user") {
+        return
+    }
+    let mut argv = make([]string, 0, len(t) + 1)
+    argv = append(argv, "ACL")
+    argv = append(argv, "SETUSER")
+    let mut i = 1
+    while i < len(t) {
+        argv = append(argv, t[i])
+        i = i + 1
+    }
+    let _ = acl_setuser_apply(replcfg, argv)
+}
+
+fn acl_load_file(replcfg: CMap, path: string) -> int {
+    if str_len(path) == 0 or not file_exists(path) {
+        return 0
+    }
+    let blob = read_file(path)
+    let lines = str_split(blob, "\n")
+    let mut i = 0
+    while i < len(lines) {
+        if str_len(lines[i]) > 0 and not str_has_prefix(lines[i], "#") {
+            acl_load_line(replcfg, lines[i])
+        }
+        i = i + 1
+    }
+    slog_with("info", "ACL loaded", "path", path)
+    return 1
+}
+
+fn acl_cmd(argv: []string, replcfg: CMap, feed: CMap, conn_id: int) -> string {
+    if len(argv) < 2 {
+        return r_arity("acl")
+    }
+    let sub = str_to_upper(argv[1])
+    if str_eq(sub, "SETUSER") {
+        return acl_setuser_apply(replcfg, argv)
+    }
+    if str_eq(sub, "GETUSER") {
+        if len(argv) != 3 {
+            return r_arity("acl")
+        }
+        return acl_getuser(replcfg, argv[2])
+    }
+    if str_eq(sub, "DELUSER") {
+        if len(argv) != 3 {
+            return r_arity("acl")
+        }
+        return acl_deluser(replcfg, argv[2])
+    }
+    if str_eq(sub, "LIST") or str_eq(sub, "USERS") {
+        return acl_list_all(replcfg)
+    }
+    if str_eq(sub, "WHOAMI") {
+        let mut u = cmap_get(feed, "au:" + format_int(conn_id))
+        if str_len(u) == 0 {
+            u = "default"
+        }
+        return r_bulk(u)
+    }
+    if str_eq(sub, "SAVE") {
+        return acl_save_file(replcfg)
+    }
+    if str_eq(sub, "LOAD") {
+        let mut dir = cmap_get(replcfg, "dir")
+        if str_len(dir) == 0 {
+            dir = "."
+        }
+        let mut p = cmap_get(replcfg, "aclfile")
+        if str_len(p) == 0 {
+            p = dir + "/users.acl"
+        }
+        let _ = acl_load_file(replcfg, p)
+        return r_ok()
+    }
+    if str_eq(sub, "GENPASS") {
+        return r_bulk(new_node_id())
+    }
+    return r_err("ERR unknown ACL subcommand")
+}
+
+fn acl_init(replcfg: CMap, pass: string, aclfile: string) {
+    cmap_set(replcfg, "requirepass", pass)
+    cmap_set(replcfg, "aclfile", aclfile)
+    acl_ensure_default(replcfg)
+    if str_len(aclfile) > 0 {
+        let _ = acl_load_file(replcfg, aclfile)
+        cmap_set(replcfg, "acl.on", "1")
+    }
+}

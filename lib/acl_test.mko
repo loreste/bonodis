@@ -1,0 +1,44 @@
+fn TestAclQuorumCmdOk() {
+    assert_eq(acl_cmd_ok("+@all", "SET"), 1)
+    assert_eq(acl_cmd_ok("+@read", "GET"), 1)
+    assert_eq(acl_cmd_ok("+@read", "SET"), 0)
+    assert_eq(acl_cmd_ok("+@write", "SET"), 1)
+    assert_eq(acl_cmd_ok("+@admin", "SHUTDOWN"), 1)
+    assert_eq(acl_cmd_ok("+@admin", "GET"), 0)
+    assert_eq(acl_cmd_ok("-@all +get", "GET"), 1)
+    assert_eq(acl_cmd_ok("-@all +get", "SET"), 0)
+    assert_eq(acl_cmd_ok("+@all -flushall", "FLUSHALL"), 0)
+    assert_eq(acl_cmd_ok("+@all -flushall", "GET"), 1)
+}
+
+fn TestAclSetuserAndAuth() {
+    let cfg = cmap_new()
+    cmap_set(cfg, "requirepass", "")
+    acl_init(cfg, "", "")
+    assert_eq(acl_check_pass(cfg, "default", ""), 1)
+    let r = acl_setuser_apply(cfg, ["ACL", "SETUSER", "alice", "on", ">secret", "-@all", "+@read", "+ping"])
+    assert_eq_str(r, "+OK\r\n")
+    assert_eq(acl_enabled(cfg), 1)
+    assert_eq(acl_check_pass(cfg, "alice", "secret"), 1)
+    assert_eq(acl_check_pass(cfg, "alice", "nope"), 0)
+    assert_eq(acl_allows(cfg, "alice", "GET"), 1)
+    assert_eq(acl_allows(cfg, "alice", "SET"), 0)
+    assert_eq(acl_allows(cfg, "alice", "PING"), 1)
+    assert(str_contains(acl_list_user(cfg, "alice"), "alice"))
+    assert(str_has_prefix(acl_deluser(cfg, "default"), "-ERR"))
+}
+
+fn TestAclLoadSave() {
+    let dir = "/tmp/bonodis_acl_unit"
+    let _ = mkdir_all(dir)
+    let cfg = cmap_new()
+    cmap_set(cfg, "dir", dir)
+    acl_init(cfg, "rootpw", "")
+    let _ = acl_setuser_apply(cfg, ["ACL", "SETUSER", "bob", "on", ">bobpw", "+@all"])
+    assert_eq_str(acl_save_file(cfg), "+OK\r\n")
+    assert(file_exists(dir + "/users.acl"))
+    let cfg2 = cmap_new()
+    cmap_set(cfg2, "dir", dir)
+    acl_init(cfg2, "", dir + "/users.acl")
+    assert_eq(acl_check_pass(cfg2, "bob", "bobpw"), 1)
+}

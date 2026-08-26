@@ -1,0 +1,12 @@
+fn bench_store_setget() {
+    let mut st = new_store()
+    let mut i = 0
+    while i < 50000 {
+        let _ = st.apply(0, ["SET", "k", "v"])
+        let g = st.apply(0, ["GET", "k"])
+        if not str_eq(g, "$1\r\nv\r\n") {
+            return
+        }
+        i = i + 1
+    }
+}

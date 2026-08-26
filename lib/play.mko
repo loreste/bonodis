@@ -1,0 +1,155 @@
+pack bonodis
+
+fn http_html(body: string) -> string {
+    let b = str_builder()
+    builder_write(b, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: ")
+    builder_write(b, format_int(str_len(body)))
+    builder_write(b, "\r\nConnection: close\r\n\r\n")
+    builder_write(b, body)
+    return builder_string(b)
+}
+
+fn mcp_result(id: string, result: string) -> string {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}"
+}
+
+fn mcp_error(id: string, msg: string) -> string {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":-32000,\"message\":\"" + json_esc(msg) + "\"}}"
+}
+
+fn mcp_id(body: string) -> string {
+    let id = json_str(body, "id")
+    if str_len(id) == 0 {
+        return "1"
+    }
+    return id
+}
+
+fn mcp_tools_json() -> string {
+    return "[{\"name\":\"turn\",\"description\":\"Read: concatenate budget, focus, tensions, and BRAIN PACK for session+ns. Does not write.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"session\":{\"type\":\"string\"},\"ns\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"}},\"required\":[\"session\",\"ns\"]}},{\"name\":\"remember\",\"description\":\"BRAIN REMEMBER ns id text. Optional vector floats belong in the RESP command, not this tool.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"ns\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"ns\",\"id\",\"text\"]}},{\"name\":\"believe\",\"description\":\"FACT ADD s p o plus optional integer score 0-100.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"s\":{\"type\":\"string\"},\"p\":{\"type\":\"string\"},\"o\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"s\",\"p\",\"o\"]}},{\"name\":\"ask\",\"description\":\"ASK key QUERY q, or ASK key OF if q is omitted.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"q\":{\"type\":\"string\"}},\"required\":[\"key\"]}},{\"name\":\"relate\",\"description\":\"RELATE from to [type]. Both keys must hash to the same slot.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"},\"type\":{\"type\":\"string\"}},\"required\":[\"from\",\"to\"]}}]"
+}
+
+fn mcp_handle(body: string, bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int) -> string {
+    let id = mcp_id(body)
+    let method = json_str(body, "method")
+    if str_eq(method, "initialize") {
+        return mcp_result(id, "{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"bonodis\",\"version\":\"" + version() + "\"}}")
+    }
+    if str_eq(method, "notifications/initialized") or str_eq(method, "initialized") {
+        return mcp_result(id, "{}")
+    }
+    if str_eq(method, "tools/list") {
+        return mcp_result(id, "{\"tools\":" + mcp_tools_json() + "}")
+    }
+    if str_eq(method, "ping") {
+        return mcp_result(id, "{}")
+    }
+    if str_eq(method, "tools/call") {
+        let params = json_obj(body, "params")
+        let mut args = json_obj(params, "arguments")
+        if str_len(args) == 0 {
+            args = json_obj(body, "arguments")
+        }
+        if str_len(args) == 0 {
+            args = body
+        }
+        let mut name = json_str(params, "name")
+        if str_len(name) == 0 {
+            name = json_str(body, "name")
+        }
+        let mut text = ""
+        if str_eq(name, "turn") {
+            let session = json_str(args, "session")
+            let ns = json_str(args, "ns")
+            let q = json_str(args, "query")
+            let mut argv = make([]string, 0, 8)
+            argv = append(argv, "TURN")
+            argv = append(argv, session)
+            argv = append(argv, ns)
+            if str_len(q) > 0 {
+                argv = append(argv, "QUERY")
+                argv = append(argv, q)
+            }
+            let r = dispatch(bus, replies, ids, shards, 0, argv)
+            text = bulk_payload(r)
+            if str_has_prefix(r, "-") {
+                text = reply_head(r)
+            }
+        } else if str_eq(name, "remember") {
+            let r = dispatch(bus, replies, ids, shards, 0, ["BRAIN", "REMEMBER", json_str(args, "ns"), json_str(args, "id"), json_str(args, "text")])
+            text = reply_head(r)
+        } else if str_eq(name, "believe") {
+            let mut argv = make([]string, 0, 6)
+            argv = append(argv, "BELIEVE")
+            argv = append(argv, json_str(args, "s"))
+            argv = append(argv, json_str(args, "p"))
+            argv = append(argv, json_str(args, "o"))
+            let sc = json_str(args, "score")
+            if str_len(sc) > 0 {
+                argv = append(argv, sc)
+            }
+            let r = dispatch(bus, replies, ids, shards, 0, argv)
+            text = reply_head(r)
+        } else if str_eq(name, "ask") {
+            let k = json_str(args, "key")
+            let q = json_str(args, "q")
+            let mut argv = make([]string, 0, 4)
+            argv = append(argv, "ASK")
+            argv = append(argv, k)
+            if str_len(q) > 0 {
+                argv = append(argv, "QUERY")
+                argv = append(argv, q)
+            } else {
+                argv = append(argv, "OF")
+            }
+            let r = dispatch(bus, replies, ids, shards, 0, argv)
+            text = r
+        } else if str_eq(name, "relate") {
+            let mut ty = json_str(args, "type")
+            if str_len(ty) == 0 {
+                ty = "related"
+            }
+            let r = dispatch(bus, replies, ids, shards, 0, ["RELATE", json_str(args, "from"), json_str(args, "to"), ty])
+            text = reply_head(r)
+        } else {
+            return mcp_error(id, "unknown tool")
+        }
+        return mcp_result(id, "{\"content\":[{\"type\":\"text\",\"text\":\"" + json_esc(text) + "\"}]}")
+    }
+    return mcp_error(id, "unknown method " + method)
+}
+
+fn play_html() -> string {
+    let b = str_builder()
+    builder_write(b, "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Bonodis</title><style>")
+    builder_write(b, "body{margin:0;font:14px/1.4 ui-monospace,Menlo,Consolas,monospace;background:#111;color:#ddd}")
+    builder_write(b, "main{display:grid;grid-template-columns:280px 1fr;min-height:100vh}")
+    builder_write(b, "@media(max-width:720px){main{grid-template-columns:1fr}}")
+    builder_write(b, "aside{padding:16px;border-right:1px solid #333}")
+    builder_write(b, "h1{font-size:14px;font-weight:600;margin:0 0 12px}")
+    builder_write(b, "label{display:block;margin:10px 0 4px;color:#888;font-size:12px}")
+    builder_write(b, "input,textarea{width:100%;box-sizing:border-box;background:#1a1a1a;border:1px solid #444;color:#ddd;padding:8px;font:inherit}")
+    builder_write(b, "textarea{min-height:64px}")
+    builder_write(b, "button{margin:8px 6px 0 0;padding:6px 10px;font:inherit;background:#1a1a1a;color:#ddd;border:1px solid #666;cursor:pointer}")
+    builder_write(b, "pre{margin:0;padding:16px;white-space:pre-wrap;word-break:break-word}")
+    builder_write(b, "p{color:#888;font-size:12px;margin:12px 0 0}")
+    builder_write(b, "</style></head><body><main><aside>")
+    builder_write(b, "<h1>Bonodis</h1>")
+    builder_write(b, "<label>session</label><input id=sess value=\"{demo}sess\">")
+    builder_write(b, "<label>memory ns</label><input id=ns value=\"{demo}mem\">")
+    builder_write(b, "<label>query</label><input id=q>")
+    builder_write(b, "<label>text</label><textarea id=txt></textarea>")
+    builder_write(b, "<label>predicate</label><input id=pred value=likes>")
+    builder_write(b, "<div><button onclick=doTurn()>TURN</button><button onclick=doRemember()>REMEMBER</button><button onclick=doBelieve()>BELIEVE</button><button onclick=doAsk()>ASK</button></div>")
+    builder_write(b, "<p>Local metrics port. Session and ns need the same hash tag. POST /api, /mcp, /turn.</p>")
+    builder_write(b, "</aside><pre id=out></pre></main><script>")
+    builder_write(b, "const $=id=>document.getElementById(id);")
+    builder_write(b, "async function api(argv){const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({argv})});return r.json();}")
+    builder_write(b, "function show(x){$('out').textContent=typeof x==='string'?x:JSON.stringify(x,null,2)}")
+    builder_write(b, "async function doTurn(){const a=['TURN',$('sess').value,$('ns').value];if($('q').value){a.push('QUERY',$('q').value)}const j=await api(a);show(j.result||j.error||j)}")
+    builder_write(b, "async function doRemember(){const id='m'+Date.now();const j=await api(['BRAIN','REMEMBER',$('ns').value,id,$('txt').value]);show(j.error||('OK '+id))}")
+    builder_write(b, "async function doBelieve(){const j=await api(['BELIEVE',$('sess').value,$('pred').value,$('txt').value]);show(j)}")
+    builder_write(b, "async function doAsk(){const a=['ASK',$('sess').value];if($('q').value){a.push('QUERY',$('q').value)}else{a.push('OF')}show(await api(a))}")
+    builder_write(b, "</script></body></html>")
+    return builder_string(b)
+}

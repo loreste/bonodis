@@ -1,0 +1,451 @@
+pack bonodis
+
+// Scored facts, per-session key list, integer budget, ASK, TURN.
+
+fn rk_bsc(ik: string, p: string, o: string) -> string {
+    return "\u001eBsc\u001e" + ik + "\u001e" + p + "\u001e" + o
+}
+
+fn rk_att(ik: string) -> string {
+    return "\u001eAtt\u001e" + ik
+}
+
+fn rk_bud(ik: string) -> string {
+    return "\u001eBud\u001e" + ik
+}
+
+fn csv_front(s: string, item: string) -> string {
+    let d = csv_del(s, item)
+    if str_len(d) == 0 {
+        return item
+    }
+    return item + "," + d
+}
+
+fn csv_take(s: string, n: int) -> string {
+    let parts = str_split(s, ",")
+    let b = str_builder()
+    let mut c = 0
+    let mut i = 0
+    while i < len(parts) and c < n {
+        if str_len(parts[i]) > 0 {
+            if c > 0 {
+                builder_write(b, ",")
+            }
+            builder_write(b, parts[i])
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn Store_belief_score(mut self: Store, ik: string, p: string, o: string) -> int {
+    let k = rk_bsc(ik, p, o)
+    if has(self.xseq, k) {
+        return self.xseq[k]
+    }
+    return 100
+}
+
+fn Store_cmd_believe(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("believe")
+    }
+    let s = argv[1]
+    let p = argv[2]
+    let o = argv[3]
+    let mut score = 100
+    if len(argv) >= 5 {
+        let n, ok = int_ok(argv[4])
+        if ok == 0 {
+            return r_notint()
+        }
+        score = n
+        if score < 0 {
+            score = 0
+        }
+        if score > 100 {
+            score = 100
+        }
+    }
+    let r = self.cmd_fact(db, ["FACT", "ADD", s, p, o])
+    if str_has_prefix(r, "-") {
+        return r
+    }
+    self.xseq[rk_bsc(ikey(db, s), p, o)] = score
+    return r_int(score)
+}
+
+fn Store_cmd_tensions(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("tensions")
+    }
+    let ik = ikey(db, argv[1])
+    let rows = edge_rows(self.xp[rk_fact(ik)])
+    let mut out = make([]string, 0, 8)
+    let mut pi = 0
+    while pi < len(rows) {
+        let pred = edge_nb(rows[pi])
+        let mut seenp = 0
+        let mut k = 0
+        while k < pi {
+            if str_eq(edge_nb(rows[k]), pred) {
+                seenp = 1
+            }
+            k = k + 1
+        }
+        if seenp == 0 {
+            let mut nobj = 0
+            let mut chunk = make([]string, 0, 8)
+            let mut rj = 0
+            while rj < len(rows) {
+                if str_eq(edge_nb(rows[rj]), pred) {
+                    let o = edge_ty(rows[rj])
+                    chunk = append(chunk, o)
+                    chunk = append(chunk, format_int(self.belief_score(ik, pred, o)))
+                    nobj = nobj + 1
+                }
+                rj = rj + 1
+            }
+            if nobj >= 2 {
+                out = append(out, pred)
+                let mut ci = 0
+                while ci < len(chunk) {
+                    out = append(out, chunk[ci])
+                    ci = ci + 1
+                }
+            }
+        }
+        pi = pi + 1
+    }
+    return r_array_bulks(out)
+}
+
+fn Store_cmd_ask(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("ask")
+    }
+    let key = argv[1]
+    let sub = str_to_upper(argv[2])
+    let ik = ikey(db, key)
+    if str_eq(sub, "OF") {
+        return self.cmd_fact(db, ["FACT", "OF", key])
+    }
+    if str_eq(sub, "WHO") {
+        if len(argv) < 4 {
+            return r_arity("ask")
+        }
+        let pred = argv[3]
+        let rows = edge_rows(self.xp[rk_fact(ik)])
+        let mut out = make([]string, 0, 4)
+        let mut i = 0
+        while i < len(rows) {
+            if str_eq(edge_nb(rows[i]), pred) {
+                let o = edge_ty(rows[i])
+                out = append(out, o)
+                out = append(out, format_int(self.belief_score(ik, pred, o)))
+            }
+            i = i + 1
+        }
+        return r_array_bulks(out)
+    }
+    if str_eq(sub, "HOPS") {
+        let mut depth = 1
+        if len(argv) >= 4 {
+            let n, ok = int_ok(argv[3])
+            if ok == 1 and n > 0 {
+                depth = n
+            }
+        }
+        if depth > 6 {
+            depth = 6
+        }
+        let mut q = make([]string, 0, 8)
+        let mut dist = make(map[string]int)
+        q = append(q, key)
+        dist[key] = 0
+        let mut qi = 0
+        while qi < len(q) and qi < 64 {
+            let cur = q[qi]
+            qi = qi + 1
+            let d = dist[cur]
+            if d >= depth {
+                continue
+            }
+            let rows = edge_rows(self.xp[rk_out(ikey(db, cur))])
+            let mut ri = 0
+            while ri < len(rows) {
+                let nb = edge_nb(rows[ri])
+                if not has(dist, nb) {
+                    dist[nb] = d + 1
+                    q = append(q, nb)
+                }
+                ri = ri + 1
+            }
+        }
+        let mut out = make([]string, 0, len(q) * 2)
+        let mut i = 0
+        while i < len(q) {
+            out = append(out, q[i])
+            out = append(out, format_int(dist[q[i]]))
+            i = i + 1
+        }
+        return r_array_bulks(out)
+    }
+    if str_eq(sub, "QUERY") {
+        if len(argv) < 4 {
+            return r_arity("ask")
+        }
+        let qtext = argv[3]
+        let mut out = make([]string, 0, 8)
+        let frows = edge_rows(self.xp[rk_fact(ik)])
+        let mut i = 0
+        while i < len(frows) {
+            let pred = edge_nb(frows[i])
+            let o = edge_ty(frows[i])
+            if token_overlap(qtext, pred + " " + o) > 0.0 {
+                out = append(out, "fact")
+                out = append(out, pred)
+                out = append(out, o)
+            }
+            i = i + 1
+        }
+        let erows = edge_rows(self.xp[rk_out(ik)])
+        i = 0
+        while i < len(erows) {
+            let nb = edge_nb(erows[i])
+            let ty = edge_ty(erows[i])
+            if token_overlap(qtext, nb + " " + ty) > 0.0 {
+                out = append(out, "edge")
+                out = append(out, ty)
+                out = append(out, nb)
+            }
+            i = i + 1
+        }
+        return r_array_bulks(out)
+    }
+    return r_err("ERR unknown ASK subcommand")
+}
+
+fn Store_cmd_attend(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("attend")
+    }
+    let ik = ikey(db, argv[1])
+    let ring = csv_front(self.xp[rk_att(ik)], argv[2])
+    self.xp[rk_att(ik)] = csv_take(ring, 24)
+    return r_ok()
+}
+
+fn Store_cmd_focus(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("focus")
+    }
+    let mut n = 8
+    if len(argv) >= 4 and str_eq(str_to_upper(argv[2]), "COUNT") {
+        let c, ok = int_ok(argv[3])
+        if ok == 1 and c > 0 {
+            n = c
+        }
+    } else if len(argv) >= 3 {
+        let c, ok = int_ok(argv[2])
+        if ok == 1 and c > 0 {
+            n = c
+        }
+    }
+    let ring = csv_take(self.xp[rk_att(ikey(db, argv[1]))], n)
+    let parts = str_split(ring, ",")
+    let mut out = make([]string, 0, 8)
+    let mut i = 0
+    while i < len(parts) {
+        if str_len(parts[i]) > 0 {
+            out = append(out, parts[i])
+        }
+        i = i + 1
+    }
+    return r_array_bulks(out)
+}
+
+fn Store_cmd_budget(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) == 2 {
+        let ik = ikey(db, argv[1])
+        if not has(self.xseq, rk_bud(ik)) {
+            return r_int(0)
+        }
+        return r_int(self.xseq[rk_bud(ik)])
+    }
+    if len(argv) != 3 {
+        return r_arity("budget")
+    }
+    let n, ok = int_ok(argv[2])
+    if ok == 0 or n < 0 {
+        return r_notint()
+    }
+    self.xseq[rk_bud(ikey(db, argv[1]))] = n
+    return r_int(n)
+}
+
+fn Store_cmd_spend(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 3 {
+        return r_arity("spend")
+    }
+    let n, ok = int_ok(argv[2])
+    if ok == 0 or n < 1 {
+        return r_notint()
+    }
+    let ik = ikey(db, argv[1])
+    let mut left = 0
+    if has(self.xseq, rk_bud(ik)) {
+        left = self.xseq[rk_bud(ik)]
+    }
+    if left < n {
+        return r_err("ERR budget exhausted")
+    }
+    left = left - n
+    self.xseq[rk_bud(ik)] = left
+    return r_int(left)
+}
+
+fn Store_cmd_turn(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("turn")
+    }
+    let session = argv[1]
+    let ns = argv[2]
+    let mut count = 8
+    let mut qtext = ""
+    let mut qi = 3
+    while qi < len(argv) {
+        let o = str_to_upper(argv[qi])
+        if str_eq(o, "COUNT") and qi + 1 < len(argv) {
+            let n, ok = int_ok(argv[qi + 1])
+            if ok == 1 and n > 0 {
+                count = n
+            }
+            qi = qi + 2
+        } else if str_eq(o, "QUERY") and qi + 1 < len(argv) {
+            qtext = argv[qi + 1]
+            qi = qi + 2
+        } else {
+            break
+        }
+    }
+    let mut pargv = make([]string, 0, 8)
+    pargv = append(pargv, "BRAIN")
+    pargv = append(pargv, "PACK")
+    pargv = append(pargv, session)
+    pargv = append(pargv, ns)
+    pargv = append(pargv, "COUNT")
+    pargv = append(pargv, format_int(count))
+    if str_len(qtext) > 0 {
+        pargv = append(pargv, "QUERY")
+        pargv = append(pargv, qtext)
+    }
+    let q = parse_float_args(argv, qi)
+    let mut fi = 0
+    while fi < len(q) {
+        pargv = append(pargv, format_float(q[fi], 6))
+        fi = fi + 1
+    }
+    let packr = self.cmd_brain(db, pargv)
+    let pack = bulk_payload(packr)
+    let b = str_builder()
+    builder_write(b, "session: ")
+    builder_write(b, session)
+    builder_write(b, "\nns: ")
+    builder_write(b, ns)
+    builder_write(b, "\n")
+    let sik = ikey(db, session)
+    if has(self.xseq, rk_bud(sik)) {
+        builder_write(b, "budget: ")
+        builder_write(b, format_int(self.xseq[rk_bud(sik)]))
+        builder_write(b, "\n")
+    }
+    let fr = self.cmd_focus(db, ["FOCUS", session, "COUNT", "8"])
+    let fxs = parse_array_bulks(fr)
+    if len(fxs) > 0 {
+        builder_write(b, "focus:")
+        let mut i = 0
+        while i < len(fxs) {
+            builder_write(b, " ")
+            builder_write(b, fxs[i])
+            i = i + 1
+        }
+        builder_write(b, "\n")
+    }
+    let tr = self.cmd_tensions(db, ["TENSIONS", session])
+    let txs = parse_array_bulks(tr)
+    if len(txs) > 0 {
+        builder_write(b, "# tensions\n")
+        let mut i = 0
+        while i < len(txs) {
+            builder_write(b, txs[i])
+            builder_write(b, ":")
+            i = i + 1
+            while i + 1 < len(txs) {
+                let maybe = txs[i]
+                let sc, sok = int_ok(txs[i + 1])
+                let _ = sc
+                if sok == 0 {
+                    break
+                }
+                builder_write(b, " ")
+                builder_write(b, maybe)
+                builder_write(b, "=")
+                builder_write(b, txs[i + 1])
+                i = i + 2
+            }
+            builder_write(b, "\n")
+        }
+    }
+    builder_write(b, pack)
+    return r_bulk(builder_string(b))
+}
+
+fn Store_cmd_brain_compact(mut self: Store, db: int, ns: string) -> string {
+    let ik = ikey(db, ns)
+    if self.kind(ik) != T_VEC {
+        return r_int(0)
+    }
+    let mut ids = make([]string, 0, 8)
+    if has(self.vtxt, ik) {
+        for id, _tx in range self.vtxt[ik] {
+            let _ = _tx
+            ids = append(ids, id)
+        }
+    }
+    let mut n = 0
+    let mut i = 0
+    while i < len(ids) {
+        if str_len(ids[i]) == 0 {
+            i = i + 1
+            continue
+        }
+        let mut j = i + 1
+        while j < len(ids) {
+            if str_len(ids[j]) == 0 {
+                j = j + 1
+                continue
+            }
+            let a = self.vtxt[ik][ids[i]]
+            let b = self.vtxt[ik][ids[j]]
+            if token_overlap(a, b) >= 0.6 or token_overlap(b, a) >= 0.6 {
+                let mut tx = self.vtxt[ik]
+                tx[ids[i]] = a + " | " + b
+                delete(tx, ids[j])
+                self.vtxt[ik] = tx
+                if has(self.vecs, ik) {
+                    let mut v = self.vecs[ik]
+                    delete(v, ids[j])
+                    self.vecs[ik] = v
+                }
+                ids[j] = ""
+                n = n + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return r_int(n)
+}

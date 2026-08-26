@@ -1,0 +1,28 @@
+fn TestLogSetupFile() {
+    let path = "/tmp/bonodis_log_test.log"
+    let _ = write_file(path, "")
+    log_setup("info", 1, path)
+    slog_info("hello-bonodis")
+    log_ready("127.0.0.1", 6379, 4, 0, 1, 0)
+    log_limits(10000, 0, 10000, 0, 1)
+    log_conn("127.0.0.1:9", 1)
+    log_cmd("PING", 1, 1, 1)
+    log_cmd_result("PING", 1, 12, "+PONG\r\n", 1)
+    log_auth_ok(1)
+    log_replica_connecting("127.0.0.1", 6379)
+    log_cluster_on("abc", "127.0.0.1", "7000")
+    log_conn_close("127.0.0.1:9", 1)
+    slog_flush()
+    slog_set_output("")
+    assert_eq(slog_get_level(), 1)
+}
+
+fn TestLogRedact() {
+    assert_eq_str(slog_redact("s3cret"), "[REDACTED]")
+}
+
+fn TestReplyKind() {
+    assert_eq_str(reply_kind("+OK\r\n"), "simple")
+    assert_eq_str(reply_kind("-ERR x\r\n"), "error")
+    assert_eq_str(reply_kind(":1\r\n"), "int")
+}

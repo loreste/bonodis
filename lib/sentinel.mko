@@ -1,0 +1,111 @@
+pack bonodis
+
+fn sentinel_announce(replcfg: CMap) -> (string, string) {
+    let mut ip = cmap_get(replcfg, "host")
+    if str_eq(ip, "0.0.0.0") or str_eq(ip, "") or str_eq(ip, "::") {
+        ip = "127.0.0.1"
+    }
+    let mut p = cmap_get(replcfg, "port")
+    if str_len(p) == 0 {
+        p = "6379"
+    }
+    if str_len(cmap_get(replcfg, "master_host")) > 0 {
+        return (cmap_get(replcfg, "master_host"), cmap_get(replcfg, "master_port"))
+    }
+    return (ip, p)
+}
+
+fn sentinel_master_arr(replcfg: CMap) -> string {
+    let ip, p = sentinel_announce(replcfg)
+    let mut flags = "master"
+    if str_eq(cmap_get(replcfg, "role"), "slave") {
+        flags = "slave"
+    }
+    let mut ks = make([]string, 0, 32)
+    ks = append(ks, "name")
+    ks = append(ks, "mymaster")
+    ks = append(ks, "ip")
+    ks = append(ks, ip)
+    ks = append(ks, "port")
+    ks = append(ks, p)
+    ks = append(ks, "runid")
+    ks = append(ks, cmap_get(replcfg, "replid"))
+    ks = append(ks, "flags")
+    ks = append(ks, flags)
+    ks = append(ks, "link-pending-commands")
+    ks = append(ks, "0")
+    ks = append(ks, "last-ping-sent")
+    ks = append(ks, "0")
+    ks = append(ks, "last-ok-ping-reply")
+    ks = append(ks, "0")
+    ks = append(ks, "down-after-milliseconds")
+    ks = append(ks, "5000")
+    ks = append(ks, "num-slaves")
+    ks = append(ks, "0")
+    ks = append(ks, "num-other-sentinels")
+    ks = append(ks, "0")
+    ks = append(ks, "quorum")
+    ks = append(ks, "1")
+    ks = append(ks, "failover-timeout")
+    ks = append(ks, "180000")
+    ks = append(ks, "parallel-syncs")
+    ks = append(ks, "1")
+    return r_array_bulks(ks)
+}
+
+fn sentinel_cmd(argv: []string, replcfg: CMap, clus: CMap) -> string {
+    if len(argv) < 2 {
+        return r_arity("sentinel")
+    }
+    let sub = str_to_upper(argv[1])
+    if str_eq(sub, "MASTERS") {
+        let b = str_builder()
+        builder_write(b, "*1\r\n")
+        builder_write(b, sentinel_master_arr(replcfg))
+        return builder_string(b)
+    }
+    if str_eq(sub, "MASTER") {
+        return sentinel_master_arr(replcfg)
+    }
+    if str_eq(sub, "GET-MASTER-ADDR-BY-NAME") {
+        if len(argv) != 3 {
+            return r_arity("sentinel")
+        }
+        let ip, p = sentinel_announce(replcfg)
+        let mut items = make([]string, 0, 2)
+        items = append(items, ip)
+        items = append(items, p)
+        return r_array_bulks(items)
+    }
+    if str_eq(sub, "SLAVES") or str_eq(sub, "REPLICAS") or str_eq(sub, "SENTINELS") {
+        let none: []string = []
+        return r_array_bulks(none)
+    }
+    if str_eq(sub, "CKQUORUM") {
+        let mut n = 1
+        if str_eq(cmap_get(clus, "on"), "1") {
+            let mut mid = cmap_get(clus, "id")
+            if str_contains(cmap_get(clus, "flags"), "slave") {
+                mid = cmap_get(clus, "master")
+            }
+            n = len(cluster_replica_ids(clus, mid))
+            if n < 1 {
+                n = 1
+            }
+        }
+        let need = cluster_quorum_needed(n)
+        return r_simple("OK " + format_int(need) + " usable replicas")
+    }
+    if str_eq(sub, "FAILOVER") {
+        if str_eq(cmap_get(clus, "on"), "1") {
+            if cluster_try_autofailover(clus, replcfg) == 1 {
+                return r_ok()
+            }
+        }
+        return r_err("ERR No failover")
+    }
+    if str_eq(sub, "PING") {
+        return r_pong()
+    }
+    return r_err("ERR unknown sentinel subcommand")
+}

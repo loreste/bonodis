@@ -1,0 +1,43 @@
+pack bonodis
+
+// RESP2 client (live tests + cli).
+
+fn wait_connect(host: string, port: int, tries: int) -> int {
+    let mut i = 0
+    while i < tries {
+        let fd = tcp_connect(host, port)
+        if fd >= 0 {
+            let _ = tcp_nodelay(fd)
+            let r = resp_send(fd, ["PING"])
+            if str_eq(r, "+PONG\r\n") {
+                return fd
+            }
+            let _ = tcp_close(fd)
+        }
+        sleep_ms(50)
+        i = i + 1
+    }
+    return -1
+}
+
+fn resp_send(fd: int, argv: []string) -> string {
+    let n = tcp_write_all(fd, encode_array(argv))
+    if n < 0 {
+        return ""
+    }
+    return tcp_read(fd)
+}
+
+fn resp_call(host: string, port: int, argv: []string) -> string {
+    let fd = tcp_connect(host, port)
+    if fd < 0 {
+        return ""
+    }
+    let r = resp_send(fd, argv)
+    let _ = tcp_close(fd)
+    return r
+}
+
+fn stop_serve(stop: AtomicInt) {
+    atomic_store(stop, 1)
+}

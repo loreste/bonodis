@@ -1,0 +1,32 @@
+fn TestLuaReturn() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["EVAL", "return 1", "0"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["EVAL", "return 'ok'", "0"]), "$2\r\nok\r\n")
+    assert_eq_str(st.apply(0, ["EVAL", "return nil", "0"]), "$-1\r\n")
+}
+
+fn TestLuaRedisCall() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k", "v"])
+    assert_eq_str(st.apply(0, ["EVAL", "return redis.call('GET', KEYS[1])", "1", "k"]), "$1\r\nv\r\n")
+    let _ = st.apply(0, ["EVAL", "return redis.call('SET', KEYS[1], ARGV[1])", "1", "k", "z"])
+    assert_eq_str(st.apply(0, ["GET", "k"]), "$1\r\nz\r\n")
+}
+
+fn TestLuaIfIncr() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["EVAL", "if 1 == 1 then return 7 end return 0", "0"]), ":7\r\n")
+    let _ = st.apply(0, ["SET", "n", "2"])
+    assert_eq_str(st.apply(0, ["EVAL", "return redis.call('INCR', KEYS[1])", "1", "n"]), ":3\r\n")
+    let t = st.apply(0, ["EVAL", "local v = redis.call('GET', KEYS[1]) return v", "1", "n"])
+    assert(str_contains(t, "3"))
+}
+
+fn TestLuaWhileAnd() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["EVAL", "local i = 0 while i < 3 do i = i + 1 end return i", "0"]), ":3\r\n")
+    assert_eq_str(st.apply(0, ["EVAL", "if 1 == 1 and 2 == 2 then return 9 end return 0", "0"]), ":9\r\n")
+    assert_eq_str(st.apply(0, ["EVAL", "if 1 == 2 or 2 == 2 then return 4 end return 0", "0"]), ":4\r\n")
+    assert_eq_str(st.apply(0, ["EVAL", "return #'abc'", "0"]), ":3\r\n")
+    assert_eq_str(st.apply(0, ["EVAL", "return 'x'..'y'", "0"]), "$2\r\nxy\r\n")
+}

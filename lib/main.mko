@@ -1,0 +1,367 @@
+pack bonodis
+
+fn usage() {
+    print("Bonodis — Redis-protocol compatible store")
+    print("Usage: bonodis [--port N] [--bind ADDR] [--requirepass P] [--dir PATH]")
+    print("               [--appendonly yes|no] [--shards N] [--protected-mode yes|no]")
+    print("               [--log-level debug|info|warn|error] [--log-json yes|no] [--logfile PATH] [--log-commands yes|no]")
+    print("               [--maxclients N] [--maxmemory BYTES] [--slowlog-slower-than US] [--metrics-port N]")
+    print("               [--cluster-enabled yes|no] [--cluster-announce-ip ADDR] [--replica-of HOST:PORT]")
+    print("               [--default-ttl SEC] [--appendfsync always|everysec|no] [--auto-failover yes|no]")
+    print("               [--prod] [--tls-cert PATH] [--tls-key PATH] [--tls-ca PATH] [--aclfile PATH]")
+    print("               [--timeout SEC] [--tcp-keepalive SEC]")
+    print("               [--accept-threads N] [--accept-rate N]")
+    print("               [--unixsocket PATH] [--unixsocketperm OCTAL]")
+    print("Platforms: linux, macOS")
+}
+
+fn yn(s: string, fallback: int) -> int {
+    let u = str_to_lower(s)
+    if str_eq(u, "yes") or str_eq(u, "true") or str_eq(u, "1") {
+        return 1
+    }
+    if str_eq(u, "no") or str_eq(u, "false") or str_eq(u, "0") {
+        return 0
+    }
+    return fallback
+}
+
+fn main() {
+    require_supported_os()
+    let mut i = 1
+    let mut port = 6379
+    let mut host = "0.0.0.0"
+    let mut pass = ""
+    let mut dir = "."
+    let mut aof = 0
+    let mut shards = 16
+    let mut protected = 1
+    let mut log_level = "info"
+    let mut log_json = 0
+    let mut logfile = ""
+    let mut maxclients = DEFAULT_MAXCLIENTS
+    let mut maxmemory = 0
+    let mut slowlog_us = 10000
+    let mut metrics_port = 0
+    let mut cluster_on = 0
+    let mut announce_ip = ""
+    let mut replica_host = ""
+    let mut replica_port = "0"
+    let mut log_commands = 0
+    let mut default_ttl = 0
+    let mut fsync_ms = 1000
+    let mut autofail = 0 - 1
+    let mut prod = 0
+    let mut tls_cert = ""
+    let mut tls_key = ""
+    let mut tls_ca = ""
+    let mut aclfile = ""
+    let mut idle_sec = 0
+    let mut keepalive_sec = 0
+    let mut accept_threads = ACCEPT_THREADS
+    let mut accept_rate = ACCEPT_RATE_MAX
+    let mut unixsocket = ""
+    let mut unixperm = DEFAULT_UNIX_PERM
+    let n = argc()
+    while i < n {
+        let a = arg_get(i)
+        if str_eq(a, "-h") or str_eq(a, "--help") {
+            usage()
+            return
+        }
+        if str_eq(a, "--port") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    port = p
+                },
+                Err(_) => {
+                    print("bad --port")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--bind") and i + 1 < n {
+            host = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--requirepass") and i + 1 < n {
+            pass = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--dir") and i + 1 < n {
+            dir = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--appendonly") and i + 1 < n {
+            aof = yn(arg_get(i + 1), 0)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--shards") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    shards = p
+                },
+                Err(_) => {
+                    print("bad --shards")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--protected-mode") and i + 1 < n {
+            protected = yn(arg_get(i + 1), 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--log-level") and i + 1 < n {
+            log_level = str_to_lower(arg_get(i + 1))
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--log-json") and i + 1 < n {
+            log_json = yn(arg_get(i + 1), 0)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--logfile") and i + 1 < n {
+            logfile = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--log-commands") and i + 1 < n {
+            log_commands = yn(arg_get(i + 1), 0)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--maxclients") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    maxclients = p
+                },
+                Err(_) => {
+                    print("bad --maxclients")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--maxmemory") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    maxmemory = p
+                },
+                Err(_) => {
+                    print("bad --maxmemory")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--metrics-port") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    metrics_port = p
+                },
+                Err(_) => {
+                    print("bad --metrics-port")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--cluster-enabled") and i + 1 < n {
+            cluster_on = yn(arg_get(i + 1), 0)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--cluster-announce-ip") and i + 1 < n {
+            announce_ip = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--replica-of") and i + 1 < n {
+            let rh, rp = parse_ipport(arg_get(i + 1))
+            replica_host = rh
+            replica_port = rp
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--slowlog-slower-than") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    slowlog_us = p
+                },
+                Err(_) => {
+                    print("bad --slowlog-slower-than")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--default-ttl") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    default_ttl = p
+                },
+                Err(_) => {
+                    print("bad --default-ttl")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--appendfsync") and i + 1 < n {
+            fsync_ms = fsync_ms_of(arg_get(i + 1))
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--auto-failover") and i + 1 < n {
+            autofail = yn(arg_get(i + 1), 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--prod") {
+            prod = 1
+            i = i + 1
+            continue
+        }
+        if str_eq(a, "--tls-cert") and i + 1 < n {
+            tls_cert = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--tls-key") and i + 1 < n {
+            tls_key = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--tls-ca") and i + 1 < n {
+            tls_ca = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--aclfile") and i + 1 < n {
+            aclfile = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--timeout") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    idle_sec = p
+                },
+                Err(_) => {
+                    print("bad --timeout")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--tcp-keepalive") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    keepalive_sec = p
+                },
+                Err(_) => {
+                    print("bad --tcp-keepalive")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--accept-threads") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    accept_threads = p
+                },
+                Err(_) => {
+                    print("bad --accept-threads")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--accept-rate") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    accept_rate = p
+                },
+                Err(_) => {
+                    print("bad --accept-rate")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--unixsocket") and i + 1 < n {
+            unixsocket = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--unixsocketperm") and i + 1 < n {
+            let p = parse_octal(arg_get(i + 1))
+            if p < 0 {
+                print("bad --unixsocketperm")
+                exit(1)
+            }
+            unixperm = p
+            i = i + 2
+            continue
+        }
+        print("unknown flag: " + a)
+        usage()
+        exit(1)
+    }
+    if shards < 1 {
+        shards = 1
+    }
+    if shards > 16 {
+        shards = 16
+    }
+    if prod == 1 {
+        if maxmemory <= 0 {
+            print("bonodis: --prod requires --maxmemory BYTES")
+            exit(1)
+        }
+        if aof == 0 {
+            print("bonodis: --prod requires --appendonly yes")
+            exit(1)
+        }
+        if str_len(pass) == 0 and (str_eq(host, "0.0.0.0") or str_eq(host, "::")) {
+            print("bonodis: --prod with a public bind requires --requirepass")
+            exit(1)
+        }
+    }
+    if str_len(tls_cert) > 0 and str_len(tls_key) == 0 {
+        print("bonodis: --tls-cert requires --tls-key")
+        exit(1)
+    }
+    if aof == 1 {
+        let _ = mkdir_all(dir)
+    }
+    let aof_path = dir + "/appendonly.aof"
+    log_setup(log_level, log_json, logfile)
+    if autofail < 0 {
+        autofail = cluster_on
+    }
+    let stop = atomic_new(0)
+    let extra = "\n" + format_int(log_commands) + "\n" + format_int(default_ttl) + "\n" + format_int(fsync_ms) + "\n" + format_int(autofail) + "\n" + tls_cert + "\n" + tls_key + "\n" + aclfile + "\n" + format_int(idle_sec) + "\n" + format_int(keepalive_sec) + "\n" + format_int(accept_threads) + "\n" + format_int(accept_rate) + "\n" + unixsocket + "\n" + format_int(unixperm) + "\n" + tls_ca
+    let rc = serve(host, port, shards, pass, aof_path, aof, protected, stop, maxclients, maxmemory, slowlog_us, metrics_port, pack_opts(cluster_on, announce_ip, dir, replica_host, replica_port) + extra)
+    exit(rc)
+}

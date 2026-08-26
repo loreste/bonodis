@@ -1,0 +1,5 @@
+.git
+*.aof
+dump.bonodis
+nodes.conf
+/tmp

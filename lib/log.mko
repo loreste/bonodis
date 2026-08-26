@@ -1,0 +1,315 @@
+pack bonodis
+
+fn log_setup(level: string, json: int, path: string) {
+    slog_set_service("bonodis")
+    let mut lv = level
+    if str_eq(lv, "") {
+        lv = "info"
+    }
+    slog_set_level(lv)
+    slog_set_json(json)
+    if str_len(path) > 0 {
+        let _ = slog_set_output(path)
+    } else {
+        let _ = slog_set_output("")
+    }
+    slog_with3("info", "logging", "level", lv, "json", ynstr(json), "file", path_or_stderr(path))
+    slog_flush()
+}
+
+fn path_or_stderr(path: string) -> string {
+    if str_len(path) == 0 {
+        return "stderr"
+    }
+    return path
+}
+
+fn ynstr(v: int) -> string {
+    if v == 1 {
+        return "yes"
+    }
+    return "no"
+}
+
+fn reply_kind(r: string) -> string {
+    if str_len(r) == 0 {
+        return "empty"
+    }
+    let c = str_byte_at(r, 0)
+    if c == 43 {
+        return "simple"
+    }
+    if c == 45 {
+        return "error"
+    }
+    if c == 58 {
+        return "int"
+    }
+    if c == 36 {
+        return "bulk"
+    }
+    if c == 42 {
+        return "array"
+    }
+    return "other"
+}
+
+fn log_ready(host: string, port: int, shards: int, aof: int, protected: int, auth: int) {
+    slog_with3("info", "ready", "bind", host, "port", format_int(port), "shards", format_int(shards))
+    slog_with2("info", "config", "appendonly", ynstr(aof), "protected", ynstr(protected))
+    slog_with("info", "auth", "requirepass", ynstr(auth))
+    slog_flush()
+}
+
+fn log_limits(maxclients: int, maxmemory: int, slowlog_us: int, metrics_port: int, logcmd: int) {
+    slog_with3("info", "limits", "maxclients", format_int(maxclients), "maxmemory", format_int(maxmemory), "slowlog_us", format_int(slowlog_us))
+    slog_with2("info", "ops", "metrics_port", format_int(metrics_port), "log_commands", ynstr(logcmd))
+}
+
+fn log_acceptors(n: int, rate: int, backlog: int) {
+    slog_with3("info", "accept", "threads", format_int(n), "rate", format_int(rate), "backlog", format_int(backlog))
+}
+
+fn log_safety(defttl_sec: int, appendfsync: string, autofail: int) {
+    slog_with3("info", "safety", "default_ttl", format_int(defttl_sec), "appendfsync", appendfsync, "auto_failover", ynstr(autofail))
+}
+
+fn log_prod_warns(maxmemory: int, aof: int) {
+    if maxmemory == 0 {
+        slog_with("warn", "maxmemory unlimited", "hint", "set --maxmemory in production")
+    }
+    if aof == 0 {
+        slog_with("warn", "appendonly disabled", "hint", "restart loses data")
+    }
+}
+
+fn log_listen_fail(host: string, port: int) {
+    slog_with2("error", "listen failed", "bind", host, "port", format_int(port))
+    slog_flush()
+}
+
+fn log_unix(path: string, ok: int) {
+    if ok == 1 {
+        slog_with("info", "unix socket", "path", path)
+    } else {
+        slog_with("error", "unix listen failed", "path", path)
+        slog_flush()
+    }
+}
+
+fn log_metrics_listen(port: int, ok: int) {
+    if ok == 1 {
+        slog_with_int("info", "metrics listening", "port", port)
+    } else {
+        slog_with_int("error", "metrics listen failed", "port", port)
+    }
+}
+
+fn log_shutdown() {
+    slog_info("shutting down")
+    slog_flush()
+}
+
+fn log_conn(peer: string, id: int) {
+    slog_with2("debug", "client connected", "id", format_int(id), "addr", peer)
+}
+
+fn log_conn_close(peer: string, id: int) {
+    slog_with2("debug", "client closed", "id", format_int(id), "addr", peer)
+}
+
+fn log_denied(peer: string) {
+    slog_with("warn", "protected-mode deny", "addr", peer)
+}
+
+fn log_maxclients(peer: string, n: int) {
+    slog_with2("warn", "maxclients reached", "addr", peer, "connected", format_int(n))
+}
+
+fn log_proto(peer: string, why: string) {
+    slog_with2("warn", "protocol error", "addr", peer, "why", why)
+}
+
+fn log_query_too_big(peer: string, n: int, cap: int) {
+    slog_with3("warn", "query buffer exceeded", "addr", peer, "len", format_int(n), "cap", format_int(cap))
+}
+
+fn log_auth_ok(id: int) {
+    slog_with_int("info", "AUTH ok", "id", id)
+}
+
+fn log_auth_fail(id: int) {
+    slog_with_int("warn", "AUTH fail", "id", id)
+}
+
+fn log_noauth(cmd: string, id: int) {
+    slog_with2("warn", "NOAUTH", "cmd", cmd, "id", format_int(id))
+}
+
+fn log_hot() -> int {
+    if slog_get_level() == 0 {
+        return 1
+    }
+    return 0
+}
+
+fn log_cmd(cmd: string, id: int, argc: int, verbose: int) {
+    if verbose == 0 and log_hot() == 0 {
+        return
+    }
+    let mut lv = "debug"
+    if verbose == 1 {
+        lv = "info"
+    }
+    slog_with3(lv, "cmd", "name", cmd, "id", format_int(id), "argc", format_int(argc))
+}
+
+fn log_cmd_result(cmd: string, id: int, us: int, reply: string, verbose: int) {
+    let kind = reply_kind(reply)
+    if not str_eq(kind, "error") and verbose == 0 and log_hot() == 0 {
+        return
+    }
+    if str_eq(kind, "error") {
+        let mut lv = "warn"
+        if str_has_prefix(reply, "-MOVED") or str_has_prefix(reply, "-ASK") {
+            lv = "debug"
+        }
+        slog_with3(lv, "cmd error", "name", cmd, "id", format_int(id), "us", format_int(us))
+        slog_with(lv, "cmd error body", "reply", reply_head(reply))
+        return
+    }
+    let mut lv = "debug"
+    if verbose == 1 {
+        lv = "info"
+    }
+    slog_with3(lv, "cmd done", "name", cmd, "kind", kind, "us", format_int(us))
+}
+
+fn reply_head(r: string) -> string {
+    let n = str_len(r)
+    let mut end = n
+    if n >= 2 and str_byte_at(r, n - 2) == 13 {
+        end = n - 2
+    }
+    if end > 160 {
+        end = 160
+    }
+    return r[:end]
+}
+
+fn log_slow(cmd: string, id: int, us: int) {
+    slog_with3("warn", "slow command", "name", cmd, "id", format_int(id), "us", format_int(us))
+}
+
+fn log_moved(cmd: string, slot: int, dest: string) {
+    slog_with3("debug", "MOVED", "cmd", cmd, "slot", format_int(slot), "dest", dest)
+}
+
+fn log_clusterdown(cmd: string, slot: int) {
+    slog_with2("warn", "CLUSTERDOWN", "cmd", cmd, "slot", format_int(slot))
+}
+
+fn log_crossslot(cmd: string) {
+    slog_with("warn", "CROSSSLOT", "cmd", cmd)
+}
+
+fn log_timeout(what: string, id: string) {
+    slog_with2("warn", "timeout", "op", what, "id", id)
+}
+
+fn log_wal(path: string, n: int) {
+    slog_with2("info", "AOF replay", "path", path, "records", format_int(n))
+}
+
+fn log_wal_open(path: string) {
+    slog_with("info", "AOF open", "path", path)
+}
+
+fn log_wal_append_err(rc: int) {
+    slog_with_int("error", "AOF append failed", "rc", rc)
+}
+
+fn log_wal_close() {
+    slog_info("AOF closed")
+    slog_flush()
+}
+
+fn log_evict(n: int, used: int, maxmem: int) {
+    slog_with3("info", "evicted keys", "n", format_int(n), "used", format_int(used), "maxmemory", format_int(maxmem))
+}
+
+fn log_replica_connecting(host: string, port: int) {
+    slog_with2("info", "replica connecting", "host", host, "port", format_int(port))
+}
+
+fn log_replica_connect_fail(host: string, port: int) {
+    slog_with2("warn", "replica connect failed", "host", host, "port", format_int(port))
+}
+
+fn log_replica_psync(host: string, port: int) {
+    slog_with2("info", "replica PSYNC sent", "host", host, "port", format_int(port))
+}
+
+fn log_replica_apply(cmd: string, db: int) {
+    slog_with2("debug", "replica apply", "cmd", cmd, "db", format_int(db))
+}
+
+fn log_replica_disconnect(why: string) {
+    slog_with("warn", "replica disconnected", "why", why)
+}
+
+fn log_replica_stop() {
+    slog_info("replica stopped (master)")
+}
+
+fn log_master_psync(peer: string) {
+    slog_with("info", "PSYNC from replica", "addr", peer)
+}
+
+fn log_master_psync_done() {
+    slog_info("PSYNC dump complete, streaming writes")
+}
+
+fn log_cluster_on(id: string, ip: string, port: string) {
+    slog_with3("info", "cluster enabled", "id", id, "ip", ip, "port", port)
+}
+
+fn log_cluster_meet(ip: string, port: int) {
+    slog_with2("info", "cluster meet", "ip", ip, "port", format_int(port))
+}
+
+fn log_cluster_meet_fail(ip: string, port: int, why: string) {
+    slog_with3("error", "cluster meet failed", "ip", ip, "port", format_int(port), "why", why)
+}
+
+fn log_cluster_gossip(ip: string, port: int) {
+    slog_with2("debug", "cluster gossip", "ip", ip, "port", format_int(port))
+}
+
+fn log_cluster_slots(n: int) {
+    slog_with_int("info", "cluster slots updated", "owned", n)
+}
+
+fn log_cluster_replicate(master: string, addr: string) {
+    slog_with2("info", "cluster replicate", "master", master, "addr", addr)
+}
+
+fn log_cluster_failover(epoch: string) {
+    slog_with("info", "cluster failover", "epoch", epoch)
+}
+
+fn log_cluster_save(path: string) {
+    slog_with("debug", "nodes.conf saved", "path", path)
+}
+
+fn log_clusterx(sub: string, peer: string) {
+    slog_with2("debug", "CLUSTERX", "sub", sub, "from", peer)
+}
+
+fn log_replicaof(host: string, port: string) {
+    slog_with2("info", "REPLICAOF", "host", host, "port", port)
+}
+
+fn log_multi(id: int, n: int) {
+    slog_with2("debug", "EXEC", "id", format_int(id), "queued", format_int(n))
+}

@@ -1,0 +1,2575 @@
+pack bonodis
+
+// Config is passed as scalars — native backend does not yet lower string struct fields.
+
+fn wait_reply(replies: CMap, id: string) -> string {
+    let mut n = 0
+    while n < WAIT_MAX {
+        let r = cmap_get(replies, id)
+        if str_len(r) > 0 {
+            let _ = cmap_del(replies, id)
+            return r
+        }
+        if n >= WAIT_SPIN {
+            if n < WAIT_NEAR {
+                sleep_us(10)
+            } else {
+                sleep_us(50)
+            }
+        }
+        n = n + 1
+    }
+    log_timeout("wait_reply", id)
+    return r_err("ERR timeout")
+}
+
+fn next_id(ids: AtomicInt) -> string {
+    return format_int(atomic_add(ids, 1))
+}
+
+fn send_job(bus: []chan[string], shard: int, id: string, db: int, argv: []string) {
+    let nbus = len(bus)
+    if nbus < 1 {
+        return
+    }
+    let mut sh = shard % nbus
+    if sh < 0 {
+        sh = 0 - sh
+    }
+    let b = str_builder()
+    builder_write(b, id)
+    builder_write(b, "\n")
+    builder_write(b, format_int(db))
+    builder_write(b, "\n")
+    builder_write(b, format_int(len(argv)))
+    builder_write(b, "\n")
+    let mut i = 0
+    while i < len(argv) {
+        builder_write(b, format_int(str_len(argv[i])))
+        builder_write(b, "\n")
+        builder_write(b, argv[i])
+        i = i + 1
+    }
+    let _ = chan_str_send_take(bus[sh], builder_string(b))
+}
+
+fn call_shard(bus: []chan[string], replies: CMap, ids: AtomicInt, shard: int, db: int, argv: []string) -> string {
+    let id = next_id(ids)
+    send_job(bus, shard, id, db, argv)
+    return wait_reply(replies, id)
+}
+
+fn pack_bus(s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string]) -> []chan[string] {
+    let mut bus = make([]chan[string], 0, 16)
+    bus = append(bus, s0)
+    bus = append(bus, s1)
+    bus = append(bus, s2)
+    bus = append(bus, s3)
+    bus = append(bus, s4)
+    bus = append(bus, s5)
+    bus = append(bus, s6)
+    bus = append(bus, s7)
+    bus = append(bus, s8)
+    bus = append(bus, s9)
+    bus = append(bus, s10)
+    bus = append(bus, s11)
+    bus = append(bus, s12)
+    bus = append(bus, s13)
+    bus = append(bus, s14)
+    bus = append(bus, s15)
+    return bus
+}
+
+fn bus_stop(bus: []chan[string]) {
+    let mut i = 0
+    while i < len(bus) {
+        let _ = bus[i].send("STOP")
+        i = i + 1
+    }
+}
+
+fn broadcast(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> []string {
+    let mut n = shards
+    if n > 16 {
+        n = 16
+    }
+    if n < 1 {
+        n = 1
+    }
+    let mut ids_s = make([]string, 0, n)
+    let mut i = 0
+    while i < n {
+        let id = next_id(ids)
+        ids_s = append(ids_s, id)
+        send_job(bus, i, id, db, argv)
+        i = i + 1
+    }
+    let mut out = make([]string, 0, n)
+    i = 0
+    while i < n {
+        out = append(out, wait_reply(replies, ids_s[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn parse_int_reply(resp: string) -> int {
+    if str_len(resp) >= 1 and str_byte_at(resp, 0) == 58 {
+        let cr = find_crlf(resp, 0)
+        if cr > 1 {
+            return int_of(resp[1:cr])
+        }
+    }
+    return 0
+}
+
+fn parse_array_bulks(resp: string) -> []string {
+    let none = make([]string, 0, 0)
+    if str_len(resp) == 0 or str_byte_at(resp, 0) != 42 {
+        return none
+    }
+    let argv, _, st = parse_cmd(resp)
+    if st != 1 {
+        return none
+    }
+    return argv
+}
+
+fn merge_arrays(parts: []string) -> string {
+    let mut all = make([]string, 0, 8)
+    let mut i = 0
+    while i < len(parts) {
+        let ks = parse_array_bulks(parts[i])
+        let mut j = 0
+        while j < len(ks) {
+            all = append(all, ks[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return r_array_bulks(all)
+}
+
+fn pick_bulk(parts: []string) -> string {
+    let mut i = 0
+    while i < len(parts) {
+        if str_has_prefix(parts[i], "$") and not str_has_prefix(parts[i], "$-1") {
+            return parts[i]
+        }
+        i = i + 1
+    }
+    return r_nil()
+}
+
+fn dispatch_blpop(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("blpop")
+    }
+    let mut right = 0
+    if str_eq(cmd_name(argv), "BRPOP") {
+        right = 1
+    }
+    let to, ok = int_ok(argv[len(argv) - 1])
+    if ok == 0 {
+        return r_notint()
+    }
+    let mut deadline = wall_ms() + to * 1000
+    if to == 0 {
+        deadline = wall_ms() + 86400000
+    }
+    let mut pop = "LPOP"
+    if right == 1 {
+        pop = "RPOP"
+    }
+    while wall_ms() <= deadline {
+        let mut i = 1
+        while i < len(argv) - 1 {
+            let r = call_shard(bus, replies, ids, key_shard(argv[i], shards), db, [pop, argv[i]])
+            if not str_has_prefix(r, "$-1") and not str_has_prefix(r, "*0") and str_has_prefix(r, "$") {
+                let cr = find_crlf(r, 0)
+                let ln = int_of(r[1:cr])
+                let val = r[cr + 2:cr + 2 + ln]
+                let mut pair = make([]string, 0, 2)
+                pair = append(pair, argv[i])
+                pair = append(pair, val)
+                return r_array_bulks(pair)
+            }
+            i = i + 1
+        }
+        sleep_ms(10)
+        if to == 0 {
+            deadline = wall_ms() + 86400000
+        }
+    }
+    return r_null_arr()
+}
+
+fn dispatch_bzpop(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("bzpopmin")
+    }
+    let mut pop = "ZPOPMIN"
+    if str_eq(cmd_name(argv), "BZPOPMAX") {
+        pop = "ZPOPMAX"
+    }
+    let to, ok = int_ok(argv[len(argv) - 1])
+    if ok == 0 {
+        return r_notint()
+    }
+    let mut deadline = wall_ms() + to * 1000
+    if to == 0 {
+        deadline = wall_ms() + 86400000
+    }
+    while wall_ms() <= deadline {
+        let mut i = 1
+        while i < len(argv) - 1 {
+            let r = call_shard(bus, replies, ids, key_shard(argv[i], shards), db, [pop, argv[i], "1"])
+            if str_has_prefix(r, "*") and not str_has_prefix(r, "*0") and not str_has_prefix(r, "*-1") {
+                let xs = parse_array_bulks(r)
+                if len(xs) >= 2 {
+                    let mut trio = make([]string, 0, 3)
+                    trio = append(trio, argv[i])
+                    trio = append(trio, xs[0])
+                    trio = append(trio, xs[1])
+                    return r_array_bulks(trio)
+                }
+            }
+            i = i + 1
+        }
+        sleep_ms(10)
+        if to == 0 {
+            deadline = wall_ms() + 86400000
+        }
+    }
+    return r_null_arr()
+}
+
+fn streams_key_index(argv: []string) -> int {
+    let mut i = 1
+    while i < len(argv) {
+        if str_eq(str_to_upper(argv[i]), "STREAMS") {
+            return i + 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn dispatch_numkeys(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string, k0: int) -> string {
+    if len(argv) <= k0 {
+        return r_arity(str_to_lower(cmd_name(argv)))
+    }
+    let nk, ok = int_ok(argv[k0])
+    if ok == 0 or nk < 1 or k0 + 1 + nk > len(argv) {
+        return r_syntax()
+    }
+    let first = key_shard(argv[k0 + 1], shards)
+    let mut i = 1
+    while i < nk {
+        if key_shard(argv[k0 + 1 + i], shards) != first {
+            return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+        }
+        i = i + 1
+    }
+    if k0 == 2 {
+        if key_shard(argv[1], shards) != first {
+            return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+        }
+    }
+    return call_shard(bus, replies, ids, first, db, argv)
+}
+
+fn cluster_slots_reply(host: string, port: int) -> string {
+    let mut ip = host
+    if str_eq(ip, "0.0.0.0") or str_eq(ip, "::") or str_eq(ip, "") {
+        ip = "127.0.0.1"
+    }
+    let b = str_builder()
+    builder_write(b, "*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n")
+    builder_write(b, r_bulk(ip))
+    builder_write(b, r_int(port))
+    builder_write(b, r_bulk("0000000000000000000000000000000000000001"))
+    return builder_string(b)
+}
+
+fn bulk_payload(resp: string) -> string {
+    if str_len(resp) < 4 or str_byte_at(resp, 0) != 36 {
+        return ""
+    }
+    let cr = find_crlf(resp, 0)
+    if cr < 2 {
+        return ""
+    }
+    let ln = int_of(resp[1:cr])
+    if ln <= 0 {
+        return ""
+    }
+    let start = cr + 2
+    if start + ln > str_len(resp) {
+        return resp[start:]
+    }
+    return resp[start:start + ln]
+}
+
+fn metrics_text(connected: int, cmds: int, shards: int, maxclients: int, maxmemory: int, slow_n: int, rss: int, role: string) -> string {
+    let b = str_builder()
+    builder_write(b, "# HELP bonodis_up 1 if the process is serving\n")
+    builder_write(b, "# TYPE bonodis_up gauge\nbonodis_up 1\n")
+    builder_write(b, "# TYPE bonodis_connected_clients gauge\nbonodis_connected_clients ")
+    builder_write(b, format_int(connected))
+    builder_write(b, "\n# TYPE bonodis_commands_processed_total counter\nbonodis_commands_processed_total ")
+    builder_write(b, format_int(cmds))
+    builder_write(b, "\n# TYPE bonodis_shards gauge\nbonodis_shards ")
+    builder_write(b, format_int(shards))
+    builder_write(b, "\n# TYPE bonodis_maxclients gauge\nbonodis_maxclients ")
+    builder_write(b, format_int(maxclients))
+    builder_write(b, "\n# TYPE bonodis_maxmemory_bytes gauge\nbonodis_maxmemory_bytes ")
+    builder_write(b, format_int(maxmemory))
+    builder_write(b, "\n# TYPE bonodis_slowlog_length gauge\nbonodis_slowlog_length ")
+    builder_write(b, format_int(slow_n))
+    builder_write(b, "\n# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes ")
+    builder_write(b, format_int(rss))
+    builder_write(b, "\n# TYPE bonodis_role info\nbonodis_role{role=\"")
+    builder_write(b, role)
+    builder_write(b, "\"} 1\n")
+    return builder_string(b)
+}
+
+fn http_req_path(raw: string) -> string {
+    let sp = str_index(raw, " ")
+    if sp < 0 {
+        return "/"
+    }
+    let rest = raw[sp + 1:]
+    let sp2 = str_index(rest, " ")
+    if sp2 < 0 {
+        let cr = find_crlf(rest, 0)
+        if cr > 0 {
+            return rest[:cr]
+        }
+        return rest
+    }
+    return rest[:sp2]
+}
+
+fn metrics_loop(lfd: int, connected: AtomicInt, cmds: AtomicInt, shards: int, maxclients: int, maxmemory: int, sl: CMap, replcfg: CMap, stop: AtomicInt, s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string], replies: CMap, ids: AtomicInt) -> int {
+    let bus = pack_bus(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15)
+    if lfd < 0 {
+        while shutdown_requested() == 0 and atomic_load(stop) == 0 {
+            sleep_ms(50)
+        }
+        return 0
+    }
+    let _ = tcp_set_timeout(lfd, 500)
+    while shutdown_requested() == 0 and atomic_load(stop) == 0 {
+        let fd = tcp_accept(lfd)
+        if fd < 0 {
+            continue
+        }
+        let _ = tcp_set_timeout(fd, 2000)
+        let _ = tcp_nodelay(fd)
+        let req = tcp_read(fd)
+        let path = http_req_path(req)
+        let mut rss = process_rss_bytes()
+        if rss < 0 {
+            rss = 0
+        }
+        let mut role = cmap_get(replcfg, "role")
+        if str_eq(role, "") {
+            role = "master"
+        }
+        if str_eq(path, "/metrics") or str_has_prefix(path, "/metrics?") {
+            let body = metrics_text(atomic_load(connected), atomic_load(cmds), shards, maxclients, maxmemory, int_of(cmap_get(sl, "n")), rss, role)
+            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: " + format_int(str_len(body)) + "\r\nConnection: close\r\n\r\n"
+            let _ = tcp_write_all(fd, hdr + body)
+        } else {
+            let ar = api_http(req, bus, replies, ids, shards, replcfg)
+            if str_len(ar) > 0 {
+                let _ = tcp_write_all(fd, ar)
+            } else {
+                let br = brain_http(req, bus, replies, ids, shards)
+                if str_len(br) > 0 {
+                    let _ = tcp_write_all(fd, br)
+                } else {
+                    let body = "not found\n"
+                    let hdr = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: " + format_int(str_len(body)) + "\r\nConnection: close\r\n\r\n"
+                    let _ = tcp_write_all(fd, hdr + body)
+                }
+            }
+        }
+        let _ = tcp_close(fd)
+    }
+    return 0
+}
+
+fn slowlog_add(sl: CMap, us: int, argv: []string) {
+    let n = int_of(cmap_get(sl, "n"))
+    let id = int_of(cmap_get(sl, "id")) + 1
+    cmap_set(sl, "id", format_int(id))
+    cmap_set(sl, "n", format_int(n + 1))
+    let rec = format_int(id) + "\t" + format_int(wall_ms()) + "\t" + format_int(us) + "\t" + str_join(argv, " ")
+    cmap_set(sl, "e" + format_int(n % 128), rec)
+}
+
+fn slowlog_get(sl: CMap, count: int) -> string {
+    let n = int_of(cmap_get(sl, "n"))
+    let mut take = count
+    if take < 0 or take > n {
+        take = n
+    }
+    if take > 128 {
+        take = 128
+    }
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(take))
+    builder_write(b, "\r\n")
+    let mut i = 0
+    while i < take {
+        let rec = cmap_get(sl, "e" + format_int((n - 1 - i) % 128))
+        let parts = str_split(rec, "\t")
+        builder_write(b, "*4\r\n")
+        if len(parts) >= 3 {
+            builder_write(b, r_int(int_of(parts[0])))
+            builder_write(b, r_int(int_of(parts[1])))
+            builder_write(b, r_int(int_of(parts[2])))
+            let mut cmd = ""
+            if len(parts) >= 4 {
+                cmd = parts[3]
+            }
+            builder_write(b, r_bulk(cmd))
+        } else {
+            builder_write(b, r_int(0))
+            builder_write(b, r_int(0))
+            builder_write(b, r_int(0))
+            builder_write(b, r_bulk(""))
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn dispatch(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    if str_eq(cmd, "FLUSHALL") or str_eq(cmd, "FLUSHDB") {
+        let parts = broadcast(bus, replies, ids, shards, db, argv)
+        let mut i = 0
+        while i < len(parts) {
+            if str_has_prefix(parts[i], "-") {
+                return parts[i]
+            }
+            i = i + 1
+        }
+        return r_ok()
+    }
+    if str_eq(cmd, "DBSIZE") {
+        let parts = broadcast(bus, replies, ids, shards, db, argv)
+        let mut n = 0
+        let mut i = 0
+        while i < len(parts) {
+            n = n + parse_int_reply(parts[i])
+            i = i + 1
+        }
+        return r_int(n)
+    }
+    if str_eq(cmd, "KEYS") {
+        let parts = broadcast(bus, replies, ids, shards, db, argv)
+        let mut i = 0
+        while i < len(parts) {
+            if str_has_prefix(parts[i], "-") {
+                return parts[i]
+            }
+            i = i + 1
+        }
+        return merge_arrays(parts)
+    }
+    if str_eq(cmd, "RANDOMKEY") {
+        return pick_bulk(broadcast(bus, replies, ids, shards, db, argv))
+    }
+    if str_eq(cmd, "SCAN") {
+        return merge_scan(bus, replies, ids, shards, db, argv)
+    }
+    if str_eq(cmd, "HOTKEYS") {
+        return merge_arrays(broadcast(bus, replies, ids, shards, db, argv))
+    }
+    if str_eq(cmd, "EXPORT") {
+        return merge_export(broadcast(bus, replies, ids, shards, db, argv))
+    }
+    if str_eq(cmd, "BLPOP") or str_eq(cmd, "BRPOP") {
+        return dispatch_blpop(bus, replies, ids, shards, db, argv)
+    }
+    if str_eq(cmd, "BZPOPMIN") or str_eq(cmd, "BZPOPMAX") {
+        return dispatch_bzpop(bus, replies, ids, shards, db, argv)
+    }
+    if str_eq(cmd, "SWAPDB") {
+        let parts = broadcast(bus, replies, ids, shards, db, argv)
+        let mut i = 0
+        while i < len(parts) {
+            if str_has_prefix(parts[i], "-") {
+                return parts[i]
+            }
+            i = i + 1
+        }
+        return r_ok()
+    }
+    if str_eq(cmd, "ZUNION") or str_eq(cmd, "ZINTER") or str_eq(cmd, "ZDIFF") or str_eq(cmd, "SINTERCARD") or str_eq(cmd, "LMPOP") or str_eq(cmd, "ZMPOP") {
+        return dispatch_numkeys(bus, replies, ids, shards, db, argv, 1)
+    }
+    if str_eq(cmd, "ZINTERSTORE") or str_eq(cmd, "ZDIFFSTORE") {
+        return dispatch_numkeys(bus, replies, ids, shards, db, argv, 2)
+    }
+    if str_eq(cmd, "XGROUP") or str_eq(cmd, "XINFO") {
+        if len(argv) >= 3 {
+            return call_shard(bus, replies, ids, key_shard(argv[2], shards), db, argv)
+        }
+        return r_arity(str_to_lower(cmd))
+    }
+    if str_eq(cmd, "XREAD") or str_eq(cmd, "XREADGROUP") {
+        let ki = streams_key_index(argv)
+        if ki >= 0 and ki < len(argv) {
+            return call_shard(bus, replies, ids, key_shard(argv[ki], shards), db, argv)
+        }
+        return r_syntax()
+    }
+    if str_eq(cmd, "GEOSEARCHSTORE") {
+        if len(argv) < 3 {
+            return r_arity("geosearchstore")
+        }
+        if key_shard(argv[1], shards) != key_shard(argv[2], shards) {
+            return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+        }
+        return call_shard(bus, replies, ids, key_shard(argv[1], shards), db, argv)
+    }
+    if str_eq(cmd, "MEMORY") {
+        if len(argv) >= 3 {
+            return call_shard(bus, replies, ids, key_shard(argv[2], shards), db, argv)
+        }
+    }
+    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") {
+        if len(argv) < 3 {
+            return r_arity("eval")
+        }
+        let nk, ok = int_ok(argv[2])
+        if ok == 0 or nk < 0 {
+            return r_notint()
+        }
+        if nk == 0 {
+            return call_shard(bus, replies, ids, 0, db, argv)
+        }
+        if nk > len(argv) - 3 {
+            return r_syntax()
+        }
+        let slot = key_shard(argv[3], shards)
+        let mut i = 1
+        while i < nk {
+            if key_shard(argv[3 + i], shards) != slot {
+                return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+            }
+            i = i + 1
+        }
+        return call_shard(bus, replies, ids, slot, db, argv)
+    }
+    if str_eq(cmd, "MGET") {
+        return dispatch_mget(bus, replies, ids, shards, db, argv)
+    }
+    if str_eq(cmd, "MSET") or str_eq(cmd, "MSETNX") {
+        return dispatch_mset(bus, replies, ids, shards, db, argv)
+    }
+    if str_eq(cmd, "SUNION") or str_eq(cmd, "SINTER") or str_eq(cmd, "SDIFF") {
+        return dispatch_setop(bus, replies, ids, shards, db, argv, 0)
+    }
+    if str_eq(cmd, "SUNIONSTORE") or str_eq(cmd, "SINTERSTORE") or str_eq(cmd, "SDIFFSTORE") {
+        return dispatch_setop(bus, replies, ids, shards, db, argv, 1)
+    }
+    if str_eq(cmd, "DEL") or str_eq(cmd, "UNLINK") or str_eq(cmd, "EXISTS") or str_eq(cmd, "TOUCH") {
+        return dispatch_multikey(bus, replies, ids, shards, db, argv)
+    }
+    if str_eq(cmd, "RENAME") or str_eq(cmd, "RENAMENX") or str_eq(cmd, "COPY") {
+        return dispatch_rename(bus, replies, ids, shards, db, argv)
+    }
+    if str_eq(cmd, "TURN") {
+        if len(argv) < 3 {
+            return r_arity("turn")
+        }
+        if key_shard(argv[1], shards) != key_shard(argv[2], shards) {
+            return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+        }
+        return call_shard(bus, replies, ids, key_shard(argv[1], shards), db, argv)
+    }
+    if str_eq(cmd, "RELATE") or str_eq(cmd, "UNRELATE") or str_eq(cmd, "PATH") {
+        if len(argv) < 3 {
+            return r_arity(str_to_lower(cmd))
+        }
+        if key_shard(argv[1], shards) != key_shard(argv[2], shards) {
+            return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+        }
+        return call_shard(bus, replies, ids, key_shard(argv[1], shards), db, argv)
+    }
+    if str_eq(cmd, "FACT") {
+        if len(argv) < 3 {
+            return r_arity("fact")
+        }
+        let sub = str_to_upper(argv[1])
+        if str_eq(sub, "WHO") {
+            if len(argv) < 4 {
+                return r_arity("fact")
+            }
+            return merge_arrays(broadcast(bus, replies, ids, shards, db, argv))
+        }
+        return call_shard(bus, replies, ids, key_shard(argv[2], shards), db, argv)
+    }
+    if str_eq(cmd, "BRAIN") {
+        if len(argv) < 2 {
+            return r_arity("brain")
+        }
+        let sub = str_to_upper(argv[1])
+        if str_eq(sub, "HELP") {
+            return call_shard(bus, replies, ids, 0, db, argv)
+        }
+        if str_eq(sub, "CACHE") {
+            return call_shard(bus, replies, ids, key_shard("brain:cache", shards), db, argv)
+        }
+        if len(argv) >= 3 {
+            return call_shard(bus, replies, ids, key_shard(argv[2], shards), db, argv)
+        }
+        return r_arity("brain")
+    }
+    if str_eq(cmd, "REACT") {
+        if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "LIST") {
+            // LIST returns from all shards; broadcast and merge
+            return merge_arrays(broadcast(bus, replies, ids, shards, db, argv))
+        }
+        if len(argv) >= 4 and str_eq(str_to_upper(argv[1]), "CREATE") {
+            // route to shard of the trigger key (argv[3])
+            return call_shard(bus, replies, ids, key_shard(argv[3], shards), db, argv)
+        }
+        // DELETE: broadcast to all shards (name could be anywhere)
+        let parts = broadcast(bus, replies, ids, shards, db, argv)
+        let mut total = 0
+        let mut i = 0
+        while i < len(parts) {
+            total = total + parse_int_reply(parts[i])
+            i = i + 1
+        }
+        return r_int(total)
+    }
+    if len(argv) >= 2 {
+        let sh = key_shard(argv[1], shards)
+        return call_shard(bus, replies, ids, sh, db, argv)
+    }
+    return call_shard(bus, replies, ids, 0, db, argv)
+}
+
+fn merge_export(parts: []string) -> string {
+    let b = str_builder()
+    let mut i = 0
+    while i < len(parts) {
+        builder_write(b, bulk_payload(parts[i]))
+        i = i + 1
+    }
+    return r_bulk(builder_string(b))
+}
+
+fn collect_dump_recs(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int) -> []string {
+    let mut recs = make([]string, 0, 16)
+    let mut db = 0
+    while db < 16 {
+        let r = dispatch(bus, replies, ids, shards, db, ["EXPORT"])
+        let payload = bulk_payload(r)
+        let mut pos = 0
+        let n = str_len(payload)
+        while pos < n {
+            let argv, used, st = parse_cmd(payload[pos:])
+            if st != 1 or used <= 0 or len(argv) == 0 {
+                break
+            }
+            recs = append(recs, format_int(db) + "\n" + payload[pos:pos + used])
+            pos = pos + used
+        }
+        db = db + 1
+    }
+    return recs
+}
+
+fn collect_dump_blob(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int) -> string {
+    let b = str_builder()
+    builder_write(b, "BONODIS-DUMP 1\n")
+    let mut db = 0
+    while db < 16 {
+        let r = dispatch(bus, replies, ids, shards, db, ["EXPORT"])
+        let payload = bulk_payload(r)
+        if str_len(payload) > 0 {
+            builder_write(b, "SELECT ")
+            builder_write(b, format_int(db))
+            builder_write(b, "\n")
+            builder_write(b, payload)
+        }
+        db = db + 1
+    }
+    return builder_string(b)
+}
+
+fn snapshot_dir(replcfg: CMap) -> string {
+    let dir = cmap_get(replcfg, "dir")
+    if str_len(dir) == 0 {
+        return "."
+    }
+    return dir
+}
+
+fn do_save(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, replcfg: CMap) -> string {
+    let dir = snapshot_dir(replcfg)
+    let _ = mkdir_all(dir)
+    let path = dir + "/dump.bonodis"
+    let blob = collect_dump_blob(bus, replies, ids, shards)
+    let rc = atomic_write_file(path, blob)
+    if rc != 0 {
+        slog_with("error", "SAVE failed", "path", path)
+        return r_err("ERR SAVE failed")
+    }
+    cmap_set(replcfg, "lastsave", format_int(wall_ms() / 1000))
+    slog_with2("info", "SAVE", "path", path, "bytes", format_int(str_len(blob)))
+    return r_ok()
+}
+
+fn do_bgrewriteaof(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, wal_ch: chan[string], aof: int, replcfg: CMap) -> string {
+    if aof == 0 {
+        return r_err("ERR No AOF configured. Enable with --appendonly yes")
+    }
+    let recs = collect_dump_recs(bus, replies, ids, shards)
+    let _ = wal_ch.send(pack_rewrite(recs))
+    cmap_set(replcfg, "lastsave", format_int(wall_ms() / 1000))
+    slog_with("info", "BGREWRITEAOF queued", "records", format_int(len(recs)))
+    return r_ok()
+}
+
+fn merge_scan(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("SCAN")
+    }
+    let mut pat = "*"
+    if len(argv) >= 4 {
+        let mut i = 2
+        while i + 1 < len(argv) {
+            if str_eq(str_to_upper(argv[i]), "MATCH") {
+                pat = argv[i + 1]
+            }
+            i = i + 2
+        }
+    }
+    let parts = broadcast(bus, replies, ids, shards, db, ["__SCANKEYS", pat])
+    let merged = parse_array_bulks(merge_arrays(parts))
+    let cursor, _ = int_ok(argv[1])
+    let mut count = 10
+    let mut i = 2
+    while i + 1 < len(argv) {
+        if str_eq(str_to_upper(argv[i]), "COUNT") {
+            let n, ok = int_ok(argv[i + 1])
+            if ok == 1 and n > 0 {
+                count = n
+            }
+        }
+        i = i + 2
+    }
+    let chunk = slice_skip_take(merged, cursor, count)
+    let mut next = cursor + len(chunk)
+    if next >= len(merged) {
+        next = 0
+    }
+    return r_scan(format_int(next), chunk)
+}
+
+fn dispatch_setop(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string, store: int) -> string {
+    let cmd = cmd_name(argv)
+    let mut k0 = 1
+    if store == 1 {
+        k0 = 2
+    }
+    if len(argv) < k0 + 1 {
+        return r_arity(str_to_lower(cmd))
+    }
+    let first = key_shard(argv[k0], shards)
+    let mut same = 1
+    let mut i = k0
+    while i < len(argv) {
+        if key_shard(argv[i], shards) != first {
+            same = 0
+        }
+        i = i + 1
+    }
+    if store == 1 {
+        if key_shard(argv[1], shards) != first {
+            same = 0
+        }
+    }
+    if same == 1 {
+        return call_shard(bus, replies, ids, first, db, argv)
+    }
+    let mut mode = 0
+    if str_contains(cmd, "INTER") {
+        mode = 1
+    } else if str_contains(cmd, "DIFF") {
+        mode = 2
+    }
+    let mut acc: []string = []
+    let mut init = 0
+    i = k0
+    while i < len(argv) {
+        let r = call_shard(bus, replies, ids, key_shard(argv[i], shards), db, ["SMEMBERS", argv[i]])
+        if str_has_prefix(r, "-") {
+            return r
+        }
+        let ks = parse_array_bulks(r)
+        if mode == 0 {
+            let mut k = 0
+            while k < len(ks) {
+                let mut found = 0
+                let mut j = 0
+                while j < len(acc) {
+                    if str_eq(acc[j], ks[k]) {
+                        found = 1
+                    }
+                    j = j + 1
+                }
+                if found == 0 {
+                    acc = append(acc, ks[k])
+                }
+                k = k + 1
+            }
+        } else if mode == 1 {
+            if init == 0 {
+                acc = ks
+                init = 1
+            } else {
+                let mut nxt: []string = []
+                let mut a = 0
+                while a < len(acc) {
+                    let mut k = 0
+                    while k < len(ks) {
+                        if str_eq(acc[a], ks[k]) {
+                            nxt = append(nxt, acc[a])
+                            break
+                        }
+                        k = k + 1
+                    }
+                    a = a + 1
+                }
+                acc = nxt
+            }
+        } else {
+            if init == 0 {
+                acc = ks
+                init = 1
+            } else {
+                let mut nxt: []string = []
+                let mut a = 0
+                while a < len(acc) {
+                    let mut found = 0
+                    let mut k = 0
+                    while k < len(ks) {
+                        if str_eq(acc[a], ks[k]) {
+                            found = 1
+                        }
+                        k = k + 1
+                    }
+                    if found == 0 {
+                        nxt = append(nxt, acc[a])
+                    }
+                    a = a + 1
+                }
+                acc = nxt
+            }
+        }
+        i = i + 1
+    }
+    if store == 0 {
+        return r_array_bulks(acc)
+    }
+    let dest = argv[1]
+    let dsh = key_shard(dest, shards)
+    let _ = call_shard(bus, replies, ids, dsh, db, ["DEL", dest])
+    if len(acc) == 0 {
+        return r_int(0)
+    }
+    let mut sadd = make([]string, 0, len(acc) + 2)
+    sadd = append(sadd, "SADD")
+    sadd = append(sadd, dest)
+    i = 0
+    while i < len(acc) {
+        sadd = append(sadd, acc[i])
+        i = i + 1
+    }
+    let _ = call_shard(bus, replies, ids, dsh, db, sadd)
+    return r_int(len(acc))
+}
+
+fn dispatch_mget(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("mget")
+    }
+    let nkeys = len(argv) - 1
+    let mut items = make([]string, 0, nkeys)
+    let mut hit = make([]int, 0, nkeys)
+    let mut k = 0
+    while k < nkeys {
+        items = append(items, "")
+        hit = append(hit, 0)
+        k = k + 1
+    }
+    let mut sh = 0
+    while sh < shards {
+        let mut sub = make([]string, 0, 4)
+        sub = append(sub, "MGET")
+        let mut idx = make([]int, 0, 4)
+        let mut i = 1
+        while i < len(argv) {
+            if key_shard(argv[i], shards) == sh {
+                sub = append(sub, argv[i])
+                idx = append(idx, i - 1)
+            }
+            i = i + 1
+        }
+        if len(sub) > 1 {
+            let r = call_shard(bus, replies, ids, sh, db, sub)
+            if str_has_prefix(r, "-") {
+                return r
+            }
+            let nils = resp_nil_mask(r)
+            let got = parse_array_bulks(r)
+            let mut j = 0
+            while j < len(got) and j < len(idx) {
+                items[idx[j]] = got[j]
+                if j >= len(nils) or nils[j] == 0 {
+                    hit[idx[j]] = 1
+                }
+                j = j + 1
+            }
+        }
+        sh = sh + 1
+    }
+    return r_array_opt(items, hit)
+}
+
+fn dispatch_mset(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    if len(argv) < 3 or (len(argv) % 2) == 0 {
+        return r_arity("mset")
+    }
+    let mut first = -1
+    let mut i = 1
+    while i < len(argv) {
+        let sh = key_shard(argv[i], shards)
+        if first < 0 {
+            first = sh
+        } else if sh != first {
+            if str_eq(cmd, "MSETNX") {
+                return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+            }
+        }
+        i = i + 2
+    }
+    if str_eq(cmd, "MSETNX") {
+        return call_shard(bus, replies, ids, first, db, argv)
+    }
+    let mut sh = 0
+    while sh < shards {
+        let mut sub = make([]string, 0, 4)
+        sub = append(sub, "MSET")
+        i = 1
+        while i + 1 < len(argv) {
+            if key_shard(argv[i], shards) == sh {
+                sub = append(sub, argv[i])
+                sub = append(sub, argv[i + 1])
+            }
+            i = i + 2
+        }
+        if len(sub) > 1 {
+            let r = call_shard(bus, replies, ids, sh, db, sub)
+            if str_has_prefix(r, "-") {
+                return r
+            }
+        }
+        sh = sh + 1
+    }
+    return r_ok()
+}
+
+fn dispatch_multikey(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity(str_to_lower(argv[0]))
+    }
+    let mut n = 0
+    let mut i = 1
+    while i < len(argv) {
+        let sh = key_shard(argv[i], shards)
+        let r = call_shard(bus, replies, ids, sh, db, [argv[0], argv[i]])
+        if str_has_prefix(r, "-") {
+            return r
+        }
+        n = n + parse_int_reply(r)
+        i = i + 1
+    }
+    return r_int(n)
+}
+
+fn dispatch_rename(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    if str_eq(cmd, "COPY") {
+        if len(argv) < 3 {
+            return r_arity("copy")
+        }
+        let s1 = key_shard(argv[1], shards)
+        let s2 = key_shard(argv[2], shards)
+        if s1 == s2 {
+            return call_shard(bus, replies, ids, s1, db, argv)
+        }
+        let g = call_shard(bus, replies, ids, s1, db, ["GET", argv[1]])
+        if str_has_prefix(g, "-") {
+            return g
+        }
+        if str_eq(g, r_nil()) {
+            return r_int(0)
+        }
+        let payload = bulk_payload(g)
+        let _ = call_shard(bus, replies, ids, s2, db, ["SET", argv[2], payload])
+        return r_int(1)
+    }
+    if len(argv) != 3 {
+        return r_arity("rename")
+    }
+    let s1 = key_shard(argv[1], shards)
+    let s2 = key_shard(argv[2], shards)
+    if s1 != s2 {
+        return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+    }
+    return call_shard(bus, replies, ids, s1, db, argv)
+}
+
+fn is_local_cmd(cmd: string) -> int {
+    if str_eq(cmd, "PING") or str_eq(cmd, "ECHO") or str_eq(cmd, "AUTH") or str_eq(cmd, "QUIT") {
+        return 1
+    }
+    if str_eq(cmd, "SELECT") or str_eq(cmd, "HELLO") or str_eq(cmd, "COMMAND") or str_eq(cmd, "INFO") {
+        return 1
+    }
+    if str_eq(cmd, "TIME") or str_eq(cmd, "CLIENT") or str_eq(cmd, "CONFIG") or str_eq(cmd, "MULTI") {
+        return 1
+    }
+    if str_eq(cmd, "EXEC") or str_eq(cmd, "DISCARD") or str_eq(cmd, "WATCH") or str_eq(cmd, "UNWATCH") {
+        return 1
+    }
+    if str_eq(cmd, "SUBSCRIBE") or str_eq(cmd, "UNSUBSCRIBE") or str_eq(cmd, "PUBLISH") or str_eq(cmd, "PSUBSCRIBE") {
+        return 1
+    }
+    if str_eq(cmd, "PUNSUBSCRIBE") {
+        return 1
+    }
+    if str_eq(cmd, "SENTINEL") or str_eq(cmd, "PUBSUB") or str_eq(cmd, "SHUTDOWN") or str_eq(cmd, "LASTSAVE") or str_eq(cmd, "SAVE") or str_eq(cmd, "BGSAVE") or str_eq(cmd, "BGREWRITEAOF") {
+        return 1
+    }
+    if str_eq(cmd, "ACL") or str_eq(cmd, "MODULE") or str_eq(cmd, "FUNCTION") or str_eq(cmd, "LATENCY") {
+        return 1
+    }
+    if str_eq(cmd, "SCRIPT") or str_eq(cmd, "READONLY") or str_eq(cmd, "READWRITE") or str_eq(cmd, "OBJECT") {
+        return 1
+    }
+    if str_eq(cmd, "MONITOR") {
+        return 1
+    }
+    return 0
+}
+
+fn info_body(port: int, shards: int, connected: int, cmds: int, keys: int, maxclients: int, maxmemory: int, role: string, role_mode: string, cluster_on: int) -> string {
+    let mut rss = process_rss_bytes()
+    if rss < 0 {
+        rss = 0
+    }
+    let b = str_builder()
+    builder_write(b, "# Server\r\n")
+    builder_write(b, "redis_version:")
+    builder_write(b, PROTO_VER)
+    builder_write(b, "\r\nredis_mode:")
+    builder_write(b, role_mode)
+    builder_write(b, "\r\n")
+    builder_write(b, "os:")
+    builder_write(b, os_name())
+    builder_write(b, " ")
+    builder_write(b, syscall_uname_machine())
+    builder_write(b, "\r\narch_bits:64\r\n")
+    builder_write(b, "process_id:")
+    builder_write(b, format_int(syscall_getpid()))
+    builder_write(b, "\r\n")
+    builder_write(b, "tcp_port:")
+    builder_write(b, format_int(port))
+    builder_write(b, "\r\n")
+    builder_write(b, "bonodis_version:")
+    builder_write(b, version())
+    builder_write(b, "\r\n")
+    builder_write(b, "bonodis_shards:")
+    builder_write(b, format_int(shards))
+    builder_write(b, "\r\n")
+    builder_write(b, "executable:bonodis\r\n")
+    builder_write(b, "# Clients\r\nconnected_clients:")
+    builder_write(b, format_int(connected))
+    builder_write(b, "\r\nmaxclients:")
+    builder_write(b, format_int(maxclients))
+    builder_write(b, "\r\n")
+    builder_write(b, "# Memory\r\nused_memory:")
+    builder_write(b, format_int(rss))
+    builder_write(b, "\r\nused_memory_human:")
+    builder_write(b, format_int(rss))
+    builder_write(b, "B\r\nmaxmemory:")
+    builder_write(b, format_int(maxmemory))
+    builder_write(b, "\r\n")
+    builder_write(b, "# Stats\r\ntotal_commands_processed:")
+    builder_write(b, format_int(cmds))
+    builder_write(b, "\r\n")
+    builder_write(b, "# Replication\r\nrole:")
+    builder_write(b, role)
+    builder_write(b, "\r\n")
+    builder_write(b, "# CPU\r\n")
+    builder_write(b, "# Cluster\r\ncluster_enabled:")
+    builder_write(b, format_int(cluster_on))
+    builder_write(b, "\r\n")
+    builder_write(b, "# Keyspace\r\ndb0:keys=")
+    builder_write(b, format_int(keys))
+    builder_write(b, ",expires=0,avg_ttl=0\r\n")
+    return builder_string(b)
+}
+
+fn info_safety(replcfg: CMap, clus: CMap, aof: int) -> string {
+    let b = str_builder()
+    builder_write(b, "# Persistence\r\nloading:0\r\nrdb_bgsave_in_progress:0\r\naof_rewrite_in_progress:0\r\n")
+    builder_write(b, "rdb_last_save_time:")
+    builder_write(b, cmap_get(replcfg, "lastsave"))
+    builder_write(b, "\r\n")
+    builder_write(b, "persistence_fork:0\r\n")
+    builder_write(b, "aof_enabled:")
+    builder_write(b, format_int(aof))
+    builder_write(b, "\r\nappendfsync:")
+    builder_write(b, cmap_get(replcfg, "appendfsync"))
+    builder_write(b, "\r\nmaxmemory_policy:allkeys-lru\r\n")
+    builder_write(b, "default_ttl:")
+    builder_write(b, cmap_get(replcfg, "defttl"))
+    builder_write(b, "\r\n")
+    builder_write(b, "# Replication\r\nmaster_host:")
+    builder_write(b, cmap_get(replcfg, "master_host"))
+    builder_write(b, "\r\nmaster_port:")
+    builder_write(b, cmap_get(replcfg, "master_port"))
+    builder_write(b, "\r\nauto_failover:")
+    builder_write(b, cmap_get(replcfg, "autofail"))
+    builder_write(b, "\r\nfailover_quorum:majority\r\n")
+    builder_write(b, "sentinel_mode:0\r\n")
+    builder_write(b, "# Cluster\r\nha_mode:")
+    if str_eq(cmap_get(clus, "on"), "1") {
+        builder_write(b, "cluster\r\n")
+    } else if str_len(cmap_get(replcfg, "master_host")) > 0 {
+        builder_write(b, "replica\r\n")
+    } else {
+        builder_write(b, "standalone\r\n")
+    }
+    builder_write(b, "tls_enabled:")
+    builder_write(b, format_int(cfg_tls_on(replcfg)))
+    builder_write(b, "\r\ntls_verify:")
+    if str_len(cmap_get(replcfg, "tls_ca")) > 0 {
+        builder_write(b, "1")
+    } else {
+        builder_write(b, "0")
+    }
+    builder_write(b, "\r\nacl_enabled:")
+    builder_write(b, format_int(acl_enabled(replcfg)))
+    builder_write(b, "\r\naccept_threads:")
+    builder_write(b, cmap_get(replcfg, "acc_threads"))
+    builder_write(b, "\r\naccept_rate:")
+    builder_write(b, cmap_get(replcfg, "acc_rate"))
+    builder_write(b, "\r\nunixsocket:")
+    builder_write(b, cmap_get(replcfg, "unixsocket"))
+    builder_write(b, "\r\nlicense:MIT\r\n")
+    return builder_string(b)
+}
+
+fn hello_reply(proto: int, id: int) -> string {
+    let mut items = make([]string, 0, 16)
+    items = append(items, "server")
+    items = append(items, "redis")
+    items = append(items, "version")
+    items = append(items, PROTO_VER)
+    items = append(items, "proto")
+    items = append(items, format_int(proto))
+    items = append(items, "id")
+    items = append(items, format_int(id))
+    items = append(items, "mode")
+    items = append(items, "standalone")
+    items = append(items, "role")
+    items = append(items, "master")
+    // RESP2 array of pairs
+    return r_array_bulks(items)
+}
+
+fn peer_host(p: string) -> string {
+    if str_len(p) == 0 {
+        return ""
+    }
+    if str_byte_at(p, 0) == 91 {
+        let i = str_index(p, "]")
+        if i > 1 {
+            return p[1:i]
+        }
+    }
+    let i = str_last_index(p, ":")
+    if i > 0 {
+        return p[:i]
+    }
+    return p
+}
+
+fn peer_is_local(fd: int) -> int {
+    let h = peer_host(tcp_peer_addr(fd))
+    if str_eq(h, "127.0.0.1") or str_has_prefix(h, "127.") {
+        return 1
+    }
+    if str_eq(h, "::1") or str_eq(h, "0:0:0:0:0:0:0:1") {
+        return 1
+    }
+    if str_eq(h, "::ffff:127.0.0.1") or str_has_prefix(h, "::ffff:127.") {
+        return 1
+    }
+    return 0
+}
+
+fn finish(reply: string, db: int, authed: int, quit: int, db_a: AtomicInt, authed_a: AtomicInt, quit_a: AtomicInt) -> string {
+    atomic_store(db_a, db)
+    atomic_store(authed_a, authed)
+    atomic_store(quit_a, quit)
+    return reply
+}
+
+fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, pass: string, conn_id: int, port: int, connected: AtomicInt, cmds: AtomicInt, wal_ch: chan[string], aof: int, db_a: AtomicInt, authed_a: AtomicInt, quit_a: AtomicInt, feed: CMap, replcfg: CMap, sl: CMap, clus: CMap) -> string {
+    let db = atomic_load(db_a)
+    let authed = atomic_load(authed_a)
+    let cmd = cmd_name(argv)
+    let _ = atomic_add(cmds, 1)
+    if str_eq(cmap_get(replcfg, "needauth"), "1") and authed == 0 {
+        if not str_eq(cmd, "AUTH") and not str_eq(cmd, "HELLO") and not str_eq(cmd, "PING") and not str_eq(cmd, "QUIT") {
+            return finish(r_err("NOAUTH Authentication required."), db, authed, 0, db_a, authed_a, quit_a)
+        }
+    }
+    if authed == 1 and acl_allows(replcfg, cmap_get(feed, "au:" + format_int(conn_id)), cmd) == 0 {
+        return finish(r_err("NOPERM this user has no permissions to run the '" + str_to_lower(cmd) + "' command"), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmap_get(replcfg, "role"), "slave") and is_write_cmd(cmd) == 1 {
+        return finish(r_err("READONLY You can't write against a read only replica."), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if is_hot_key_cmd(cmd) == 1 {
+        return apply_key_cmd(cmd, argv, bus, replies, ids, shards, db, authed, wal_ch, aof, db_a, authed_a, quit_a, feed, replcfg, clus)
+    }
+    if str_eq(cmd, "PING") {
+        if len(argv) == 1 {
+            return finish(r_pong(), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if len(argv) == 2 {
+            return finish(r_bulk(argv[1]), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(r_arity("ping"), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "ECHO") {
+        if len(argv) != 2 {
+            return finish(r_arity("echo"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(r_bulk(argv[1]), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "QUIT") {
+        return finish(r_ok(), db, authed, 1, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "AUTH") {
+        let mut user = "default"
+        let mut pw = ""
+        if len(argv) == 2 {
+            pw = argv[1]
+        } else if len(argv) == 3 {
+            user = argv[1]
+            pw = argv[2]
+        } else {
+            return finish(r_arity("auth"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if acl_check_pass(replcfg, user, pw) == 1 or (str_eq(user, "default") and str_eq(pw, cmap_get(replcfg, "requirepass")) and str_len(cmap_get(replcfg, "requirepass")) > 0) {
+            cmap_set(feed, "au:" + format_int(conn_id), user)
+            log_auth_ok(conn_id)
+            return finish(r_ok(), db, 1, 0, db_a, authed_a, quit_a)
+        }
+        log_auth_fail(conn_id)
+        return finish(r_err("WRONGPASS invalid username-password pair"), db, 0, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "SELECT") {
+        if len(argv) != 2 {
+            return finish(r_arity("select"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        let n, nok = int_ok(argv[1])
+        if nok == 0 or n < 0 or n > 15 {
+            return finish(r_err("ERR DB index is out of range"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(r_ok(), n, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "HELLO") {
+        let mut proto = 2
+        let mut i = 1
+        let mut hello_authed = authed
+        if len(argv) >= 2 {
+            let p0 = str_to_upper(argv[1])
+            if not str_eq(p0, "AUTH") and not str_eq(p0, "SETNAME") {
+                proto = int_of(argv[1])
+                i = 2
+            }
+        }
+        if proto != 2 and proto != 3 {
+            return finish(r_err("NOPROTO unsupported protocol version"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        while i < len(argv) {
+            let o = str_to_upper(argv[i])
+            if str_eq(o, "AUTH") {
+                if i + 2 >= len(argv) {
+                    return finish(r_syntax(), db, authed, 0, db_a, authed_a, quit_a)
+                }
+                let hu = argv[i + 1]
+                let hp = argv[i + 2]
+                if acl_check_pass(replcfg, hu, hp) == 0 and not (str_eq(hu, "default") and str_eq(hp, cmap_get(replcfg, "requirepass")) and str_len(cmap_get(replcfg, "requirepass")) > 0) {
+                    return finish(r_err("WRONGPASS invalid username-password pair"), db, 0, 0, db_a, authed_a, quit_a)
+                }
+                cmap_set(feed, "au:" + format_int(conn_id), hu)
+                hello_authed = 1
+                i = i + 3
+            } else if str_eq(o, "SETNAME") {
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        }
+        if str_eq(cmap_get(replcfg, "needauth"), "1") and hello_authed == 0 {
+            return finish(r_err("NOAUTH Authentication required."), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(hello_reply(proto, conn_id), db, hello_authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "COMMAND") {
+        let names = command_names()
+        if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "COUNT") {
+            return finish(r_int(len(names)), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "LIST") {
+            return finish(r_array_bulks(names), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(r_array_bulks(names), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "TIME") {
+        let ms = wall_ms()
+        let secs = ms / 1000
+        let us = (ms % 1000) * 1000
+        let mut items = make([]string, 0, 16)
+        items = append(items, format_int(secs))
+        items = append(items, format_int(us))
+        return finish(r_array_bulks(items), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "CLIENT") {
+        let mut sub = ""
+        if len(argv) >= 2 {
+            sub = str_to_upper(argv[1])
+        }
+        if str_eq(sub, "ID") {
+            return finish(r_int(conn_id), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if str_eq(sub, "SETNAME") {
+            if len(argv) != 3 {
+                return finish(r_arity("client"), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            cmap_set(feed, "cn:" + format_int(conn_id), argv[2])
+            return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if str_eq(sub, "GETNAME") {
+            let nm = cmap_get(feed, "cn:" + format_int(conn_id))
+            if str_len(nm) == 0 {
+                return finish(r_nil(), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            return finish(r_bulk(nm), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if str_eq(sub, "LIST") {
+            let ids = str_split(cmap_get(feed, "cliids"), ",")
+            let mut lines = make([]string, 0, len(ids))
+            let mut i = 0
+            while i < len(ids) {
+                if str_len(ids[i]) > 0 {
+                    let rec = cmap_get(feed, "cli:" + ids[i])
+                    if str_len(rec) > 0 {
+                        lines = append(lines, rec)
+                    }
+                }
+                i = i + 1
+            }
+            return finish(r_array_bulks(lines), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if str_eq(sub, "KILL") {
+            if len(argv) < 3 {
+                return finish(r_arity("client"), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            let mut target = argv[2]
+            if str_eq(str_to_upper(argv[2]), "ID") and len(argv) >= 4 {
+                target = argv[3]
+            }
+            cmap_set(feed, "kill:" + target, "1")
+            return finish(r_int(1), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if str_eq(sub, "INFO") {
+            let mut rec = cmap_get(feed, "cli:" + format_int(conn_id))
+            if str_len(rec) == 0 {
+                rec = "id=" + format_int(conn_id)
+            }
+            return finish(r_bulk(rec), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "CONFIG") {
+        if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "GET") {
+            let mut items = make([]string, 0, 16)
+            items = append(items, "port")
+            items = append(items, format_int(port))
+            items = append(items, "databases")
+            items = append(items, "16")
+            items = append(items, "appendonly")
+            if aof == 1 {
+                items = append(items, "yes")
+            } else {
+                items = append(items, "no")
+            }
+            items = append(items, "appendfsync")
+            items = append(items, cmap_get(replcfg, "appendfsync"))
+            items = append(items, "maxmemory")
+            items = append(items, cmap_get(replcfg, "maxmemory"))
+            items = append(items, "maxmemory-policy")
+            items = append(items, "allkeys-lru")
+            items = append(items, "maxclients")
+            items = append(items, cmap_get(replcfg, "maxclients"))
+            items = append(items, "default-ttl")
+            items = append(items, cmap_get(replcfg, "defttl"))
+            items = append(items, "auto-failover")
+            items = append(items, cmap_get(replcfg, "autofail"))
+            items = append(items, "tls-cert-file")
+            items = append(items, cmap_get(replcfg, "tls_cert"))
+            items = append(items, "tls-ca-cert-file")
+            items = append(items, cmap_get(replcfg, "tls_ca"))
+            items = append(items, "aclfile")
+            items = append(items, cmap_get(replcfg, "aclfile"))
+            items = append(items, "timeout")
+            items = append(items, cmap_get(replcfg, "timeout"))
+            items = append(items, "tcp-keepalive")
+            items = append(items, cmap_get(replcfg, "tcp_keepalive"))
+            items = append(items, "notify-keyspace-events")
+            items = append(items, cmap_get(replcfg, "notify"))
+            items = append(items, "accept-threads")
+            items = append(items, cmap_get(replcfg, "acc_threads"))
+            items = append(items, "accept-rate")
+            items = append(items, cmap_get(replcfg, "acc_rate"))
+            items = append(items, "unixsocket")
+            items = append(items, cmap_get(replcfg, "unixsocket"))
+            items = append(items, "unixsocketperm")
+            items = append(items, cmap_get(replcfg, "unixperm"))
+            return finish(r_array_bulks(items), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "REWRITE") {
+            let dir = snapshot_dir(replcfg)
+            let _ = mkdir_all(dir)
+            let b = str_builder()
+            builder_write(b, "port ")
+            builder_write(b, format_int(port))
+            builder_write(b, "\nmaxmemory ")
+            builder_write(b, cmap_get(replcfg, "maxmemory"))
+            builder_write(b, "\nappendfsync ")
+            builder_write(b, cmap_get(replcfg, "appendfsync"))
+            builder_write(b, "\ntimeout ")
+            builder_write(b, cmap_get(replcfg, "timeout"))
+            builder_write(b, "\n")
+            let rc = atomic_write_file(dir + "/bonodis.conf", builder_string(b))
+            if rc != 0 {
+                return finish(r_err("ERR CONFIG REWRITE failed"), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if len(argv) >= 4 and str_eq(str_to_upper(argv[1]), "SET") {
+            let k = str_to_lower(argv[2])
+            let v = argv[3]
+            if str_eq(k, "maxmemory") {
+                cmap_set(replcfg, "maxmemory", v)
+            } else if str_eq(k, "requirepass") {
+                cmap_set(replcfg, "requirepass", v)
+                cmap_set(replcfg, acl_user_key("default", "pass"), v)
+                if str_len(v) > 0 {
+                    cmap_set(replcfg, "needauth", "1")
+                    cmap_set(replcfg, acl_user_key("default", "nopass"), "0")
+                } else {
+                    cmap_set(replcfg, "needauth", "0")
+                    cmap_set(replcfg, acl_user_key("default", "nopass"), "1")
+                }
+            } else if str_eq(k, "slowlog-log-slower-than") {
+                cmap_set(replcfg, "slowlog_us", v)
+            } else if str_eq(k, "default-ttl") {
+                cmap_set(replcfg, "defttl", v)
+            } else if str_eq(k, "auto-failover") {
+                cmap_set(replcfg, "autofail", format_int(yn(v, 0)))
+            } else if str_eq(k, "timeout") {
+                cmap_set(replcfg, "timeout", v)
+            } else if str_eq(k, "tcp-keepalive") {
+                cmap_set(replcfg, "tcp_keepalive", v)
+            } else if str_eq(k, "notify-keyspace-events") {
+                cmap_set(replcfg, "notify", v)
+            } else if str_eq(k, "maxclients") {
+                cmap_set(replcfg, "maxclients", v)
+            } else {
+                return finish(r_err("ERR Unsupported CONFIG parameter: " + k), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(r_err("ERR unknown CONFIG subcommand"), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "ACL") {
+        return finish(acl_cmd(argv, replcfg, feed, conn_id), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "MODULE") {
+        return finish(r_err("ERR modules are not supported"), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "FUNCTION") {
+        return finish(r_err("ERR Redis functions are not supported"), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") {
+        let mut ev = argv
+        if str_eq(cmd, "EVALSHA") {
+            if len(argv) < 3 {
+                return finish(r_arity("evalsha"), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            let src = cmap_get(replcfg, "lua:" + argv[1])
+            if str_len(src) == 0 {
+                return finish(r_err("NOSCRIPT No matching script. Please use EVAL."), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            ev = make([]string, 0, len(argv))
+            ev = append(ev, "EVAL")
+            ev = append(ev, src)
+            let mut ei = 2
+            while ei < len(argv) {
+                ev = append(ev, argv[ei])
+                ei = ei + 1
+            }
+        }
+        return apply_key_cmd("EVAL", ev, bus, replies, ids, shards, db, authed, wal_ch, aof, db_a, authed_a, quit_a, feed, replcfg, clus)
+    }
+    if str_eq(cmd, "LATENCY") {
+        let none: []string = []
+        return finish(r_array_bulks(none), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "CLUSTER") {
+        return finish(cluster_cmd(argv, clus, replcfg), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "SENTINEL") {
+        return finish(sentinel_cmd(argv, replcfg, clus), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "PUBSUB") {
+        return finish(pubsub_cmd(argv, feed), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "MONITOR") {
+        let sid = format_int(conn_id)
+        cmap_set(feed, "mon:" + sid, "1")
+        cmap_set(feed, "monids", csv_add(cmap_get(feed, "monids"), sid))
+        return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "LASTSAVE") {
+        return finish(r_int(int_of(cmap_get(replcfg, "lastsave"))), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "SAVE") or str_eq(cmd, "BGSAVE") {
+        return finish(do_save(bus, replies, ids, shards, replcfg), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "BGREWRITEAOF") {
+        return finish(do_bgrewriteaof(bus, replies, ids, shards, wal_ch, aof, replcfg), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "READONLY") or str_eq(cmd, "READWRITE") {
+        return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "SCRIPT") {
+        if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "FLUSH") {
+            let shas = str_split(cmap_get(replcfg, "lua.list"), ",")
+            let mut si = 0
+            while si < len(shas) {
+                if str_len(shas[si]) > 0 {
+                    cmap_set(replcfg, "lua:" + shas[si], "")
+                }
+                si = si + 1
+            }
+            cmap_set(replcfg, "lua.list", "")
+            return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "KILL") {
+            return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if len(argv) >= 3 and str_eq(str_to_upper(argv[1]), "LOAD") {
+            let src = argv[2]
+            let sha = sha1(src)
+            cmap_set(replcfg, "lua:" + sha, src)
+            cmap_set(replcfg, "lua.list", csv_add(cmap_get(replcfg, "lua.list"), sha))
+            return finish(r_bulk(sha), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "EXISTS") {
+            let b = str_builder()
+            builder_write(b, "*")
+            builder_write(b, format_int(len(argv) - 2))
+            builder_write(b, "\r\n")
+            let mut i = 2
+            while i < len(argv) {
+                if str_len(cmap_get(replcfg, "lua:" + argv[i])) > 0 {
+                    builder_write(b, r_int(1))
+                } else {
+                    builder_write(b, r_int(0))
+                }
+                i = i + 1
+            }
+            return finish(builder_string(b), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(r_arity("script"), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "OBJECT") {
+        if len(argv) >= 3 and str_eq(str_to_upper(argv[1]), "ENCODING") {
+            let tr = dispatch(bus, replies, ids, shards, db, ["TYPE", argv[2]])
+            if str_contains(tr, "none") {
+                return finish(r_nil(), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            return finish(r_bulk("raw"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if len(argv) >= 3 and str_eq(str_to_upper(argv[1]), "IDLETIME") {
+            let tr = dispatch(bus, replies, ids, shards, db, ["EXISTS", argv[2]])
+            if parse_int_reply(tr) == 0 {
+                return finish(r_nil(), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            return finish(r_int(0), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "CLUSTERX") {
+        return finish(clusterx_cmd(argv, clus), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "ROLE") {
+        let role = cmap_get(replcfg, "role")
+        if str_eq(role, "slave") {
+            let h = cmap_get(replcfg, "master_host")
+            let p = cmap_get(replcfg, "master_port")
+            let b = str_builder()
+            builder_write(b, "*5\r\n")
+            builder_write(b, r_bulk("slave"))
+            builder_write(b, r_bulk(h))
+            builder_write(b, r_int(int_of(p)))
+            builder_write(b, r_bulk("connected"))
+            builder_write(b, r_int(0))
+            return finish(builder_string(b), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish("*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n", db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "REPLICAOF") or str_eq(cmd, "SLAVEOF") {
+        if len(argv) != 3 {
+            return finish(r_arity("replicaof"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if str_eq(str_to_upper(argv[1]), "NO") {
+            cmap_set(replcfg, "master_host", "")
+            cmap_set(replcfg, "master_port", "0")
+            cmap_set(replcfg, "role", "master")
+            log_replicaof("NO", "ONE")
+            if str_eq(cmap_get(clus, "on"), "1") {
+                cluster_put(clus, cmap_get(clus, "id"), cmap_get(clus, "ip"), cmap_get(clus, "port"), "master", "-", cmap_get(clus, "slots"), cmap_get(clus, "epoch"))
+                cluster_save(clus)
+            }
+            return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        cmap_set(replcfg, "master_host", argv[1])
+        cmap_set(replcfg, "master_port", argv[2])
+        cmap_set(replcfg, "role", "slave")
+        log_replicaof(argv[1], argv[2])
+        if str_eq(cmap_get(clus, "on"), "1") {
+            cluster_put(clus, cmap_get(clus, "id"), cmap_get(clus, "ip"), cmap_get(clus, "port"), "slave", "-", "", cmap_get(clus, "epoch"))
+            cluster_save(clus)
+        }
+        return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "REPLCONF") {
+        return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "WAIT") {
+        return finish(r_int(0), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "METRICS") {
+        let mut rss = process_rss_bytes()
+        if rss < 0 {
+            rss = 0
+        }
+        let mut role = cmap_get(replcfg, "role")
+        if str_eq(role, "") {
+            role = "master"
+        }
+        let body = metrics_text(atomic_load(connected), atomic_load(cmds), shards, int_of(cmap_get(replcfg, "maxclients")), int_of(cmap_get(replcfg, "maxmemory")), int_of(cmap_get(sl, "n")), rss, role)
+        return finish(r_bulk(body), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "INFO") {
+        let keys_r = dispatch(bus, replies, ids, shards, db, ["DBSIZE"])
+        let nkeys = parse_int_reply(keys_r)
+        let mut role = cmap_get(replcfg, "role")
+        if str_eq(role, "") {
+            role = "master"
+        }
+        let mut mode = "standalone"
+        let mut cluster_on = 0
+        if str_eq(cmap_get(clus, "on"), "1") {
+            mode = "cluster"
+            cluster_on = 1
+        }
+        let mut body = info_body(port, shards, atomic_load(connected), atomic_load(cmds), nkeys, int_of(cmap_get(replcfg, "maxclients")), int_of(cmap_get(replcfg, "maxmemory")), role, mode, cluster_on)
+        body = body + info_safety(replcfg, clus, aof)
+        return finish(r_bulk(body), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "PUBLISH") {
+        if len(argv) != 3 {
+            return finish(r_arity("publish"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        return finish(r_int(pubsub_publish(feed, argv[1], argv[2])), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "SUBSCRIBE") {
+        if len(argv) < 2 {
+            return finish(r_arity("subscribe"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        let id = format_int(conn_id)
+        let mut b = ""
+        let mut i = 1
+        while i < len(argv) {
+            let n = pubsub_sub(feed, id, argv[i])
+            b = b + sub_reply("subscribe", argv[i], n)
+            i = i + 1
+        }
+        return finish(b, db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "PSUBSCRIBE") {
+        if len(argv) < 2 {
+            return finish(r_arity("psubscribe"), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        let id = format_int(conn_id)
+        let mut b = ""
+        let mut i = 1
+        while i < len(argv) {
+            let n = pubsub_psub(feed, id, argv[i])
+            b = b + sub_reply("psubscribe", argv[i], n)
+            i = i + 1
+        }
+        return finish(b, db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "UNSUBSCRIBE") or str_eq(cmd, "PUNSUBSCRIBE") {
+        let id = format_int(conn_id)
+        if len(argv) < 2 {
+            // unsubscribe from all channels
+            let ck = "ps:c:" + id
+            let chans = str_split(cmap_get(feed, ck), ",")
+            let mut b = ""
+            let mut ci = 0
+            while ci < len(chans) {
+                if str_len(chans[ci]) > 0 {
+                    let n = pubsub_unsub(feed, id, chans[ci])
+                    b = b + sub_reply("unsubscribe", chans[ci], n)
+                }
+                ci = ci + 1
+            }
+            if str_len(b) == 0 {
+                b = sub_reply("unsubscribe", "", 0)
+            }
+            return finish(b, db, authed, 0, db_a, authed_a, quit_a)
+        }
+        let mut b = ""
+        let mut i = 1
+        while i < len(argv) {
+            let n = pubsub_unsub(feed, id, argv[i])
+            b = b + sub_reply("unsubscribe", argv[i], n)
+            i = i + 1
+        }
+        return finish(b, db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "WATCH") or str_eq(cmd, "UNWATCH") {
+        return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+    }
+    return apply_key_cmd(cmd, argv, bus, replies, ids, shards, db, authed, wal_ch, aof, db_a, authed_a, quit_a, feed, replcfg, clus)
+}
+
+fn apply_key_cmd(cmd: string, argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, authed: int, wal_ch: chan[string], aof: int, db_a: AtomicInt, authed_a: AtomicInt, quit_a: AtomicInt, feed: CMap, replcfg: CMap, clus: CMap) -> string {
+    let redir = cluster_redirect(clus, argv)
+    if str_len(redir) > 0 {
+        return finish(redir, db, authed, 0, db_a, authed_a, quit_a)
+    }
+    let reply = dispatch(bus, replies, ids, shards, db, argv)
+    if aof == 1 and is_write_cmd(cmd) == 1 and not str_has_prefix(reply, "-") {
+        let _ = wal_ch.send(format_int(db) + "\n" + encode_array(argv))
+    }
+    if is_write_cmd(cmd) == 1 and not str_has_prefix(reply, "-") and len(argv) >= 2 {
+        let ev = cmap_get(replcfg, "notify")
+        if str_len(ev) > 0 {
+            let kn = str_to_lower(cmd)
+            if str_contains(ev, "K") or str_contains(ev, "A") {
+                let _ = pubsub_publish(feed, "__keyspace@" + format_int(db) + "__:" + argv[1], kn)
+            }
+            if str_contains(ev, "E") or str_contains(ev, "A") {
+                let _ = pubsub_publish(feed, "__keyevent@" + format_int(db) + "__:" + kn, argv[1])
+            }
+        }
+    }
+    repl_publish(feed, db, argv, reply)
+    return finish(reply, db, authed, 0, db_a, authed_a, quit_a)
+}
+
+fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string], replies: CMap, ids: AtomicInt, shards: int, pass: string, port: int, protected: int, connected: AtomicInt, cmds: AtomicInt, wal_ch: chan[string], aof: int, sl: CMap, slowlog_us: int, feed: CMap, replcfg: CMap, stop: AtomicInt, clus: CMap, peer0: string) -> int {
+    let bus = pack_bus(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15)
+    let _ = tcp_nodelay(fd)
+    let _ = tcp_set_recv_buf(fd, SOCK_BUF)
+    let _ = tcp_set_send_buf(fd, SOCK_BUF)
+    let mut peer = peer0
+    if str_len(peer) == 0 {
+        peer = tcp_peer_addr(fd)
+    }
+    let mut cert = cmap_get(replcfg, "tls_cert")
+    let mut key = cmap_get(replcfg, "tls_key")
+    if str_has_prefix(peer, "unix:") {
+        cert = ""
+        key = ""
+    }
+    let hs, tc0 = conn_handshake(fd, cert, key)
+    if hs < 0 {
+        let _ = tcp_close(fd)
+        return 0
+    }
+    let tls_on = hs
+    let tc = tc0
+    let mut local = peer_is_local(fd)
+    if str_has_prefix(peer, "unix:") {
+        local = 1
+    }
+    if protected == 1 and str_len(pass) == 0 and local == 0 {
+        log_denied(peer)
+        let _ = conn_write(fd, tls_on, tc, r_err("DENIED Bonodis is running in protected mode because protected mode is enabled, no bind address was specified, and no authentication is configured. This is to prevent connections from other hosts."))
+        conn_close(fd, tls_on, tc)
+        return 0
+    }
+    let _ = atomic_add(connected, 1)
+    let conn_id = atomic_add(ids, 1)
+    log_conn(peer, conn_id)
+    let sid0 = format_int(conn_id)
+    cmap_set(feed, "cli:" + sid0, "id=" + sid0 + " addr=" + peer + " fd=" + format_int(fd))
+    cmap_set(feed, "cliids", csv_add(cmap_get(feed, "cliids"), sid0))
+    let ka = int_of(cmap_get(replcfg, "tcp_keepalive"))
+    if ka > 0 {
+        let _ = tcp_keepalive(fd, ka, ka, 5)
+    }
+    let idle = int_of(cmap_get(replcfg, "timeout"))
+    if idle > 0 {
+        let _ = tcp_set_timeout(fd, idle * 1000)
+    }
+    let mut buf = ""
+    let db_a = atomic_new(0)
+    let authed_a = atomic_new(0)
+    let quit_a = atomic_new(0)
+    if not str_eq(cmap_get(replcfg, "needauth"), "1") {
+        atomic_store(authed_a, 1)
+        cmap_set(feed, "au:" + format_int(conn_id), "default")
+    }
+    let mut multi = 0
+    let mut queued = make([]string, 0, 8)
+    let wat = cmap_new()
+    cmap_set(wat, "keys", "")
+    let mut running = 1
+    let verbose = int_of(cmap_get(replcfg, "logcmd"))
+    let hot = log_hot()
+    let sid = format_int(conn_id)
+    let mut subbed = 0
+    let mut monitoring = 0
+    while running == 1 {
+        if str_eq(cmap_get(feed, "kill:" + sid), "1") {
+            running = 0
+            break
+        }
+        if subbed == 1 {
+            pubsub_drain(fd, feed, sid, tls_on, tc)
+        }
+        if monitoring == 1 {
+            monitor_drain(fd, feed, sid, tls_on, tc)
+        }
+        let chunk = conn_read(fd, tls_on, tc)
+        if str_len(chunk) == 0 {
+            if (subbed == 1 or monitoring == 1) and shutdown_requested() == 0 and atomic_load(stop) == 0 {
+                continue
+            }
+            break
+        }
+        buf = buf + chunk
+        let mut cap = MAX_QUERY_BUF
+        if str_eq(cmap_get(replcfg, "needauth"), "1") and atomic_load(authed_a) == 0 {
+            cap = MAX_UNAUTH_BUF
+        }
+        if str_len(buf) > cap {
+            log_query_too_big(peer, str_len(buf), cap)
+            let _ = conn_write(fd, tls_on, tc, "-ERR Protocol error: too big query\r\n")
+            running = 0
+            break
+        }
+        while running == 1 {
+            let argv, used, st = parse_cmd(buf)
+            if st == 0 {
+                break
+            }
+            if st < 0 {
+                log_proto(peer, "parse")
+                let _ = conn_write(fd, tls_on, tc, r_err("ERR protocol error"))
+                running = 0
+                break
+            }
+            buf = buf[used:]
+            let cmd = cmd_name(argv)
+            if subbed == 1 {
+                if not str_eq(cmd, "SUBSCRIBE") and not str_eq(cmd, "UNSUBSCRIBE") and not str_eq(cmd, "PSUBSCRIBE") and not str_eq(cmd, "PUNSUBSCRIBE") and not str_eq(cmd, "PING") and not str_eq(cmd, "QUIT") and not str_eq(cmd, "PUBLISH") {
+                    let _ = conn_write(fd, tls_on, tc, r_err("ERR Can't execute '" + str_to_lower(cmd) + "': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context"))
+                    continue
+                }
+            }
+            if str_eq(cmd, "SUBSCRIBE") or str_eq(cmd, "PSUBSCRIBE") {
+                subbed = 1
+                let _ = tcp_set_timeout(fd, 100)
+            }
+            if str_eq(cmd, "MONITOR") {
+                monitoring = 1
+                let _ = tcp_set_timeout(fd, 100)
+            }
+            if monitoring == 0 and not str_eq(cmd, "AUTH") {
+                if str_len(cmap_get(feed, "monids")) > 0 {
+                    monitor_fanout(feed, atomic_load(db_a), conn_id, argv)
+                }
+            }
+            if verbose == 1 or hot == 1 {
+                log_cmd(cmd, conn_id, len(argv), verbose)
+            }
+            if str_eq(cmap_get(replcfg, "needauth"), "1") and atomic_load(authed_a) == 0 {
+                if not str_eq(cmd, "AUTH") and not str_eq(cmd, "HELLO") and not str_eq(cmd, "PING") and not str_eq(cmd, "QUIT") {
+                    log_noauth(cmd, conn_id)
+                    let _ = conn_write(fd, tls_on, tc, r_err("NOAUTH Authentication required."))
+                    continue
+                }
+            }
+            if str_eq(cmd, "SHUTDOWN") {
+                let mut nosave = 0
+                if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "NOSAVE") {
+                    nosave = 1
+                }
+                if nosave == 0 {
+                    let _ = do_save(bus, replies, ids, shards, replcfg)
+                    if aof == 1 {
+                        let _ = wal_ch.send("FSYNC")
+                    }
+                }
+                atomic_store(stop, 1)
+                let _ = conn_write(fd, tls_on, tc, r_ok())
+                running = 0
+                continue
+            }
+            if str_eq(cmd, "MULTI") {
+                if multi == 1 {
+                    let _ = conn_write(fd, tls_on, tc, r_err("ERR MULTI calls can not be nested"))
+                    continue
+                }
+                multi = 1
+                queued = make([]string, 0, 0)
+                let _ = conn_write(fd, tls_on, tc, r_ok())
+                continue
+            }
+            if str_eq(cmd, "DISCARD") {
+                if multi == 0 {
+                    let _ = conn_write(fd, tls_on, tc, r_err("ERR DISCARD without MULTI"))
+                    continue
+                }
+                multi = 0
+                queued = make([]string, 0, 0)
+                cmap_set(wat, "keys", "")
+                let _ = conn_write(fd, tls_on, tc, r_ok())
+                continue
+            }
+            if str_eq(cmd, "WATCH") {
+                if multi == 1 {
+                    let _ = conn_write(fd, tls_on, tc, r_err("ERR WATCH inside MULTI is not allowed"))
+                    continue
+                }
+                if len(argv) < 2 {
+                    let _ = conn_write(fd, tls_on, tc, r_arity("watch"))
+                    continue
+                }
+                let dbw = atomic_load(db_a)
+                let mut wi = 1
+                while wi < len(argv) {
+                    let vr = dispatch(bus, replies, ids, shards, dbw, ["__KVER", argv[wi]])
+                    cmap_set(wat, "v:" + argv[wi], format_int(parse_int_reply(vr)))
+                    cmap_set(wat, "keys", csv_add(cmap_get(wat, "keys"), argv[wi]))
+                    wi = wi + 1
+                }
+                let _ = conn_write(fd, tls_on, tc, r_ok())
+                continue
+            }
+            if str_eq(cmd, "UNWATCH") {
+                cmap_set(wat, "keys", "")
+                let _ = conn_write(fd, tls_on, tc, r_ok())
+                continue
+            }
+            if str_eq(cmd, "EXEC") {
+                if multi == 0 {
+                    let _ = conn_write(fd, tls_on, tc, r_err("ERR EXEC without MULTI"))
+                    continue
+                }
+                let dbw = atomic_load(db_a)
+                let wkeys = str_split(cmap_get(wat, "keys"), ",")
+                let mut dirty = 0
+                let mut wi = 0
+                while wi < len(wkeys) {
+                    if str_len(wkeys[wi]) > 0 {
+                        let vr = dispatch(bus, replies, ids, shards, dbw, ["__KVER", wkeys[wi]])
+                        if parse_int_reply(vr) != int_of(cmap_get(wat, "v:" + wkeys[wi])) {
+                            dirty = 1
+                        }
+                    }
+                    wi = wi + 1
+                }
+                cmap_set(wat, "keys", "")
+                if dirty == 1 {
+                    multi = 0
+                    queued = make([]string, 0, 0)
+                    let _ = conn_write(fd, tls_on, tc, r_null_arr())
+                    continue
+                }
+                multi = 0
+                let mut replies_a = make([]string, 0, len(queued))
+                let mut i = 0
+                while i < len(queued) {
+                    let qargv, _, qs = parse_cmd(queued[i])
+                    if qs == 1 {
+                        let r = handle_one(qargv, bus, replies, ids, shards, pass, conn_id, port, connected, cmds, wal_ch, aof, db_a, authed_a, quit_a, feed, replcfg, sl, clus)
+                        replies_a = append(replies_a, r)
+                        if atomic_load(quit_a) == 1 {
+                            running = 0
+                        }
+                    }
+                    i = i + 1
+                }
+                queued = make([]string, 0, 0)
+                log_multi(conn_id, len(replies_a))
+                let b = str_builder()
+                builder_write(b, "*")
+                builder_write(b, format_int(len(replies_a)))
+                builder_write(b, "\r\n")
+                i = 0
+                while i < len(replies_a) {
+                    builder_write(b, replies_a[i])
+                    i = i + 1
+                }
+                let _ = conn_write(fd, tls_on, tc, builder_string(b))
+                continue
+            }
+            if multi == 1 {
+                if len(queued) >= 10000 {
+                    let _ = conn_write(fd, tls_on, tc, r_err("ERR MULTI queue limit reached"))
+                    continue
+                }
+                queued = append(queued, encode_array(argv))
+                let _ = conn_write(fd, tls_on, tc, r_queued())
+                continue
+            }
+            if str_eq(cmd, "SYNC") or str_eq(cmd, "PSYNC") {
+                log_master_psync(peer)
+                let rid = cmap_get(replcfg, "replid")
+                let _ = conn_write(fd, tls_on, tc, "+FULLRESYNC " + rid + " 0\r\n")
+                let _ = psync_dump(fd, bus, replies, ids, shards, tls_on, tc)
+                log_master_psync_done()
+                let _ = replica_serve(fd, feed, stop, tls_on, tc)
+                running = 0
+                break
+            }
+            if str_eq(cmd, "SLOWLOG") {
+                if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "LEN") {
+                    let _ = conn_write(fd, tls_on, tc, r_int(int_of(cmap_get(sl, "n"))))
+                } else if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "RESET") {
+                    cmap_set(sl, "n", "0")
+                    let _ = conn_write(fd, tls_on, tc, r_ok())
+                } else {
+                    let mut c = 10
+                    if len(argv) >= 3 {
+                        c = int_of(argv[2])
+                    }
+                    let _ = conn_write(fd, tls_on, tc, slowlog_get(sl, c))
+                }
+                continue
+            }
+            let t0 = mono_ns()
+            let r = handle_one(argv, bus, replies, ids, shards, pass, conn_id, port, connected, cmds, wal_ch, aof, db_a, authed_a, quit_a, feed, replcfg, sl, clus)
+            if subbed == 1 and (str_eq(cmd, "UNSUBSCRIBE") or str_eq(cmd, "PUNSUBSCRIBE")) {
+                if pubsub_count_subs(feed, sid) == 0 {
+                    subbed = 0
+                    if idle > 0 {
+                        let _ = tcp_set_timeout(fd, idle * 1000)
+                    } else {
+                        let _ = tcp_set_timeout(fd, 0)
+                    }
+                }
+            }
+            let us = elapsed_ns(t0) / 1000
+            let sl_us = int_of(cmap_get(replcfg, "slowlog_us"))
+            if sl_us >= 0 and us >= sl_us {
+                slowlog_add(sl, us, argv)
+                log_slow(cmd, conn_id, us)
+            }
+            if verbose == 1 or hot == 1 or str_has_prefix(r, "-") {
+                log_cmd_result(cmd, conn_id, us, r, verbose)
+            }
+            let _ = conn_write(fd, tls_on, tc, r)
+            if atomic_load(quit_a) == 1 {
+                running = 0
+            }
+        }
+    }
+    log_conn_close(peer, conn_id)
+    cmap_set(feed, "cliids", csv_del(cmap_get(feed, "cliids"), format_int(conn_id)))
+    cmap_set(feed, "cli:" + format_int(conn_id), "")
+    cmap_set(feed, "monids", csv_del(cmap_get(feed, "monids"), format_int(conn_id)))
+    cmap_set(feed, "mon:" + format_int(conn_id), "")
+    cmap_set(feed, "monm:" + format_int(conn_id), "")
+    let _ = atomic_add(connected, 0 - 1)
+    conn_close(fd, tls_on, tc)
+    return 0
+}
+
+fn accept_or_idle(lfd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string], replies: CMap, ids: AtomicInt, shards: int, pass: string, port: int, protected: int, connected: AtomicInt, cmds: AtomicInt, wal_ch: chan[string], aof: int, stop: AtomicInt, maxclients: int, sl: CMap, slowlog_us: int, feed: CMap, replcfg: CMap, clus: CMap) -> int {
+    if lfd < 0 {
+        return 0
+    }
+    return accept_loop(lfd, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards, pass, port, protected, connected, cmds, wal_ch, aof, stop, maxclients, sl, slowlog_us, feed, replcfg, clus)
+}
+
+fn accept_loop(lfd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string], replies: CMap, ids: AtomicInt, shards: int, pass: string, port: int, protected: int, connected: AtomicInt, cmds: AtomicInt, wal_ch: chan[string], aof: int, stop: AtomicInt, maxclients: int, sl: CMap, slowlog_us: int, feed: CMap, replcfg: CMap, clus: CMap) -> int {
+    let _ = tcp_set_timeout(lfd, 200)
+    let mut rate = int_of(cmap_get(replcfg, "acc_rate"))
+    if rate < 1 {
+        rate = ACCEPT_RATE_MAX
+    }
+    let mut acc_win = wall_ms()
+    let mut acc_n = 0
+    crew conns {
+        while shutdown_requested() == 0 and atomic_load(stop) == 0 {
+            let fd = tcp_accept(lfd)
+            if fd < 0 {
+                continue
+            }
+            let now = wall_ms()
+            if now - acc_win >= 1000 {
+                acc_win = now
+                acc_n = 0
+            }
+            acc_n = acc_n + 1
+            if acc_n > rate {
+                log_maxclients(tcp_peer_addr(fd), acc_n)
+                let _ = tcp_write_all(fd, "-ERR connection rate exceeded\r\n")
+                let _ = tcp_close(fd)
+                continue
+            }
+            let mut cap = int_of(cmap_get(replcfg, "maxclients"))
+            if cap < 1 {
+                cap = maxclients
+            }
+            if cap > 0 and atomic_load(connected) >= cap {
+                log_maxclients(tcp_peer_addr(fd), atomic_load(connected))
+                let _ = tcp_write_all(fd, "-ERR max number of clients reached\r\n")
+                let _ = tcp_close(fd)
+                continue
+            }
+            detach handle_conn(fd, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards, pass, port, protected, connected, cmds, wal_ch, aof, sl, slowlog_us, feed, replcfg, stop, clus, "")
+        }
+    }
+    return 0
+}
+
+fn unix_accept_loop(lfd: int, sock: string, s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string], replies: CMap, ids: AtomicInt, shards: int, pass: string, port: int, protected: int, connected: AtomicInt, cmds: AtomicInt, wal_ch: chan[string], aof: int, stop: AtomicInt, maxclients: int, sl: CMap, slowlog_us: int, feed: CMap, replcfg: CMap, clus: CMap) -> int {
+    if lfd < 0 {
+        return 0
+    }
+    let _ = tcp_set_timeout(lfd, 200)
+    let mut rate = int_of(cmap_get(replcfg, "acc_rate"))
+    if rate < 1 {
+        rate = ACCEPT_RATE_MAX
+    }
+    let mut acc_win = wall_ms()
+    let mut acc_n = 0
+    let peer = "unix:" + sock
+    crew uconns {
+        while shutdown_requested() == 0 and atomic_load(stop) == 0 {
+            let fd = unix_accept(lfd)
+            if fd < 0 {
+                continue
+            }
+            let now = wall_ms()
+            if now - acc_win >= 1000 {
+                acc_win = now
+                acc_n = 0
+            }
+            acc_n = acc_n + 1
+            if acc_n > rate {
+                let _ = tcp_write_all(fd, "-ERR connection rate exceeded\r\n")
+                let _ = unix_close(fd)
+                continue
+            }
+            let mut cap = int_of(cmap_get(replcfg, "maxclients"))
+            if cap < 1 {
+                cap = maxclients
+            }
+            if cap > 0 and atomic_load(connected) >= cap {
+                let _ = tcp_write_all(fd, "-ERR max number of clients reached\r\n")
+                let _ = unix_close(fd)
+                continue
+            }
+            detach handle_conn(fd, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards, pass, port, protected, connected, cmds, wal_ch, aof, sl, slowlog_us, feed, replcfg, stop, clus, peer)
+        }
+    }
+    return 0
+}
+
+fn replay_aof(path: string, s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string], replies: CMap, ids: AtomicInt, shards: int) {
+    let bus = pack_bus(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15)
+    let recs = wal_load(path)
+    log_wal(path, len(recs))
+    let mut i = 0
+    while i < len(recs) {
+        let rec = recs[i]
+        let mut db = 0
+        let mut body = rec
+        if str_len(rec) > 0 and str_byte_at(rec, 0) != 42 {
+            let nl = str_index(rec, "\n")
+            if nl > 0 {
+                db = int_of(rec[:nl])
+                body = rec[nl + 1:]
+            }
+        }
+        let argv, _, st = parse_cmd(body)
+        if st == 1 {
+            let _ = dispatch(bus, replies, ids, shards, db, argv)
+        }
+        i = i + 1
+    }
+}
+
+// Lines: cluster, announce, dir, replica_host, replica_port [, logcmd, defttl_sec, fsync_ms, autofail]
+fn pack_opts(cluster_on: int, announce_ip: string, dir: string, replica_host: string, replica_port: string) -> string {
+    return format_int(cluster_on) + "\n" + announce_ip + "\n" + dir + "\n" + replica_host + "\n" + replica_port
+}
+
+fn opt_line(cfg: string, idx: int) -> string {
+    let lines = str_split(cfg, "\n")
+    if idx < 0 or idx >= len(lines) {
+        return ""
+    }
+    return lines[idx]
+}
+
+fn serve(host: string, port: int, shards0: int, pass: string, aof_path: string, aof: int, protected: int, stop: AtomicInt, maxclients: int, maxmemory: int, slowlog_us: int, metrics_port: int, cluster_cfg: string) -> int {
+    if os_supported() == 0 {
+        slog_error("linux and macOS only (this is " + os_name() + ")")
+        slog_flush()
+        return 1
+    }
+    let mut shards = shards0
+    if shards < 1 {
+        shards = 1
+    }
+    if shards > 16 {
+        shards = 16
+    }
+    let mut per_mem = 0
+    if maxmemory > 0 {
+        per_mem = maxmemory / shards
+        if per_mem < 1 {
+            per_mem = maxmemory
+        }
+    }
+    let sl = cmap_new()
+    cmap_set(sl, "n", "0")
+    cmap_set(sl, "id", "0")
+    let feed = cmap_new()
+    cmap_set(feed, "off", "0")
+    cmap_set(feed, "nrepl", "0")
+    let replcfg = cmap_new()
+    cmap_set(replcfg, "role", "master")
+    cmap_set(replcfg, "master_host", "")
+    cmap_set(replcfg, "master_port", "0")
+    cmap_set(replcfg, "replid", "0000000000000000000000000000000000000001")
+    cmap_set(replcfg, "host", host)
+    cmap_set(replcfg, "port", format_int(port))
+    cmap_set(replcfg, "maxclients", format_int(maxclients))
+    cmap_set(replcfg, "maxmemory", format_int(maxmemory))
+    cmap_set(replcfg, "appendfsync", "everysec")
+    cmap_set(replcfg, "autofail", "0")
+    cmap_set(replcfg, "defttl", "0")
+    cmap_set(replcfg, "lastsave", format_int(wall_ms() / 1000))
+    let mut datadir = opt_line(cluster_cfg, 2)
+    if str_len(datadir) == 0 {
+        datadir = "."
+    }
+    cmap_set(replcfg, "dir", datadir)
+    cmap_set(replcfg, "tls_cert", opt_line(cluster_cfg, 9))
+    cmap_set(replcfg, "tls_key", opt_line(cluster_cfg, 10))
+    cmap_set(replcfg, "tls_ca", opt_line(cluster_cfg, 18))
+    cmap_set(replcfg, "slowlog_us", format_int(slowlog_us))
+    cmap_set(replcfg, "timeout", opt_line(cluster_cfg, 12))
+    cmap_set(replcfg, "tcp_keepalive", opt_line(cluster_cfg, 13))
+    cmap_set(replcfg, "notify", "")
+    let clus = cmap_new()
+    cmap_set(clus, "on", "0")
+    if str_eq(opt_line(cluster_cfg, 0), "1") {
+        cluster_init(clus, host, port, opt_line(cluster_cfg, 1), opt_line(cluster_cfg, 2))
+    }
+    let logcmd = int_of(opt_line(cluster_cfg, 5))
+    cmap_set(replcfg, "logcmd", format_int(logcmd))
+    let mut defttl_sec = int_of(opt_line(cluster_cfg, 6))
+    if defttl_sec < 0 {
+        defttl_sec = 0
+    }
+    let defttl = defttl_sec * 1000
+    cmap_set(replcfg, "defttl", format_int(defttl_sec))
+    let mut fsync_ms = 1000
+    let fsync_line = opt_line(cluster_cfg, 7)
+    if str_len(fsync_line) > 0 {
+        fsync_ms = int_of(fsync_line)
+    }
+    cmap_set(replcfg, "appendfsync", fsync_policy_name(fsync_ms))
+    let mut autofail = 0
+    if str_eq(cmap_get(clus, "on"), "1") {
+        autofail = 1
+    }
+    let af_line = opt_line(cluster_cfg, 8)
+    if str_len(af_line) > 0 {
+        autofail = int_of(af_line)
+    }
+    cmap_set(replcfg, "autofail", format_int(autofail))
+    acl_init(replcfg, pass, opt_line(cluster_cfg, 11))
+    if str_len(pass) > 0 {
+        cmap_set(replcfg, "needauth", "1")
+    } else {
+        cmap_set(replcfg, "needauth", "0")
+    }
+    if cfg_tls_on(replcfg) == 1 {
+        cmap_set(clus, "tls", "1")
+    }
+    cmap_set(clus, "tls_ca", cmap_get(replcfg, "tls_ca"))
+    cmap_set(clus, "tls_cert", cmap_get(replcfg, "tls_cert"))
+    if str_len(opt_line(cluster_cfg, 3)) > 0 {
+        cmap_set(replcfg, "master_host", opt_line(cluster_cfg, 3))
+        cmap_set(replcfg, "master_port", opt_line(cluster_cfg, 4))
+        cmap_set(replcfg, "role", "slave")
+        log_replicaof(opt_line(cluster_cfg, 3), opt_line(cluster_cfg, 4))
+        if str_eq(cmap_get(clus, "on"), "1") {
+            cluster_put(clus, cmap_get(clus, "id"), cmap_get(clus, "ip"), cmap_get(clus, "port"), "slave", "-", "", cmap_get(clus, "epoch"))
+        }
+    }
+    let _ = touch_store_methods()
+    let replies = cmap_new()
+    let ids = atomic_new(1)
+    let connected = atomic_new(0)
+    let cmds = atomic_new(0)
+    let s0 = make(chan[string], SHARD_CHAN)
+    let s1 = make(chan[string], SHARD_CHAN)
+    let s2 = make(chan[string], SHARD_CHAN)
+    let s3 = make(chan[string], SHARD_CHAN)
+    let s4 = make(chan[string], SHARD_CHAN)
+    let s5 = make(chan[string], SHARD_CHAN)
+    let s6 = make(chan[string], SHARD_CHAN)
+    let s7 = make(chan[string], SHARD_CHAN)
+    let s8 = make(chan[string], SHARD_CHAN)
+    let s9 = make(chan[string], SHARD_CHAN)
+    let s10 = make(chan[string], SHARD_CHAN)
+    let s11 = make(chan[string], SHARD_CHAN)
+    let s12 = make(chan[string], SHARD_CHAN)
+    let s13 = make(chan[string], SHARD_CHAN)
+    let s14 = make(chan[string], SHARD_CHAN)
+    let s15 = make(chan[string], SHARD_CHAN)
+    let wal_ch = make(chan[string], WAL_CHAN)
+    let mut acc_n = int_of(opt_line(cluster_cfg, 14))
+    if acc_n < 1 {
+        acc_n = 1
+    }
+    if acc_n > 4 {
+        acc_n = 4
+    }
+    let mut acc_rate = int_of(opt_line(cluster_cfg, 15))
+    if acc_rate < 1 {
+        acc_rate = ACCEPT_RATE_MAX
+    }
+    cmap_set(replcfg, "acc_threads", format_int(acc_n))
+    cmap_set(replcfg, "acc_rate", format_int(acc_rate))
+    let usock = opt_line(cluster_cfg, 16)
+    cmap_set(replcfg, "unixsocket", usock)
+    let mut uperm = int_of(opt_line(cluster_cfg, 17))
+    if uperm < 1 {
+        uperm = DEFAULT_UNIX_PERM
+    }
+    cmap_set(replcfg, "unixperm", format_int(uperm))
+    let mut ufd = 0 - 1
+    if str_len(usock) > 0 {
+        let _ = unix_unlink(usock)
+        ufd = unix_listen(usock)
+        if ufd < 0 {
+            log_unix(usock, 0)
+            return 1
+        }
+        log_unix(usock, 1)
+    }
+    let mut lfd = 0 - 1
+    if port > 0 {
+        lfd = tcp_listen_backlog(host, port, LISTEN_BACKLOG)
+        if lfd < 0 {
+            lfd = tcp_listen_addr(host, port)
+        }
+        if lfd < 0 {
+            if ufd >= 0 {
+                let _ = unix_close(ufd)
+                let _ = unix_unlink(usock)
+            }
+            log_listen_fail(host, port)
+            return 1
+        }
+        let _ = tcp_set_recv_buf(lfd, SOCK_BUF)
+        let _ = tcp_set_send_buf(lfd, SOCK_BUF)
+    } else if ufd < 0 {
+        log_listen_fail(host, port)
+        return 1
+    }
+    let mut lfd1 = 0 - 1
+    let mut lfd2 = 0 - 1
+    let mut lfd3 = 0 - 1
+    if port > 0 and acc_n > 1 {
+        lfd1 = tcp_listen_backlog(host, port, LISTEN_BACKLOG)
+    }
+    if port > 0 and acc_n > 2 {
+        lfd2 = tcp_listen_backlog(host, port, LISTEN_BACKLOG)
+    }
+    if port > 0 and acc_n > 3 {
+        lfd3 = tcp_listen_backlog(host, port, LISTEN_BACKLOG)
+    }
+    let mut mfd = -1
+    if metrics_port > 0 {
+        mfd = tcp_listen_addr("127.0.0.1", metrics_port)
+        if mfd < 0 {
+            log_metrics_listen(metrics_port, 0)
+        } else {
+            log_metrics_listen(metrics_port, 1)
+        }
+    }
+    let _ = signal_ignore("PIPE")
+    signal_on_term()
+    slog_with2("info", "start", "version", version(), "proto", PROTO_VER)
+    let mut has_pass = 0
+    if str_len(pass) > 0 {
+        has_pass = 1
+    }
+    log_ready(host, port, shards, aof, protected, has_pass)
+    log_limits(maxclients, maxmemory, slowlog_us, metrics_port, logcmd)
+    log_acceptors(acc_n, acc_rate, LISTEN_BACKLOG)
+    log_safety(defttl_sec, cmap_get(replcfg, "appendfsync"), autofail)
+    log_prod_warns(maxmemory, aof)
+    crew t {
+        let w0 = t.kick(shard_loop(s0, replies, per_mem, defttl))
+        let w1 = t.kick(shard_loop(s1, replies, per_mem, defttl))
+        let w2 = t.kick(shard_loop(s2, replies, per_mem, defttl))
+        let w3 = t.kick(shard_loop(s3, replies, per_mem, defttl))
+        let w4 = t.kick(shard_loop(s4, replies, per_mem, defttl))
+        let w5 = t.kick(shard_loop(s5, replies, per_mem, defttl))
+        let w6 = t.kick(shard_loop(s6, replies, per_mem, defttl))
+        let w7 = t.kick(shard_loop(s7, replies, per_mem, defttl))
+        let w8 = t.kick(shard_loop(s8, replies, per_mem, defttl))
+        let w9 = t.kick(shard_loop(s9, replies, per_mem, defttl))
+        let w10 = t.kick(shard_loop(s10, replies, per_mem, defttl))
+        let w11 = t.kick(shard_loop(s11, replies, per_mem, defttl))
+        let w12 = t.kick(shard_loop(s12, replies, per_mem, defttl))
+        let w13 = t.kick(shard_loop(s13, replies, per_mem, defttl))
+        let w14 = t.kick(shard_loop(s14, replies, per_mem, defttl))
+        let w15 = t.kick(shard_loop(s15, replies, per_mem, defttl))
+        if aof == 1 {
+            replay_aof(aof_path, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards)
+        }
+        let pers = t.kick(persist_loop(wal_ch, aof_path, fsync_ms, aof))
+        let rpl = t.kick(replica_worker(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards, replcfg, stop, clus))
+        let gos = t.kick(gossip_loop(clus, stop))
+        let met = t.kick(metrics_loop(mfd, connected, cmds, shards, maxclients, maxmemory, sl, replcfg, stop, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids))
+        let acc = t.kick(accept_or_idle(lfd, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards, pass, port, protected, connected, cmds, wal_ch, aof, stop, maxclients, sl, slowlog_us, feed, replcfg, clus))
+        let acc1 = t.kick(accept_or_idle(lfd1, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards, pass, port, protected, connected, cmds, wal_ch, aof, stop, maxclients, sl, slowlog_us, feed, replcfg, clus))
+        let acc2 = t.kick(accept_or_idle(lfd2, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards, pass, port, protected, connected, cmds, wal_ch, aof, stop, maxclients, sl, slowlog_us, feed, replcfg, clus))
+        let acc3 = t.kick(accept_or_idle(lfd3, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards, pass, port, protected, connected, cmds, wal_ch, aof, stop, maxclients, sl, slowlog_us, feed, replcfg, clus))
+        let uacc = t.kick(unix_accept_loop(ufd, usock, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, replies, ids, shards, pass, port, protected, connected, cmds, wal_ch, aof, stop, maxclients, sl, slowlog_us, feed, replcfg, clus))
+        while shutdown_requested() == 0 and atomic_load(stop) == 0 {
+            sleep_ms(50)
+        }
+        log_shutdown()
+        if lfd >= 0 {
+            let _ = tcp_close(lfd)
+        }
+        if lfd1 >= 0 {
+            let _ = tcp_close(lfd1)
+        }
+        if lfd2 >= 0 {
+            let _ = tcp_close(lfd2)
+        }
+        if lfd3 >= 0 {
+            let _ = tcp_close(lfd3)
+        }
+        if ufd >= 0 {
+            let _ = unix_close(ufd)
+            let _ = unix_unlink(usock)
+        }
+        if mfd >= 0 {
+            let _ = tcp_close(mfd)
+        }
+        let _ = s0.send("STOP")
+        let _ = s1.send("STOP")
+        let _ = s2.send("STOP")
+        let _ = s3.send("STOP")
+        let _ = s4.send("STOP")
+        let _ = s5.send("STOP")
+        let _ = s6.send("STOP")
+        let _ = s7.send("STOP")
+        let _ = s8.send("STOP")
+        let _ = s9.send("STOP")
+        let _ = s10.send("STOP")
+        let _ = s11.send("STOP")
+        let _ = s12.send("STOP")
+        let _ = s13.send("STOP")
+        let _ = s14.send("STOP")
+        let _ = s15.send("STOP")
+        let _ = wal_ch.send("STOP")
+        let _ = w0.join()
+        let _ = w1.join()
+        let _ = w2.join()
+        let _ = w3.join()
+        let _ = w4.join()
+        let _ = w5.join()
+        let _ = w6.join()
+        let _ = w7.join()
+        let _ = w8.join()
+        let _ = w9.join()
+        let _ = w10.join()
+        let _ = w11.join()
+        let _ = w12.join()
+        let _ = w13.join()
+        let _ = w14.join()
+        let _ = w15.join()
+        let _ = pers.join()
+        let _ = rpl.join()
+        let _ = gos.join()
+        let _ = met.join()
+        let _ = acc.join()
+        let _ = acc1.join()
+        let _ = acc2.join()
+        let _ = acc3.join()
+        let _ = uacc.join()
+    }
+    detached_join_all()
+    return 0
+}

@@ -1,0 +1,468 @@
+fn TestStringGetSet() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["SET", "k", "v"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["GET", "k"]), "$1\r\nv\r\n")
+    assert_eq_str(st.apply(0, ["GET", "missing"]), "$-1\r\n")
+}
+
+fn TestIncr() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["INCR", "n"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["INCRBY", "n", "4"]), ":5\r\n")
+    assert_eq_str(st.apply(0, ["DECR", "n"]), ":4\r\n")
+}
+
+fn TestSetNxXx() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["SET", "k", "1", "NX"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["SET", "k", "2", "NX"]), "$-1\r\n")
+    assert_eq_str(st.apply(0, ["GET", "k"]), "$1\r\n1\r\n")
+    assert_eq_str(st.apply(0, ["SET", "k", "3", "XX"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["GET", "k"]), "$1\r\n3\r\n")
+}
+
+fn TestDelExistsType() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "a", "1"])
+    let _ = st.apply(0, ["SET", "b", "2"])
+    assert_eq_str(st.apply(0, ["EXISTS", "a", "b", "c"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["TYPE", "a"]), "+string\r\n")
+    assert_eq_str(st.apply(0, ["DEL", "a", "b"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["EXISTS", "a"]), ":0\r\n")
+}
+
+fn TestExpireTtl() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k", "v"])
+    assert_eq_str(st.apply(0, ["TTL", "k"]), ":-1\r\n")
+    assert_eq_str(st.apply(0, ["EXPIRE", "k", "60"]), ":1\r\n")
+    let t = st.apply(0, ["TTL", "k"])
+    assert(str_has_prefix(t, ":"))
+    assert_eq_str(st.apply(0, ["PERSIST", "k"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["TTL", "k"]), ":-1\r\n")
+}
+
+fn TestHash() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["HSET", "h", "f", "1", "g", "2"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["HGET", "h", "f"]), "$1\r\n1\r\n")
+    assert_eq_str(st.apply(0, ["HEXISTS", "h", "g"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["HLEN", "h"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["HINCRBY", "h", "f", "3"]), ":4\r\n")
+    assert_eq_str(st.apply(0, ["HDEL", "h", "g"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["HLEN", "h"]), ":1\r\n")
+}
+
+fn TestList() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["LPUSH", "l", "a", "b"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["RPUSH", "l", "c"]), ":3\r\n")
+    assert_eq_str(st.apply(0, ["LLEN", "l"]), ":3\r\n")
+    let r = st.apply(0, ["LRANGE", "l", "0", "-1"])
+    assert(str_has_prefix(r, "*3\r\n"))
+    assert_eq_str(st.apply(0, ["LPOP", "l"]), "$1\r\nb\r\n")
+}
+
+fn TestSet() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["SADD", "s", "a", "b", "a"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["SCARD", "s"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["SISMEMBER", "s", "a"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["SREM", "s", "a"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["SCARD", "s"]), ":1\r\n")
+}
+
+fn TestZset() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["ZADD", "z", "2", "b", "1", "a"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["ZCARD", "z"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["ZSCORE", "z", "a"]), "$1\r\n1\r\n")
+    let r = st.apply(0, ["ZRANGE", "z", "0", "-1"])
+    assert(str_contains(r, "a"))
+    assert(str_contains(r, "b"))
+    assert_eq_str(st.apply(0, ["ZRANK", "z", "a"]), ":0\r\n")
+}
+
+fn TestWrongType() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["HSET", "h", "f", "1"])
+    assert(str_has_prefix(st.apply(0, ["GET", "h"]), "-WRONGTYPE"))
+}
+
+fn TestKeysDbsizeFlush() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "a", "1"])
+    let _ = st.apply(0, ["SET", "b", "2"])
+    assert_eq_str(st.apply(0, ["DBSIZE"]), ":2\r\n")
+    let ks = st.apply(0, ["KEYS", "*"])
+    assert(str_has_prefix(ks, "*2\r\n"))
+    assert_eq_str(st.apply(0, ["FLUSHDB"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["DBSIZE"]), ":0\r\n")
+}
+
+fn TestSelectNamespace() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k", "a"])
+    let _ = st.apply(1, ["SET", "k", "b"])
+    assert_eq_str(st.apply(0, ["GET", "k"]), "$1\r\na\r\n")
+    assert_eq_str(st.apply(1, ["GET", "k"]), "$1\r\nb\r\n")
+}
+
+fn TestJobEncode() {
+    let job = encode_job("9", 0, ["SET", "k", "v"])
+    let id, db, argv, ok = parse_job(job)
+    assert_eq(ok, 1)
+    assert_eq_str(id, "9")
+    assert_eq(db, 0)
+    assert_eq_str(argv[2], "v")
+}
+
+fn TestKeepTtl() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k", "v", "EX", "60"])
+    let t1 = st.apply(0, ["TTL", "k"])
+    assert(str_has_prefix(t1, ":"))
+    let _ = st.apply(0, ["SET", "k", "w", "KEEPTTL"])
+    let t2 = st.apply(0, ["TTL", "k"])
+    assert(not str_eq(t2, ":-1\r\n"))
+    assert_eq_str(st.apply(0, ["GET", "k"]), "$1\r\nw\r\n")
+}
+
+fn TestSetbitGetbit() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["SETBIT", "b", "0", "1"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["GETBIT", "b", "0"]), ":1\r\n")
+    let bc = st.apply(0, ["BITCOUNT", "b"])
+    assert_eq_str(bc, ":1\r\n")
+}
+
+fn TestGeoAddDist() {
+    let mut st = new_store()
+    let r = st.apply(0, ["GEOADD", "g", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"])
+    assert_eq_str(r, ":2\r\n")
+    let d = st.apply(0, ["GEODIST", "g", "Palermo", "Catania", "km"])
+    assert(str_has_prefix(d, "$"))
+}
+
+fn TestXaddXlen() {
+    let mut st = new_store()
+    let id = st.apply(0, ["XADD", "s", "*", "f", "v"])
+    assert(str_has_prefix(id, "$"))
+    assert_eq_str(st.apply(0, ["XLEN", "s"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["TYPE", "s"]), "+stream\r\n")
+}
+
+fn TestMgetMset() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["MSET", "a", "1", "b", "2"]), "+OK\r\n")
+    let r = st.apply(0, ["MGET", "a", "missing", "b"])
+    assert(str_contains(r, "1"))
+    assert(str_contains(r, "2"))
+    assert(str_contains(r, "$-1"))
+}
+
+fn TestZaddNanRejected() {
+    let mut st = new_store()
+    let r = st.apply(0, ["ZADD", "z", "nan", "m"])
+    assert(str_has_prefix(r, "-ERR"))
+    assert_eq_str(st.apply(0, ["ZCARD", "z"]), ":0\r\n")
+}
+
+fn TestMaxmemoryEvict() {
+    let mut st = new_store()
+    st.maxmem = 20
+    let _ = st.apply(0, ["SET", "a", "xxxxxxxxxxxxxxxxxxxx"])
+    let _ = st.apply(0, ["SET", "b", "yyyyyyyyyyyyyyyyyyyy"])
+    let n = st.cmd_dbsize(0)
+    assert(n <= 2)
+    assert(st.used <= st.maxmem + 40)
+}
+
+fn TestExportReplay() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k", "v"])
+    let dump = st.apply(0, ["EXPORT"])
+    assert(str_has_prefix(dump, "$"))
+    assert(str_contains(dump, "SET"))
+}
+
+fn TestVecAddSim() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["VADD", "emb", "a", "1", "0"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["VADD", "emb", "b", "0", "1"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["VCARD", "emb"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["VDIM", "emb"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["TYPE", "emb"]), "+vector\r\n")
+    let r = st.apply(0, ["VSIM", "emb", "COUNT", "1", "1", "0"])
+    assert(str_contains(r, "a"))
+}
+
+fn TestBrainRememberRecall() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["BRAIN", "REMEMBER", "u", "m1", "user likes coffee"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["BRAIN", "REMEMBER", "u", "m2", "user lives in paris"]), "+OK\r\n")
+    let r = st.apply(0, ["BRAIN", "RECALL", "u", "COUNT", "2", "QUERY", "coffee"])
+    assert(str_contains(r, "m1"))
+    assert(str_contains(r, "coffee"))
+}
+
+fn TestBrainSayContextPack() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["BRAIN", "REMEMBER", "u", "m1", "name is ada"])
+    assert(str_has_prefix(st.apply(0, ["BRAIN", "SAY", "chat", "user", "hello"]), ":"))
+    assert(str_has_prefix(st.apply(0, ["BRAIN", "SAY", "chat", "assistant", "hi ada"]), ":"))
+    let ctx = st.apply(0, ["BRAIN", "CONTEXT", "chat", "COUNT", "10"])
+    assert(str_contains(ctx, "hello"))
+    let pack = st.apply(0, ["BRAIN", "PACK", "chat", "u", "QUERY", "name"])
+    assert(str_has_prefix(pack, "$"))
+    assert(str_contains(pack, "memories"))
+    assert(str_contains(pack, "conversation"))
+}
+
+fn TestBrainCache() {
+    let mut st = new_store()
+    assert(str_has_prefix(st.apply(0, ["BRAIN", "CACHE", "SET", "h1", "pong"]), ":"))
+    assert_eq_str(st.apply(0, ["BRAIN", "CACHE", "GET", "h1"]), "$4\r\npong\r\n")
+}
+
+fn TestDefaultTtl() {
+    let mut st = new_store()
+    st.defttl = 60000
+    let _ = st.apply(0, ["SET", "k", "v"])
+    let t = st.apply(0, ["TTL", "k"])
+    assert(str_has_prefix(t, ":"))
+    assert(not str_eq(t, ":-1\r\n"))
+    assert(not str_eq(t, ":-2\r\n"))
+    let _ = st.apply(0, ["SET", "k2", "v", "EX", "10"])
+    let t2 = st.apply(0, ["TTL", "k2"])
+    assert(str_has_prefix(t2, ":"))
+    assert(not str_eq(t2, ":-1\r\n"))
+    let _ = st.apply(0, ["INCR", "n"])
+    let tn = st.apply(0, ["TTL", "n"])
+    assert(not str_eq(tn, ":-1\r\n"))
+}
+
+fn TestKeysHardLimit() {
+    let mut st = new_store()
+    let mut i = 0
+    while i < KEYS_HARD_LIMIT + 1 {
+        let _ = st.apply(0, ["SET", "k" + format_int(i), "1"])
+        i = i + 1
+    }
+    let r = st.apply(0, ["KEYS", "*"])
+    assert(str_has_prefix(r, "-ERR KEYS"))
+    let lim = st.collect_keys_lim(0, "*", 8)
+    assert(len(lim) > 8)
+}
+
+fn TestHotkeys() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "hot", "1"])
+    let _ = st.apply(0, ["GET", "hot"])
+    let r = st.apply(0, ["HOTKEYS", "5"])
+    assert(str_has_prefix(r, "*"))
+    assert(str_contains(r, "hot"))
+}
+
+fn TestDumpRestore() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k", "hello"])
+    let d = st.apply(0, ["DUMP", "k"])
+    assert(str_has_prefix(d, "$"))
+    let _ = st.apply(0, ["DEL", "k"])
+    assert_eq_str(st.apply(0, ["GET", "k"]), "$-1\r\n")
+    let payload = bulk_payload(d)
+    assert_eq_str(st.apply(0, ["RESTORE", "k", "0", payload]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["GET", "k"]), "$5\r\nhello\r\n")
+}
+
+fn TestExpiretimeHsetnxLpos() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "e", "1", "EX", "60"])
+    let et = st.apply(0, ["EXPIRETIME", "e"])
+    assert(str_has_prefix(et, ":"))
+    assert(not str_eq(et, ":-1\r\n"))
+    assert_eq_str(st.apply(0, ["HSETNX", "h", "f", "v"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["HSETNX", "h", "f", "x"]), ":0\r\n")
+    let _ = st.apply(0, ["RPUSH", "L", "a", "b", "c"])
+    assert_eq_str(st.apply(0, ["LPOS", "L", "b"]), ":1\r\n")
+}
+
+fn TestSintercardBitfield() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["SADD", "sa", "x"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["SCARD", "sa"]), ":1\r\n")
+    let set = st.apply(0, ["BITFIELD", "bf", "SET", "u8", "0", "5"])
+    assert(str_contains(set, ":0"))
+    let get = st.apply(0, ["BITFIELD", "bf", "GET", "u8", "0"])
+    assert(str_contains(get, ":5"))
+    let inc = st.apply(0, ["BITFIELD", "bf", "INCRBY", "u8", "0", "1"])
+    assert(str_contains(inc, ":6"))
+}
+
+fn TestXgroupHgetdelLmpopExpireNx() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["XADD", "s", "1-0", "f", "v1"])
+    assert_eq_str(st.apply(0, ["XGROUP", "CREATE", "s", "g", "0-0"]), "+OK\r\n")
+    let busy = st.apply(0, ["XGROUP", "CREATE", "s", "g", "0-0"])
+    assert(str_contains(busy, "BUSYGROUP"))
+    let xr = st.apply(0, ["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"])
+    assert(str_contains(xr, "v1"))
+    let xp = st.apply(0, ["XPENDING", "s", "g"])
+    assert(str_has_prefix(xp, "*"))
+    assert(str_contains(xp, ":1"))
+    let xi = st.apply(0, ["XINFO", "STREAM", "s"])
+    assert(str_contains(xi, "length"))
+    let xg = st.apply(0, ["XINFO", "GROUPS", "s"])
+    assert(str_contains(xg, "g"))
+    let _ = st.apply(0, ["HSET", "h", "f", "v"])
+    assert_eq_str(st.apply(0, ["HGETDEL", "h", "f"]), "$1\r\nv\r\n")
+    assert_eq_str(st.apply(0, ["HGET", "h", "f"]), "$-1\r\n")
+    let _ = st.apply(0, ["RPUSH", "l", "a", "b"])
+    let lp = st.apply(0, ["LMPOP", "1", "l", "LEFT", "COUNT", "1"])
+    assert(str_contains(lp, "a"))
+    let _ = st.apply(0, ["ZADD", "z", "1", "m"])
+    let zp = st.apply(0, ["ZMPOP", "1", "z", "MIN"])
+    assert(str_contains(zp, "m"))
+    let _ = st.apply(0, ["SET", "k", "v"])
+    assert_eq_str(st.apply(0, ["EXPIRE", "k", "60", "NX"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["EXPIRE", "k", "30", "NX"]), ":0\r\n")
+    let _ = st.apply(0, ["HSET", "hf", "a", "1", "b", "2"])
+    let hf = st.apply(0, ["HRANDFIELD", "hf", "2"])
+    assert(str_has_prefix(hf, "*"))
+    assert_eq_str(st.apply(0, ["XGROUP", "DESTROY", "s", "g"]), ":1\r\n")
+    let _ = st.apply(0, ["GEOADD", "geo", "13.361389", "38.115556", "Palermo"])
+    let gs = st.apply(0, ["GEOSEARCHSTORE", "gout", "geo", "FROMLONLAT", "13.361389", "38.115556", "BYRADIUS", "100", "km"])
+    assert(str_has_prefix(gs, ":"))
+}
+
+fn TestGraphFactsLeaseWhy() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["RELATE", "{g}a", "{g}b", "knows"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["RELATE", "{g}b", "{g}c", "knows"]), "+OK\r\n")
+    let nb = st.apply(0, ["NEIGHBORS", "{g}a"])
+    assert(str_contains(nb, "b"))
+    assert(str_contains(nb, "knows"))
+    let p = st.apply(0, ["PATH", "{g}a", "{g}c"])
+    assert(str_contains(p, "{g}a"))
+    assert(str_contains(p, "{g}c"))
+    assert_eq_str(st.apply(0, ["FACT", "ADD", "{g}a", "likes", "tea"]), "+OK\r\n")
+    let fo = st.apply(0, ["FACT", "OF", "{g}a"])
+    assert(str_contains(fo, "likes"))
+    assert(str_contains(fo, "tea"))
+    let who = st.apply(0, ["FACT", "WHO", "likes", "tea"])
+    assert(str_contains(who, "{g}a"))
+    let _ = st.apply(0, ["SET", "{g}a", "1"])
+    let w = st.apply(0, ["WHY", "{g}a"])
+    assert(str_contains(w, "string"))
+    assert(str_contains(w, "SET"))
+    let tok = st.apply(0, ["LEASE", "{g}lock", "30"])
+    assert(str_has_prefix(tok, "$"))
+    assert_eq_str(st.apply(0, ["LEASE", "{g}lock", "30"]), "$-1\r\n")
+    let payload = bulk_payload(tok)
+    assert_eq_str(st.apply(0, ["LEASED", "{g}lock"]), tok)
+    assert_eq_str(st.apply(0, ["UNLEASE", "{g}lock", payload]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["LEASED", "{g}lock"]), "$-1\r\n")
+    let pack = st.apply(0, ["BRAIN", "PACK", "{g}a", "{g}mem"])
+    assert(str_contains(pack, "related"))
+    assert(str_contains(pack, "likes"))
+}
+
+fn TestXclaimPel() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["XADD", "s", "1-0", "f", "a"])
+    let _ = st.apply(0, ["XADD", "s", "1-1", "f", "b"])
+    assert_eq_str(st.apply(0, ["XGROUP", "CREATE", "s", "g", "0-0"]), "+OK\r\n")
+    let r1 = st.apply(0, ["XREADGROUP", "GROUP", "g", "c1", "COUNT", "1", "STREAMS", "s", ">"])
+    assert(str_contains(r1, "a"))
+    let pend = st.apply(0, ["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", "0-0"])
+    assert(str_contains(pend, "a"))
+    let cl = st.apply(0, ["XCLAIM", "s", "g", "c2", "0", "1-0"])
+    assert(str_contains(cl, "a"))
+    let xp = st.apply(0, ["XPENDING", "s", "g", "-", "+", "10"])
+    assert(str_contains(xp, "c2"))
+    assert_eq_str(st.apply(0, ["XACK", "s", "g", "1-0"]), ":1\r\n")
+    let r2 = st.apply(0, ["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"])
+    assert(str_contains(r2, "b"))
+    let ac = st.apply(0, ["XAUTOCLAIM", "s", "g", "c2", "0", "0-0"])
+    assert(str_has_prefix(ac, "*"))
+    let xi = st.apply(0, ["XINFO", "CONSUMERS", "s", "g"])
+    assert(str_has_prefix(xi, "*"))
+}
+
+fn TestMemoryUsageTypes() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k", "hello"])
+    let su = st.apply(0, ["MEMORY", "USAGE", "k"])
+    assert(str_has_prefix(su, ":"))
+    assert(not str_eq(su, ":0\r\n"))
+    let _ = st.apply(0, ["HSET", "h", "f", "v", "g", "w"])
+    let hu = st.apply(0, ["MEMORY", "USAGE", "h"])
+    assert(str_has_prefix(hu, ":"))
+    let _ = st.apply(0, ["SADD", "s", "a", "b", "c"])
+    let se = st.apply(0, ["MEMORY", "USAGE", "s"])
+    assert(str_has_prefix(se, ":"))
+    let tot = st.apply(0, ["MEMORY"])
+    assert(str_has_prefix(tot, ":"))
+    assert(not str_eq(tot, ":0\r\n"))
+}
+
+fn TestPackUnpackRewrite() {
+    let mut recs = make([]string, 0, 2)
+    recs = append(recs, "0\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+    recs = append(recs, "1\n*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nb\r\n")
+    let packed = pack_rewrite(recs)
+    assert(str_has_prefix(packed, "REWRITE\n"))
+    let got = unpack_rewrite(packed)
+    assert_eq(len(got), 2)
+    assert_eq_str(got[0], recs[0])
+    assert_eq_str(got[1], recs[1])
+    let none = unpack_rewrite("not-a-rewrite")
+    assert_eq(len(none), 0)
+}
+
+fn TestFsyncPolicyName() {
+    assert_eq_str(fsync_policy_name(0), "always")
+    assert_eq_str(fsync_policy_name(1000), "everysec")
+    assert_eq_str(fsync_policy_name(0 - 1), "no")
+    assert_eq(fsync_ms_of("always"), 0)
+    assert_eq(fsync_ms_of("everysec"), 1000)
+    assert_eq(fsync_ms_of("no"), 0 - 1)
+}
+
+fn TestStoreApplyThroughput() {
+    let mut st = new_store()
+    let t0 = wall_ms()
+    let mut i = 0
+    while i < 8000 {
+        let _ = st.apply(0, ["SET", "k", "v"])
+        let g = st.apply(0, ["GET", "k"])
+        assert_eq_str(g, "$1\r\nv\r\n")
+        i = i + 1
+    }
+    let dt = wall_ms() - t0
+    assert(dt < 2000)
+}
+
+fn TestReactUnit() {
+    let mut st = new_store()
+    // Create a reaction: when "src" is written, SET "dst" to $VALUE
+    let cr = st.dispatch_cmd(0, ["REACT", "CREATE", "cp", "src", "ON", "WRITE", "SET", "dst", "$VALUE"])
+    assert_eq_str(cr, "+OK\r\n")
+    // Verify decode
+    let tokens = react_decode_cmds(st.xp[react_rule_key("cp")])
+    assert(len(tokens) == 3)
+    assert_eq_str(tokens[0], "SET")
+    assert_eq_str(tokens[1], "dst")
+    assert_eq_str(tokens[2], "$VALUE")
+    // Collect reactions
+    let cmds = st.react_collect(0, "src", "test")
+    assert(len(cmds) > 0)
+    // Execute
+    let rargv = react_decode_argv(cmds[0])
+    assert_eq_str(rargv[0], "SET")
+    assert_eq_str(rargv[1], "dst")
+    assert_eq_str(rargv[2], "test")
+    let _ = st.dispatch_cmd(0, rargv)
+    assert_eq_str(st.dispatch_cmd(0, ["GET", "dst"]), "$4\r\ntest\r\n")
+}

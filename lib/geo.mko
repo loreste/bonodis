@@ -1,0 +1,225 @@
+pack bonodis
+
+fn deg2rad(d: float) -> float {
+    return d * 3.141592653589793 / 180.0
+}
+
+fn haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float {
+    let r = 6371000.0
+    let p1 = deg2rad(lat1)
+    let p2 = deg2rad(lat2)
+    let dp = deg2rad(lat2 - lat1)
+    let dl = deg2rad(lon2 - lon1)
+    let a = math_sin(dp / 2.0) * math_sin(dp / 2.0) + math_cos(p1) * math_cos(p2) * math_sin(dl / 2.0) * math_sin(dl / 2.0)
+    let c = 2.0 * math_atan2(math_sqrt(a), math_sqrt(1.0 - a))
+    return r * c
+}
+
+fn geo_pack(lon: float, lat: float) -> string {
+    return format_float(lon, 8) + "," + format_float(lat, 8)
+}
+
+fn geo_lon(s: string) -> float {
+    let i = str_index(s, ",")
+    if i <= 0 {
+        return parse_float(s)
+    }
+    return parse_float(s[:i])
+}
+
+fn geo_lat(s: string) -> float {
+    let i = str_index(s, ",")
+    if i < 0 {
+        return 0.0
+    }
+    return parse_float(s[i + 1:])
+}
+
+fn Store_cmd_geoadd(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 5 or ((len(argv) - 2) % 3) != 0 {
+        return r_arity("geoadd")
+    }
+    let ik = ikey(db, argv[1])
+    if self.ensure_zset(ik) == 0 {
+        return r_wrongtype()
+    }
+    let mut z = self.zsets[ik]
+    let mut added = 0
+    let mut i = 2
+    while i + 2 < len(argv) {
+        let lon = parse_float(argv[i])
+        let lat = parse_float(argv[i + 1])
+        if lon < (0.0 - 180.0) or lon > 180.0 or lat < (0.0 - 85.05112878) or lat > 85.05112878 {
+            return r_err("ERR invalid longitude,latitude pair")
+        }
+        let packed = geo_pack(lon, lat)
+        if not has(z, argv[i + 2]) {
+            added = added + 1
+        }
+        z[argv[i + 2]] = packed
+        i = i + 3
+    }
+    self.zsets[ik] = z
+    return r_int(added)
+}
+
+fn Store_cmd_geodist(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("geodist")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_nil()
+    }
+    if t != T_ZSET {
+        return r_wrongtype()
+    }
+    let z = self.zsets[ik]
+    if not has(z, argv[2]) or not has(z, argv[3]) {
+        return r_nil()
+    }
+    let a = z[argv[2]]
+    let b = z[argv[3]]
+    let mut m = haversine_m(geo_lon(a), geo_lat(a), geo_lon(b), geo_lat(b))
+    let mut unit = "m"
+    if len(argv) >= 5 {
+        unit = str_to_lower(argv[4])
+    }
+    if str_eq(unit, "km") {
+        m = m / 1000.0
+    }
+    if str_eq(unit, "ft") {
+        m = m * 3.28084
+    }
+    if str_eq(unit, "mi") {
+        m = m / 1609.344
+    }
+    return r_bulk(format_float(m, 4))
+}
+
+fn Store_cmd_geopos(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("geopos")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(len(argv) - 2))
+    builder_write(b, "\r\n")
+    let mut i = 2
+    while i < len(argv) {
+        if t != T_ZSET or not has(self.zsets[ik], argv[i]) {
+            builder_write(b, r_null_arr())
+        } else {
+            let p = self.zsets[ik][argv[i]]
+            let mut pair = make([]string, 0, 2)
+            pair = append(pair, format_float(geo_lon(p), 8))
+            pair = append(pair, format_float(geo_lat(p), 8))
+            builder_write(b, r_array_bulks(pair))
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn Store_cmd_georadius(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 6 {
+        return r_arity("georadius")
+    }
+    let ik = ikey(db, argv[1])
+    let lon = parse_float(argv[2])
+    let lat = parse_float(argv[3])
+    let rad = parse_float(argv[4])
+    let unit = str_to_lower(argv[5])
+    let t = self.kind(ik)
+    let none: []string = []
+    if t == T_NONE {
+        return r_array_bulks(none)
+    }
+    if t != T_ZSET {
+        return r_wrongtype()
+    }
+    let mut scale = 1.0
+    if str_eq(unit, "km") {
+        scale = 1000.0
+    }
+    if str_eq(unit, "mi") {
+        scale = 1609.344
+    }
+    if str_eq(unit, "ft") {
+        scale = 0.3048
+    }
+    let lim = rad * scale
+    let z = self.zsets[ik]
+    let mut out = make([]string, 0, 4)
+    for m, p in range z {
+        let d = haversine_m(lon, lat, geo_lon(p), geo_lat(p))
+        if d <= lim {
+            out = append(out, m)
+        }
+    }
+    return r_array_bulks(out)
+}
+
+fn Store_cmd_geosearch(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("geosearch")
+    }
+    let mut lon = "0"
+    let mut lat = "0"
+    let mut rad = "1"
+    let mut unit = "m"
+    let mut i = 2
+    while i < len(argv) {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "FROMLONLAT") and i + 2 < len(argv) {
+            lon = argv[i + 1]
+            lat = argv[i + 2]
+            i = i + 3
+        } else if str_eq(o, "BYRADIUS") and i + 2 < len(argv) {
+            rad = argv[i + 1]
+            unit = argv[i + 2]
+            i = i + 3
+        } else {
+            i = i + 1
+        }
+    }
+    return self.cmd_georadius(db, ["GEORADIUS", argv[1], lon, lat, rad, unit])
+}
+
+fn Store_cmd_geosearchstore(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("geosearchstore")
+    }
+    let dest = argv[1]
+    let mut sub = make([]string, 0, len(argv) - 1)
+    sub = append(sub, "GEOSEARCH")
+    let mut i = 2
+    while i < len(argv) {
+        sub = append(sub, argv[i])
+        i = i + 1
+    }
+    let r = self.cmd_geosearch(db, sub)
+    if str_has_prefix(r, "-") {
+        return r
+    }
+    let mems = parse_array_bulks(r)
+    if len(mems) == 0 {
+        return r_int(0)
+    }
+    let dik = ikey(db, dest)
+    if self.live(dik) == 1 {
+        let _ = self.drop_key(dik)
+    }
+    let mut z = make(map[string]string)
+    i = 0
+    while i < len(mems) {
+        z[mems[i]] = "1"
+        i = i + 1
+    }
+    self.zsets[dik] = z
+    self.types[dik] = T_ZSET
+    return r_int(len(mems))
+}

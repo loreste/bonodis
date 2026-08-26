@@ -1,0 +1,139 @@
+pack bonodis
+
+fn dummy_tls_conn() -> TlsConn {
+    return tls_accept(tls_server_new("", ""), -1)
+}
+
+fn dummy_tls_client() -> TlsClient {
+    return tls_client_new_insecure()
+}
+
+fn tls_cli_new(ca: string) -> TlsClient {
+    if str_len(ca) > 0 {
+        return tls_client_new(ca)
+    }
+    return tls_client_new_insecure()
+}
+
+fn cfg_tls_ca(m: CMap) -> string {
+    return cmap_get(m, "tls_ca")
+}
+
+fn tls_write_all(tc: TlsConn, s: string) -> int {
+    let mut off = 0
+    let n = str_len(s)
+    while off < n {
+        let w = tls_write(tc, s[off:])
+        if w <= 0 {
+            return -1
+        }
+        off = off + w
+    }
+    return n
+}
+
+fn conn_read(fd: int, tls_on: int, tc: TlsConn) -> string {
+    if tls_on == 1 {
+        return tls_read(tc, 65536)
+    }
+    return tcp_read(fd)
+}
+
+fn conn_write(fd: int, tls_on: int, tc: TlsConn, s: string) -> int {
+    if tls_on == 1 {
+        return tls_write_all(tc, s)
+    }
+    return tcp_write_all(fd, s)
+}
+
+fn conn_close(fd: int, tls_on: int, tc: TlsConn) {
+    if tls_on == 1 {
+        let _ = tls_conn_close(tc)
+        return
+    }
+    if fd >= 0 {
+        let _ = tcp_close(fd)
+    }
+}
+
+fn conn_handshake(fd: int, cert: string, key: string) -> (int, TlsConn) {
+    let none = dummy_tls_conn()
+    if str_len(cert) == 0 or str_len(key) == 0 {
+        return (0, none)
+    }
+    if tls_server_available() == 0 {
+        slog_error("TLS requested but tls_server_available=0")
+        return (0 - 1, none)
+    }
+    let srv = tls_server_new(cert, key)
+    let tc = tls_accept(srv, fd)
+    if tls_conn_fd(tc) < 0 {
+        slog_with("error", "TLS handshake failed", "fd", format_int(fd))
+        return (0 - 1, none)
+    }
+    slog_with("info", "TLS accepted", "fd", format_int(fd))
+    return (1, tc)
+}
+
+fn peer_open(ip: string, port: int, tls_on: int, ca: string) -> (int, TlsConn, TlsClient) {
+    let cli = tls_cli_new(ca)
+    let mut tc = dummy_tls_conn()
+    if tls_on == 0 {
+        let fd = tcp_connect(ip, port)
+        if fd < 0 {
+            return (-1, tc, cli)
+        }
+        let _ = tcp_nodelay(fd)
+        let _ = tcp_set_timeout(fd, 1000)
+        return (fd, tc, cli)
+    }
+    let fd = tcp_connect(ip, port)
+    if fd < 0 {
+        return (-1, tc, cli)
+    }
+    let _ = tcp_nodelay(fd)
+    let _ = tcp_set_timeout(fd, 1000)
+    tc = tls_connect(cli, fd, ip)
+    if tls_conn_fd(tc) < 0 {
+        let _ = tcp_close(fd)
+        return (-1, dummy_tls_conn(), cli)
+    }
+    return (fd, tc, cli)
+}
+
+fn peer_send(fd: int, tls_on: int, tc: TlsConn, argv: []string) -> string {
+    let n = conn_write(fd, tls_on, tc, encode_array(argv))
+    if n < 0 {
+        return ""
+    }
+    return conn_read(fd, tls_on, tc)
+}
+
+fn peer_close(fd: int, tls_on: int, tc: TlsConn, cli: TlsClient) {
+    conn_close(fd, tls_on, tc)
+    let _ = tls_client_free(cli)
+}
+
+fn peer_call(ip: string, port: int, argv: []string, tls_on: int, ca: string) -> string {
+    if tls_on == 0 {
+        return resp_call(ip, port, argv)
+    }
+    let fd, tc, cli = peer_open(ip, port, 1, ca)
+    if fd < 0 {
+        peer_close(fd, 0, tc, cli)
+        return ""
+    }
+    let r = peer_send(fd, 1, tc, argv)
+    peer_close(fd, 1, tc, cli)
+    return r
+}
+
+fn cfg_tls_on(m: CMap) -> int {
+    if str_len(cmap_get(m, "tls_cert")) > 0 {
+        return 1
+    }
+    if str_eq(cmap_get(m, "tls"), "1") {
+        return 1
+    }
+    return 0
+}

@@ -1,0 +1,126 @@
+fn TestDropinGetdel() {
+    let mut st = new_store()
+    let s = st.apply(0, ["SET", "a", "v"])
+    assert_eq_str(s, "+OK\r\n")
+    let g = st.apply(0, ["GETDEL", "a"])
+    assert_eq_str(g, "$1\r\nv\r\n")
+    assert_eq_str(st.apply(0, ["GET", "a"]), "$-1\r\n")
+}
+
+fn TestDropinUnion() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SADD", "u", "a", "b"])
+    let _ = st.apply(0, ["SADD", "v", "b", "c"])
+    let u = st.apply(0, ["SUNION", "u", "v"])
+    assert(str_has_prefix(u, "*"))
+}
+
+fn TestDropinZ() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["ZADD", "z", "1", "a", "2", "b"])
+    let r = st.apply(0, ["ZRANGEBYSCORE", "z", "1", "2"])
+    assert(str_contains(r, "a"))
+}
+
+fn TestDropinSort() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["LPUSH", "l", "3", "1", "2"])
+    let r = st.apply(0, ["SORT", "l"])
+    assert(str_has_prefix(r, "*"))
+}
+
+fn TestDropinHll() {
+    let mut st = new_store()
+    let a = st.apply(0, ["PFADD", "h", "a", "b"])
+    assert(str_has_prefix(a, ":"))
+    let n = st.apply(0, ["PFCOUNT", "h"])
+    assert(str_has_prefix(n, ":"))
+    assert(not str_eq(n, ":0\r\n"))
+    let _ = st.apply(0, ["SET", "b", "x"])
+    assert_eq_str(st.apply(0, ["COPY", "b", "c"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["GET", "c"]), "$1\r\nx\r\n")
+    assert_eq_str(st.apply(0, ["TOUCH", "b", "c", "nope"]), ":2\r\n")
+}
+
+fn TestDropinXgroupBitfield() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["XADD", "s", "1-0", "f", "v1"])
+    assert_eq_str(st.apply(0, ["XGROUP", "CREATE", "s", "g", "0-0"]), "+OK\r\n")
+    let xr = st.apply(0, ["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"])
+    assert(str_contains(xr, "v1"))
+    assert_eq_str(st.apply(0, ["XGROUP", "SETID", "s", "g", "$"]), "+OK\r\n")
+    let bf = st.apply(0, ["BITFIELD", "bf", "SET", "u8", "0", "5"])
+    assert(str_has_prefix(bf, "*"))
+    assert(str_contains(bf, ":0"))
+    assert(str_contains(st.apply(0, ["BITFIELD", "bf", "GET", "u8", "0"]), ":5"))
+    let _ = st.apply(0, ["HSET", "h", "f", "v"])
+    assert_eq_str(st.apply(0, ["HGETDEL", "h", "f"]), "$1\r\nv\r\n")
+    let _ = st.apply(0, ["RPUSH", "l", "a", "b"])
+    let lp = st.apply(0, ["LMPOP", "1", "l", "LEFT", "COUNT", "1"])
+    assert(str_contains(lp, "a"))
+    let _ = st.apply(0, ["SET", "k", "v"])
+    assert_eq_str(st.apply(0, ["EXPIRE", "k", "60", "NX"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["EXPIRE", "k", "30", "NX"]), ":0\r\n")
+}
+
+fn TestWatchVersion() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k", "1"])
+    let v1 = st.apply(0, ["__KVER", "k"])
+    let _ = st.apply(0, ["SET", "k", "2"])
+    let v2 = st.apply(0, ["__KVER", "k"])
+    assert(not str_eq(v1, v2))
+}
+
+fn TestGetrangeSetrange() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "s", "hello"])
+    assert_eq_str(st.apply(0, ["GETRANGE", "s", "1", "3"]), "$3\r\nell\r\n")
+    let _ = st.apply(0, ["SETRANGE", "s", "0", "H"])
+    assert_eq_str(st.apply(0, ["GET", "s"]), "$5\r\nHello\r\n")
+}
+
+fn TestLremIncrbyfloat() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["RPUSH", "l", "a", "b", "a", "c"])
+    assert_eq_str(st.apply(0, ["LREM", "l", "1", "a"]), ":1\r\n")
+    let f = st.apply(0, ["INCRBYFLOAT", "n", "0.5"])
+    assert(str_has_prefix(f, "$"))
+    assert(str_contains(f, "0.5"))
+}
+
+fn TestBitopSmove() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SETBIT", "b1", "0", "1"])
+    let _ = st.apply(0, ["SETBIT", "b2", "0", "1"])
+    let r = st.apply(0, ["BITOP", "AND", "bout", "b1", "b2"])
+    assert(str_has_prefix(r, ":"))
+    let _ = st.apply(0, ["SADD", "s1", "m"])
+    assert_eq_str(st.apply(0, ["SMOVE", "s1", "s2", "m"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["SISMEMBER", "s2", "m"]), ":1\r\n")
+}
+
+fn TestMoveRpoplpushScan() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k", "v"])
+    assert_eq_str(st.apply(0, ["MOVE", "k", "1"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["GET", "k"]), "$-1\r\n")
+    assert_eq_str(st.apply(1, ["GET", "k"]), "$1\r\nv\r\n")
+    let _ = st.apply(0, ["RPUSH", "src", "a", "b"])
+    let r = st.apply(0, ["RPOPLPUSH", "src", "dst"])
+    assert_eq_str(r, "$1\r\nb\r\n")
+    let _ = st.apply(0, ["HSET", "h", "f", "hello"])
+    assert_eq_str(st.apply(0, ["HSTRLEN", "h", "f"]), ":5\r\n")
+    let hs = st.apply(0, ["HSCAN", "h", "0"])
+    assert(str_has_prefix(hs, "*"))
+}
+
+fn TestZremrangeXdel() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["ZADD", "z", "1", "a", "5", "b"])
+    assert_eq_str(st.apply(0, ["ZREMRANGEBYSCORE", "z", "0", "2"]), ":1\r\n")
+    let _ = st.apply(0, ["XADD", "s", "*", "f", "v"])
+    let n = st.apply(0, ["XLEN", "s"])
+    assert_eq_str(n, ":1\r\n")
+    let _ = st.apply(0, ["XTRIM", "s", "MAXLEN", "0"])
+}

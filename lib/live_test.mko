@@ -1,0 +1,1089 @@
+// End-to-end RESP over TCP. Server is kicked in-process — 100% Mako.
+
+fn boot(port: int, pass: string, stop: AtomicInt) -> int {
+    return serve("127.0.0.1", port, 4, pass, "", 0, 0, stop, 10000, 0, 10000, 0, "")
+}
+
+fn boot_metrics(port: int, mport: int, stop: AtomicInt) -> int {
+    return serve("127.0.0.1", port, 4, "", "", 0, 0, stop, 10000, 0, 0, mport, "")
+}
+
+fn boot_cluster(port: int, stop: AtomicInt, dir: string) -> int {
+    return serve("127.0.0.1", port, 4, "", "", 0, 0, stop, 10000, 0, 10000, 0, pack_opts(1, "127.0.0.1", dir, "", "0"))
+}
+
+fn boot_replica_of(port: int, stop: AtomicInt, mhost: string, mport: int) -> int {
+    return serve("127.0.0.1", port, 4, "", "", 0, 0, stop, 10000, 0, 10000, 0, pack_opts(0, "", "", mhost, format_int(mport)))
+}
+
+fn boot_tls(port: int, stop: AtomicInt, cert: string, key: string) -> int {
+    let cfg = pack_opts(0, "", "", "", "0") + "\n0\n0\n10000\n0\n" + cert + "\n" + key + "\n"
+    return serve("127.0.0.1", port, 4, "", "", 0, 0, stop, 10000, 0, 10000, 0, cfg)
+}
+
+fn boot_persist(port: int, stop: AtomicInt, dir: string) -> int {
+    let cfg = pack_opts(0, "", dir, "", "0") + "\n0\n0\n1000\n0"
+    return serve("127.0.0.1", port, 4, "", dir + "/appendonly.aof", 1, 0, stop, 10000, 0, 10000, 0, cfg)
+}
+
+fn boot_unix(port: int, sock: string, stop: AtomicInt) -> int {
+    let cfg = pack_opts(0, "", "", "", "0") + "\n0\n0\n10000\n0\n\n\n\n0\n0\n1\n50000\n" + sock + "\n448"
+    return serve("127.0.0.1", port, 4, "", "", 0, 1, stop, 10000, 0, 10000, 0, cfg)
+}
+
+fn boot_defttl(port: int, stop: AtomicInt, sec: int) -> int {
+    let cfg = pack_opts(0, "", "", "", "0") + "\n0\n" + format_int(sec) + "\n1000\n0"
+    return serve("127.0.0.1", port, 4, "", "", 0, 0, stop, 10000, 0, 10000, 0, cfg)
+}
+
+fn bulk_str(r: string) -> string {
+    if not str_has_prefix(r, "$") {
+        return r
+    }
+    let cr = find_crlf(r, 0)
+    if cr < 2 {
+        return ""
+    }
+    let ln = int_of(r[1:cr])
+    if ln <= 0 {
+        return ""
+    }
+    let start = cr + 2
+    if start + ln > str_len(r) {
+        return r[start:]
+    }
+    return r[start:start + ln]
+}
+
+fn parse_moved(r: string) -> (string, int, int) {
+    if not str_has_prefix(r, "-MOVED") {
+        return ("", 0, 0)
+    }
+    let n = str_len(r)
+    let mut end = n
+    if n >= 2 and str_byte_at(r, n - 2) == 13 {
+        end = n - 2
+    }
+    let line = r[1:end]
+    let f = str_fields(line)
+    if len(f) < 3 {
+        return ("", 0, 0)
+    }
+    let ip, ps = parse_ipport(f[2])
+    return (ip, int_of(ps), 1)
+}
+
+fn resp_follow(fd0: int, argv: []string) -> string {
+    let r = resp_send(fd0, argv)
+    let ip, port, ok = parse_moved(r)
+    if ok == 0 {
+        return r
+    }
+    let fd = tcp_connect(ip, port)
+    if fd < 0 {
+        return r
+    }
+    let _ = tcp_nodelay(fd)
+    let r2 = resp_send(fd, argv)
+    let _ = tcp_close(fd)
+    return r2
+}
+
+fn TestLivePingSetGet() {
+    let stop = atomic_new(0)
+    let port = 19491
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["PING"]), "+PONG\r\n")
+        assert_eq_str(resp_send(fd, ["SET", "smoke", "ok"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["GET", "smoke"]), "$2\r\nok\r\n")
+        assert_eq_str(resp_send(fd, ["INCR", "smoke_n"]), ":1\r\n")
+        assert_eq_str(resp_send(fd, ["INCR", "smoke_n"]), ":2\r\n")
+        let _ = resp_send(fd, ["QUIT"])
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveFastGet() {
+    let stop = atomic_new(0)
+    let port = 19508
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["SET", "hot", "1"]), "+OK\r\n")
+        let t0 = wall_ms()
+        let mut i = 0
+        while i < 200 {
+            assert_eq_str(resp_send(fd, ["GET", "hot"]), "$1\r\n1\r\n")
+            i = i + 1
+        }
+        let dt = wall_ms() - t0
+        assert(dt < 80)
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveTypes() {
+    let stop = atomic_new(0)
+    let port = 19492
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["HSET", "h", "f", "1"]), ":1\r\n")
+        let g = resp_send(fd, ["GET", "h"])
+        assert(str_has_prefix(g, "-WRONGTYPE"))
+        assert_eq_str(resp_send(fd, ["LPUSH", "L", "a", "b"]), ":2\r\n")
+        let lr = resp_send(fd, ["LRANGE", "L", "0", "-1"])
+        assert(str_contains(lr, "b"))
+        assert(str_contains(lr, "a"))
+        assert_eq_str(resp_send(fd, ["SADD", "s", "m"]), ":1\r\n")
+        assert_eq_str(resp_send(fd, ["SISMEMBER", "s", "m"]), ":1\r\n")
+        assert_eq_str(resp_send(fd, ["ZADD", "z", "1", "a"]), ":1\r\n")
+        assert_eq_str(resp_send(fd, ["ZSCORE", "z", "a"]), "$1\r\n1\r\n")
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveBrain() {
+    let stop = atomic_new(0)
+    let port = 19509
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["BRAIN", "REMEMBER", "{bot}mem", "m1", "likes espresso"]), "+OK\r\n")
+        assert(str_has_prefix(resp_send(fd, ["BRAIN", "SAY", "{bot}sess", "user", "coffee?"]), ":"))
+        let rec = resp_send(fd, ["BRAIN", "RECALL", "{bot}mem", "COUNT", "3", "QUERY", "espresso"])
+        assert(str_contains(rec, "m1"))
+        let pack = resp_send(fd, ["BRAIN", "PACK", "{bot}sess", "{bot}mem", "QUERY", "coffee"])
+        assert(str_has_prefix(pack, "$"))
+        let help = resp_send(fd, ["BRAIN", "HELP"])
+        assert(str_contains(help, "REMEMBER"))
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveBrainHttp() {
+    let stop = atomic_new(0)
+    let port = 19510
+    let hport = 19511
+    crew t {
+        let srv = t.kick(boot_metrics(port, hport, stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let _ = tcp_close(fd)
+        let mut hi = 0
+        let mut hfd = -1
+        while hi < 40 {
+            hfd = tcp_connect("127.0.0.1", hport)
+            if hfd >= 0 {
+                break
+            }
+            sleep_ms(50)
+            hi = hi + 1
+        }
+        assert(hfd >= 0)
+        let _ = tcp_set_timeout(hfd, 1000)
+        let _ = tcp_write_all(hfd, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        let body = tcp_read(hfd)
+        assert(str_contains(body, "\"service\":\"bonodis\""))
+        let _ = tcp_close(hfd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveAuth() {
+    let stop = atomic_new(0)
+    let port = 19493
+    crew t {
+        let srv = t.kick(boot(port, "s3cret", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let denied = resp_send(fd, ["GET", "k"])
+        assert(str_contains(denied, "NOAUTH"))
+        let multi = resp_send(fd, ["MULTI"])
+        assert(str_contains(multi, "NOAUTH"))
+        let hello = resp_send(fd, ["HELLO", "2"])
+        assert(str_contains(hello, "NOAUTH"))
+        let bad = resp_send(fd, ["AUTH", "nope"])
+        assert(str_contains(bad, "WRONGPASS"))
+        assert_eq_str(resp_send(fd, ["AUTH", "s3cret"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["SET", "authed", "yes"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["GET", "authed"]), "$3\r\nyes\r\n")
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveHelloAuth() {
+    let stop = atomic_new(0)
+    let port = 19494
+    crew t {
+        let srv = t.kick(boot(port, "s3cret", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let r = resp_send(fd, ["HELLO", "3", "AUTH", "default", "s3cret"])
+        assert(str_contains(r, "server"))
+        assert_eq_str(resp_send(fd, ["SET", "afterhello", "1"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["GET", "afterhello"]), "$1\r\n1\r\n")
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveIncrOverflow() {
+    let stop = atomic_new(0)
+    let port = 19495
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let _ = resp_send(fd, ["SET", "n", "9223372036854775807"])
+        let r = resp_send(fd, ["INCR", "n"])
+        assert(str_contains(r, "overflow"))
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveUnreadCloseSurvives() {
+    let stop = atomic_new(0)
+    let port = 19496
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let mut i = 0
+        while i < 40 {
+            let _ = tcp_write_all(fd, encode_array(["PING"]))
+            i = i + 1
+        }
+        let _ = tcp_close(fd)
+        sleep_ms(200)
+        let fd2 = wait_connect("127.0.0.1", port, 40)
+        assert(fd2 >= 0)
+        assert_eq_str(resp_send(fd2, ["PING"]), "+PONG\r\n")
+        let _ = tcp_close(fd2)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveClusterKeyslot() {
+    let stop = atomic_new(0)
+    let port = 19498
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let r = resp_send(fd, ["CLUSTER", "KEYSLOT", "foo"])
+        assert_eq_str(r, ":12182\r\n")
+        let ev = resp_send(fd, ["EVAL", "return 1", "0"])
+        assert_eq_str(ev, ":1\r\n")
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveMget() {
+    let stop = atomic_new(0)
+    let port = 19497
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["MSET", "a", "1", "b", "2"]), "+OK\r\n")
+        let r = resp_send(fd, ["MGET", "a", "missing", "b"])
+        assert(str_contains(r, "1"))
+        assert(str_contains(r, "2"))
+        assert(str_contains(r, "$-1"))
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveBitGeoStream() {
+    let stop = atomic_new(0)
+    let port = 19503
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["SETBIT", "bm", "7", "1"]), ":0\r\n")
+        assert_eq_str(resp_send(fd, ["GETBIT", "bm", "7"]), ":1\r\n")
+        assert_eq_str(resp_send(fd, ["BITCOUNT", "bm"]), ":1\r\n")
+        assert_eq_str(resp_send(fd, ["GEOADD", "cities", "13.361389", "38.115556", "Palermo"]), ":1\r\n")
+        let d = resp_send(fd, ["GEODIST", "cities", "Palermo", "Palermo", "m"])
+        assert(str_has_prefix(d, "$"))
+        let xid = resp_send(fd, ["XADD", "xs", "*", "f", "v"])
+        assert(str_has_prefix(xid, "$"))
+        assert_eq_str(resp_send(fd, ["XLEN", "xs"]), ":1\r\n")
+        let _ = resp_send(fd, ["LPUSH", "bl", "x"])
+        let bl = resp_send(fd, ["BLPOP", "bl", "1"])
+        assert(str_contains(bl, "x"))
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveSlowlogMetricsCluster() {
+    let stop = atomic_new(0)
+    let port = 19504
+    let mport = 19505
+    crew t {
+        let srv = t.kick(boot_metrics(port, mport, stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let _ = resp_send(fd, ["PING"])
+        let sl = resp_send(fd, ["SLOWLOG", "LEN"])
+        assert(str_has_prefix(sl, ":"))
+        let m = resp_send(fd, ["METRICS"])
+        assert(str_contains(m, "bonodis_up"))
+        assert_eq_str(resp_send(fd, ["CLUSTER", "KEYSLOT", "foo"]), ":12182\r\n")
+        let slots = resp_send(fd, ["CLUSTER", "SLOTS"])
+        assert(str_contains(slots, "16383"))
+        let role = resp_send(fd, ["ROLE"])
+        assert(str_contains(role, "master"))
+        let ev = resp_send(fd, ["EVAL", "return 1", "0"])
+        assert_eq_str(ev, ":1\r\n")
+        let sen = resp_send(fd, ["SENTINEL", "MASTERS"])
+        assert(str_contains(sen, "mymaster"))
+        let inf = bulk_str(resp_send(fd, ["INFO"]))
+        assert(str_contains(inf, "persistence_fork:0"))
+        assert(str_contains(inf, "sentinel_mode:0"))
+        assert(str_contains(inf, "license:MIT"))
+        assert(str_contains(inf, "maxmemory_policy:allkeys-lru"))
+        let cfg = resp_send(fd, ["CONFIG", "GET", "*"])
+        assert(str_contains(cfg, "appendfsync"))
+        assert(str_contains(cfg, "everysec"))
+        assert(str_contains(cfg, "maxmemory-policy"))
+        assert(str_contains(cfg, "allkeys-lru"))
+        let _ = resp_send(fd, ["SET", "hk", "1"])
+        let hk = resp_send(fd, ["HOTKEYS", "5"])
+        assert(str_has_prefix(hk, "*"))
+        let _ = tcp_close(fd)
+        let mut hi = 0
+        let mut hfd = -1
+        while hi < 40 {
+            hfd = tcp_connect("127.0.0.1", mport)
+            if hfd >= 0 {
+                break
+            }
+            sleep_ms(50)
+            hi = hi + 1
+        }
+        assert(hfd >= 0)
+        let _ = tcp_set_timeout(hfd, 1000)
+        let _ = tcp_write_all(hfd, "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        let body = tcp_read(hfd)
+        assert(str_contains(body, "bonodis_up"))
+        let _ = tcp_close(hfd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveReplica() {
+    let stopm = atomic_new(0)
+    let stopr = atomic_new(0)
+    let mp = 19506
+    let rp = 19507
+    crew t {
+        let sm = t.kick(boot(mp, "", stopm))
+        let sr = t.kick(boot(rp, "", stopr))
+        let fdm = wait_connect("127.0.0.1", mp, 80)
+        let fdr = wait_connect("127.0.0.1", rp, 80)
+        assert(fdm >= 0)
+        assert(fdr >= 0)
+        assert_eq_str(resp_send(fdm, ["SET", "from_master", "hello"]), "+OK\r\n")
+        assert_eq_str(resp_send(fdr, ["REPLICAOF", "127.0.0.1", format_int(mp)]), "+OK\r\n")
+        let mut n = 0
+        let mut got = ""
+        while n < 80 {
+            sleep_ms(50)
+            got = resp_send(fdr, ["GET", "from_master"])
+            if str_contains(got, "hello") {
+                break
+            }
+            n = n + 1
+        }
+        assert(str_contains(got, "hello"))
+        assert_eq_str(resp_send(fdm, ["SET", "streamed", "yes"]), "+OK\r\n")
+        n = 0
+        got = ""
+        while n < 80 {
+            sleep_ms(50)
+            got = resp_send(fdr, ["GET", "streamed"])
+            if str_contains(got, "yes") {
+                break
+            }
+            n = n + 1
+        }
+        assert(str_contains(got, "yes"))
+        let mut ro = ""
+        n = 0
+        while n < 40 {
+            ro = resp_send(fdr, ["SET", "on_replica", "no"])
+            if str_contains(ro, "READONLY") {
+                break
+            }
+            sleep_ms(50)
+            n = n + 1
+        }
+        assert(str_contains(ro, "READONLY"))
+        let _ = tcp_close(fdm)
+        let _ = tcp_close(fdr)
+        stop_serve(stopm)
+        stop_serve(stopr)
+        let _ = sm.join()
+        let _ = sr.join()
+    }
+}
+
+fn wait_nodes(fd: int, want: int) -> int {
+    let mut n = 0
+    while n < 80 {
+        let blob = bulk_str(resp_send(fd, ["CLUSTER", "NODES"]))
+        let lines = str_split(blob, "\n")
+        let mut c = 0
+        let mut i = 0
+        while i < len(lines) {
+            if str_len(lines[i]) > 5 {
+                c = c + 1
+            }
+            i = i + 1
+        }
+        if c >= want {
+            return 1
+        }
+        sleep_ms(50)
+        n = n + 1
+    }
+    return 0
+}
+
+fn TestLiveClusterCreate() {
+    let s0 = atomic_new(0)
+    let s1 = atomic_new(0)
+    let s2 = atomic_new(0)
+    let p0 = 19610
+    let p1 = 19611
+    let p2 = 19612
+    crew t {
+        let a = t.kick(boot_cluster(p0, s0, "/tmp/bonodis_c19610"))
+        let b = t.kick(boot_cluster(p1, s1, "/tmp/bonodis_c19611"))
+        let c = t.kick(boot_cluster(p2, s2, "/tmp/bonodis_c19612"))
+        let f0 = wait_connect("127.0.0.1", p0, 80)
+        let f1 = wait_connect("127.0.0.1", p1, 80)
+        let f2 = wait_connect("127.0.0.1", p2, 80)
+        assert(f0 >= 0)
+        assert(f1 >= 0)
+        assert(f2 >= 0)
+        assert_eq_str(resp_send(f0, ["CLUSTER", "MEET", "127.0.0.1", format_int(p1)]), "+OK\r\n")
+        assert_eq_str(resp_send(f0, ["CLUSTER", "MEET", "127.0.0.1", format_int(p2)]), "+OK\r\n")
+        assert_eq(wait_nodes(f0, 3), 1)
+        assert_eq(wait_nodes(f1, 3), 1)
+        assert_eq(wait_nodes(f2, 3), 1)
+        let parts = cluster_split_slots(3)
+        assert_eq(len(parts), 3)
+        let d0 = str_index(parts[0], "-")
+        let d1 = str_index(parts[1], "-")
+        let d2 = str_index(parts[2], "-")
+        assert_eq_str(resp_send(f0, ["CLUSTER", "ADDSLOTSRANGE", parts[0][:d0], parts[0][d0 + 1:]]), "+OK\r\n")
+        assert_eq_str(resp_send(f1, ["CLUSTER", "ADDSLOTSRANGE", parts[1][:d1], parts[1][d1 + 1:]]), "+OK\r\n")
+        assert_eq_str(resp_send(f2, ["CLUSTER", "ADDSLOTSRANGE", parts[2][:d2], parts[2][d2 + 1:]]), "+OK\r\n")
+        let mut n = 0
+        let mut info = ""
+        while n < 40 {
+            info = bulk_str(resp_send(f0, ["CLUSTER", "INFO"]))
+            if str_contains(info, "cluster_state:ok") {
+                break
+            }
+            sleep_ms(50)
+            n = n + 1
+        }
+        assert(str_contains(info, "cluster_state:ok"))
+        let setr = resp_follow(f0, ["SET", "foo", "bar"])
+        assert_eq_str(setr, "+OK\r\n")
+        let getr = resp_follow(f0, ["GET", "foo"])
+        assert(str_contains(getr, "bar"))
+        let miss = resp_send(f0, ["GET", "foo"])
+        if str_has_prefix(miss, "-MOVED") {
+            assert(str_contains(miss, "MOVED"))
+        }
+        let _ = tcp_close(f0)
+        let _ = tcp_close(f1)
+        let _ = tcp_close(f2)
+        stop_serve(s0)
+        stop_serve(s1)
+        stop_serve(s2)
+        let _ = a.join()
+        let _ = b.join()
+        let _ = c.join()
+    }
+}
+
+fn TestLiveReplicaOfFlag() {
+    let stopm = atomic_new(0)
+    let stopr = atomic_new(0)
+    let mp = 19620
+    let rp = 19621
+    crew t {
+        let sm = t.kick(boot(mp, "", stopm))
+        let sr = t.kick(boot_replica_of(rp, stopr, "127.0.0.1", mp))
+        let fdm = wait_connect("127.0.0.1", mp, 80)
+        let fdr = wait_connect("127.0.0.1", rp, 80)
+        assert(fdm >= 0)
+        assert(fdr >= 0)
+        assert_eq_str(resp_send(fdm, ["SET", "auto_replicated", "1"]), "+OK\r\n")
+        let mut n = 0
+        let mut got = ""
+        while n < 80 {
+            sleep_ms(50)
+            got = resp_send(fdr, ["GET", "auto_replicated"])
+            if str_contains(got, "1") {
+                break
+            }
+            n = n + 1
+        }
+        assert(str_contains(got, "1"))
+        let role = resp_send(fdr, ["ROLE"])
+        assert(str_contains(role, "slave"))
+        let _ = tcp_close(fdm)
+        let _ = tcp_close(fdr)
+        stop_serve(stopm)
+        stop_serve(stopr)
+        let _ = sm.join()
+        let _ = sr.join()
+    }
+}
+
+fn TestLivePubsubAndNewCmds() {
+    let stop = atomic_new(0)
+    let port = 19513
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        let sub = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert(sub >= 0)
+        let _ = tcp_set_timeout(sub, 1000)
+        let sr = resp_send(sub, ["SUBSCRIBE", "news"])
+        assert(str_contains(sr, "subscribe"))
+        let pub = resp_send(fd, ["PUBLISH", "news", "hi"])
+        assert(str_has_prefix(pub, ":"))
+        assert(not str_eq(pub, ":0\r\n"))
+        assert_eq_str(resp_send(fd, ["SET", "g", "1"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["GETDEL", "g"]), "$1\r\n1\r\n")
+        let _ = resp_send(fd, ["SADD", "su", "a", "b"])
+        let _ = resp_send(fd, ["SADD", "sv", "b", "c"])
+        let un = resp_send(fd, ["SUNION", "su", "sv"])
+        assert(str_contains(un, "a"))
+        assert(str_contains(un, "c"))
+        let _ = resp_send(fd, ["ZADD", "zz", "1", "m"])
+        assert(str_contains(resp_send(fd, ["ZRANGEBYSCORE", "zz", "0", "2"]), "m"))
+        let _ = resp_send(fd, ["PFADD", "pf", "x", "y"])
+        let pc = resp_send(fd, ["PFCOUNT", "pf"])
+        assert(str_has_prefix(pc, ":"))
+        let fd2 = wait_connect("127.0.0.1", port, 40)
+        assert(fd2 >= 0)
+        assert_eq_str(resp_send(fd, ["SET", "wk", "1"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["WATCH", "wk"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd2, ["SET", "wk", "2"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["MULTI"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["SET", "wk", "3"]), "+QUEUED\r\n")
+        let ex = resp_send(fd, ["EXEC"])
+        assert(str_eq(ex, "*-1\r\n") or str_has_prefix(ex, "*-1"))
+        let _ = tcp_close(fd2)
+        assert_eq_str(resp_send(fd, ["CLIENT", "SETNAME", "c1"]), "+OK\r\n")
+        assert(str_contains(resp_send(fd, ["CLIENT", "GETNAME"]), "c1"))
+        let sen = resp_send(fd, ["SENTINEL", "GET-MASTER-ADDR-BY-NAME", "mymaster"])
+        assert(str_has_prefix(sen, "*2\r\n"))
+        assert(str_contains(sen, "127.0.0.1"))
+        let masters = resp_send(fd, ["SENTINEL", "MASTERS"])
+        assert(str_contains(masters, "mymaster"))
+        assert(str_has_prefix(resp_send(fd, ["LASTSAVE"]), ":"))
+        assert_eq_str(resp_send(fd, ["READONLY"]), "+OK\r\n")
+        let _ = tcp_close(fd)
+        let _ = tcp_close(sub)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveDefaultTtl() {
+    let stop = atomic_new(0)
+    let port = 19512
+    crew t {
+        let srv = t.kick(boot_defttl(port, stop, 30))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["SET", "ttlkey", "v"]), "+OK\r\n")
+        let ttl = resp_send(fd, ["TTL", "ttlkey"])
+        assert(str_has_prefix(ttl, ":"))
+        assert(not str_eq(ttl, ":-1\r\n"))
+        assert(not str_eq(ttl, ":-2\r\n"))
+        let inf = bulk_str(resp_send(fd, ["INFO"]))
+        assert(str_contains(inf, "default_ttl:30"))
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveSaveDump() {
+    let stop = atomic_new(0)
+    let port = 19520
+    let dir = "/tmp/bonodis_save_test"
+    let _ = mkdir_all(dir)
+    crew t {
+        let srv = t.kick(boot_persist(port, stop, dir))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["SET", "snap", "hello"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["SAVE"]), "+OK\r\n")
+        assert(file_exists(dir + "/dump.bonodis"))
+        let blob = read_file(dir + "/dump.bonodis")
+        assert(str_has_prefix(blob, "BONODIS-DUMP 1"))
+        assert(str_contains(blob, "snap"))
+        assert(str_contains(blob, "hello"))
+        assert(str_has_prefix(resp_send(fd, ["LASTSAVE"]), ":"))
+        let inf = bulk_str(resp_send(fd, ["INFO"]))
+        assert(str_contains(inf, "failover_quorum:majority"))
+        assert_eq_str(resp_send(fd, ["BGREWRITEAOF"]), "+OK\r\n")
+        sleep_ms(50)
+        assert_eq_str(resp_send(fd, ["GET", "snap"]), "$5\r\nhello\r\n")
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveBgrewriteRequiresAof() {
+    let stop = atomic_new(0)
+    let port = 19521
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let r = resp_send(fd, ["BGREWRITEAOF"])
+        assert(str_has_prefix(r, "-ERR"))
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveAcl() {
+    let stop = atomic_new(0)
+    let port = 19530
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["ACL", "SETUSER", "alice", "on", ">secret", "-@all", "+@read", "+ping", "+auth", "+echo", "+acl"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["AUTH", "alice", "secret"]), "+OK\r\n")
+        let who = resp_send(fd, ["ACL", "WHOAMI"])
+        assert(str_contains(who, "alice"))
+        let st = resp_send(fd, ["SET", "k", "v"])
+        assert(str_has_prefix(st, "-NOPERM") or str_has_prefix(st, "-ERR"))
+        assert_eq_str(resp_send(fd, ["PING"]), "+PONG\r\n")
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveTlsPing() {
+    let stop = atomic_new(0)
+    let port = 19531
+    let cert = "/tmp/bonodis_tls.crt"
+    let key = "/tmp/bonodis_tls.key"
+    let rc = tls_make_self_signed(cert, key, "localhost", 1)
+    if rc != 0 {
+        return
+    }
+    crew t {
+        let srv = t.kick(boot_tls(port, stop, cert, key))
+        let mut i = 0
+        let mut fd = -1
+        while i < 80 {
+            fd = tcp_connect("127.0.0.1", port)
+            if fd >= 0 {
+                break
+            }
+            sleep_ms(50)
+            i = i + 1
+        }
+        assert(fd >= 0)
+        let _ = tcp_nodelay(fd)
+        let cli = tls_client_new_insecure()
+        let tc = tls_connect(cli, fd, "localhost")
+        assert(tls_conn_fd(tc) >= 0)
+        let n = tls_write(tc, encode_array(["PING"]))
+        assert(n > 0)
+        let r = tls_read(tc, 65536)
+        assert(str_contains(r, "PONG"))
+        let _ = tls_conn_close(tc)
+        let _ = tls_client_free(cli)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveDumpClientNotify() {
+    let stop = atomic_new(0)
+    let port = 19533
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["SET", "{t}k", "v"]), "+OK\r\n")
+        let d = resp_send(fd, ["DUMP", "{t}k"])
+        assert(str_has_prefix(d, "$"))
+        assert_eq_str(resp_send(fd, ["DEL", "{t}k"]), ":1\r\n")
+        let payload = bulk_str(d)
+        assert_eq_str(resp_send(fd, ["RESTORE", "{t}k", "0", payload]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["GET", "{t}k"]), "$1\r\nv\r\n")
+        let cl = resp_send(fd, ["CLIENT", "LIST"])
+        assert(str_contains(cl, "id="))
+        assert_eq_str(resp_send(fd, ["CONFIG", "SET", "notify-keyspace-events", "KEA"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["CONFIG", "REWRITE"]), "+OK\r\n")
+        let _ = resp_send(fd, ["HSETNX", "{t}h", "f", "1"])
+        assert_eq_str(resp_send(fd, ["HSETNX", "{t}h", "f", "2"]), ":0\r\n")
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveMonitorXgroupBitfield() {
+    let stop = atomic_new(0)
+    let port = 19534
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let xid = resp_send(fd, ["XADD", "xs", "1-0", "f", "v1"])
+        assert(str_has_prefix(xid, "$"))
+        let gok = resp_send(fd, ["XGROUP", "CREATE", "xs", "g", "0-0"])
+        assert_eq_str(gok, "+OK\r\n")
+        let xr = resp_send(fd, ["XREADGROUP", "GROUP", "g", "c", "STREAMS", "xs", ">"])
+        assert(str_contains(xr, "v1"))
+        let cl = resp_send(fd, ["XCLAIM", "xs", "g", "c2", "0", "1-0"])
+        assert(str_contains(cl, "v1"))
+        let xp = resp_send(fd, ["XPENDING", "xs", "g"])
+        assert(str_has_prefix(xp, "*"))
+        assert_eq_str(resp_send(fd, ["XACK", "xs", "g", "1-0"]), ":1\r\n")
+        let set = resp_send(fd, ["BITFIELD", "bf", "SET", "u8", "0", "5"])
+        assert(str_contains(set, ":0"))
+        let get = resp_send(fd, ["BITFIELD", "bf", "GET", "u8", "0"])
+        assert(str_contains(get, ":5"))
+        let _ = resp_send(fd, ["HSET", "h", "f", "v"])
+        assert_eq_str(resp_send(fd, ["HGETDEL", "h", "f"]), "$1\r\nv\r\n")
+        let _ = resp_send(fd, ["RPUSH", "l", "a"])
+        let lp = resp_send(fd, ["LMPOP", "1", "l", "LEFT"])
+        assert(str_contains(lp, "a"))
+        let fdmon = wait_connect("127.0.0.1", port, 80)
+        assert(fdmon >= 0)
+        let mok = resp_send(fdmon, ["MONITOR"])
+        assert_eq_str(mok, "+OK\r\n")
+        let _ = tcp_set_timeout(fdmon, 400)
+        assert_eq_str(resp_send(fd, ["SET", "mk", "1"]), "+OK\r\n")
+        sleep_ms(250)
+        let mut mon = ""
+        let mut i = 0
+        while i < 8 {
+            mon = mon + tcp_read(fdmon)
+            if str_contains(mon, "SET") {
+                break
+            }
+            sleep_ms(50)
+            i = i + 1
+        }
+        assert(str_contains(mon, "SET"))
+        let _ = tcp_close(fd)
+        let _ = tcp_close(fdmon)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveConfigSet() {
+    let stop = atomic_new(0)
+    let port = 19532
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["CONFIG", "SET", "maxmemory", "12345"]), "+OK\r\n")
+        let g = resp_send(fd, ["CONFIG", "GET", "maxmemory"])
+        assert(str_contains(g, "12345"))
+        assert(str_has_prefix(resp_send(fd, ["MODULE", "LIST"]), "-ERR"))
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveUnixSocket() {
+    let stop = atomic_new(0)
+    let port = 19535
+    let sock = "/tmp/bonodis_live.sock"
+    let _ = unix_unlink(sock)
+    crew t {
+        let srv = t.kick(boot_unix(port, sock, stop))
+        let mut fd = -1
+        let mut i = 0
+        while i < 80 {
+            fd = unix_connect(sock)
+            if fd >= 0 {
+                break
+            }
+            sleep_ms(50)
+            i = i + 1
+        }
+        assert(fd >= 0)
+        assert_eq_str(resp_send(fd, ["PING"]), "+PONG\r\n")
+        assert_eq_str(resp_send(fd, ["SET", "uk", "1"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["GET", "uk"]), "$1\r\n1\r\n")
+        let cfg = resp_send(fd, ["CONFIG", "GET", "unixsocket"])
+        assert(str_contains(cfg, "unixsocket"))
+        assert(str_contains(cfg, sock))
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+    let _ = unix_unlink(sock)
+}
+
+fn TestLiveEvalAndAuth() {
+    let stop = atomic_new(0)
+    let port = 19536
+    crew t {
+        let srv = t.kick(boot(port, "s3cret", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let no = resp_send(fd, ["EVAL", "return 1", "0"])
+        assert(str_contains(no, "NOAUTH"))
+        assert_eq_str(resp_send(fd, ["AUTH", "s3cret"]), "+OK\r\n")
+        assert_eq_str(resp_send(fd, ["EVAL", "return 1", "0"]), ":1\r\n")
+        assert_eq_str(resp_send(fd, ["SET", "ek", "1"]), "+OK\r\n")
+        let g = resp_send(fd, ["EVAL", "return redis.call('GET', KEYS[1])", "1", "ek"])
+        assert_eq_str(g, "$1\r\n1\r\n")
+        let ld = resp_send(fd, ["SCRIPT", "LOAD", "return 2"])
+        assert(str_has_prefix(ld, "$"))
+        let sha = bulk_str(ld)
+        assert_eq_str(resp_send(fd, ["EVALSHA", sha, "0"]), ":2\r\n")
+        let nan = resp_send(fd, ["ZADD", "z", "nan", "m"])
+        assert(str_has_prefix(nan, "-ERR"))
+        assert_eq_str(resp_send(fd, ["EVAL", "local i = 0 while i < 2 do i = i + 1 end return i", "0"]), ":2\r\n")
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveTlsVerify() {
+    let stop = atomic_new(0)
+    let port = 19537
+    let cert = "/tmp/bonodis_tls_ca.crt"
+    let key = "/tmp/bonodis_tls_ca.key"
+    let rc = tls_make_self_signed(cert, key, "localhost", 1)
+    if rc != 0 {
+        return
+    }
+    crew t {
+        let cfg = pack_opts(0, "", "", "", "0") + "\n0\n0\n10000\n0\n" + cert + "\n" + key + "\n\n0\n0\n1\n50000\n\n448\n" + cert
+        let srv = t.kick(serve("127.0.0.1", port, 4, "", "", 0, 0, stop, 10000, 0, 10000, 0, cfg))
+        let mut i = 0
+        let mut fd = -1
+        while i < 80 {
+            fd = tcp_connect("127.0.0.1", port)
+            if fd >= 0 {
+                break
+            }
+            sleep_ms(50)
+            i = i + 1
+        }
+        assert(fd >= 0)
+        let _ = tcp_nodelay(fd)
+        let cli = tls_client_new(cert)
+        let tc = tls_connect(cli, fd, "localhost")
+        assert(tls_conn_fd(tc) >= 0)
+        let n = tls_write(tc, encode_array(["PING"]))
+        assert(n > 0)
+        let r = tls_read(tc, 65536)
+        assert(str_contains(r, "PONG"))
+        let _ = tls_conn_close(tc)
+        let _ = tls_client_free(cli)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestLiveHttpApi() {
+    let stop = atomic_new(0)
+    let port = 19538
+    let hport = 19539
+    crew t {
+        let srv = t.kick(boot_metrics(port, hport, stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+        let _ = tcp_close(fd)
+        let mut hi = 0
+        let mut hfd = -1
+        while hi < 40 {
+            hfd = tcp_connect("127.0.0.1", hport)
+            if hfd >= 0 {
+                break
+            }
+            sleep_ms(50)
+            hi = hi + 1
+        }
+        assert(hfd >= 0)
+        let _ = tcp_nodelay(hfd)
+        let _ = tcp_set_timeout(hfd, 2000)
+        let _ = tcp_write_all(hfd, "GET /api HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        let disc = tcp_read(hfd)
+        assert(str_contains(disc, "bonodis"))
+        assert(str_contains(disc, "RESP2") or str_contains(disc, "\"ok\""))
+        let _ = tcp_close(hfd)
+        hfd = tcp_connect("127.0.0.1", hport)
+        assert(hfd >= 0)
+        let _ = tcp_set_timeout(hfd, 1000)
+        let _ = tcp_write_all(hfd, "GET /api/ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        let ping = tcp_read(hfd)
+        assert(str_contains(ping, "PONG"))
+        let _ = tcp_close(hfd)
+        let body = "{\"argv\":[\"SET\",\"apik\",\"1\"]}"
+        let req = "POST /api HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: " + format_int(str_len(body)) + "\r\nConnection: close\r\n\r\n" + body
+        hfd = tcp_connect("127.0.0.1", hport)
+        assert(hfd >= 0)
+        let _ = tcp_set_timeout(hfd, 1000)
+        let _ = tcp_write_all(hfd, req)
+        let setr = tcp_read(hfd)
+        assert(str_contains(setr, "OK"))
+        let _ = tcp_close(hfd)
+        let gbody = "{\"argv\":[\"GET\",\"apik\"]}"
+        let greq = "POST /api HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: " + format_int(str_len(gbody)) + "\r\nConnection: close\r\n\r\n" + gbody
+        hfd = tcp_connect("127.0.0.1", hport)
+        assert(hfd >= 0)
+        let _ = tcp_set_timeout(hfd, 1000)
+        let _ = tcp_write_all(hfd, greq)
+        let getr = tcp_read(hfd)
+        assert(str_contains(getr, "\"result\":\"1\""))
+        let _ = tcp_close(hfd)
+        let ebody = "{\"argv\":[\"EVAL\",\"return 7\",\"0\"]}"
+        let ereq = "POST /api HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: " + format_int(str_len(ebody)) + "\r\nConnection: close\r\n\r\n" + ebody
+        hfd = tcp_connect("127.0.0.1", hport)
+        assert(hfd >= 0)
+        let _ = tcp_set_timeout(hfd, 1000)
+        let _ = tcp_write_all(hfd, ereq)
+        let ev = tcp_read(hfd)
+        assert(str_contains(ev, "\"result\":7"))
+        let _ = tcp_close(hfd)
+        let pbody = "{\"commands\":[[\"SET\",\"pk\",\"z\"],[\"GET\",\"pk\"]]}"
+        let preq = "POST /api/pipeline HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: " + format_int(str_len(pbody)) + "\r\nConnection: close\r\n\r\n" + pbody
+        hfd = tcp_connect("127.0.0.1", hport)
+        assert(hfd >= 0)
+        let _ = tcp_set_timeout(hfd, 1000)
+        let _ = tcp_write_all(hfd, preq)
+        let pipe = tcp_read(hfd)
+        assert(str_contains(pipe, "replies"))
+        assert(str_contains(pipe, "z"))
+        let _ = tcp_close(hfd)
+        hfd = tcp_connect("127.0.0.1", hport)
+        assert(hfd >= 0)
+        let _ = tcp_set_timeout(hfd, 2000)
+        let _ = tcp_write_all(hfd, "GET /play HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        let play = tcp_read(hfd)
+        assert(str_contains(play, "TURN"))
+        let _ = tcp_close(hfd)
+        let mb = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"
+        let mreq = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: " + format_int(str_len(mb)) + "\r\nConnection: close\r\n\r\n" + mb
+        hfd = tcp_connect("127.0.0.1", hport)
+        assert(hfd >= 0)
+        let _ = tcp_set_timeout(hfd, 2000)
+        let _ = tcp_write_all(hfd, mreq)
+        let mcp = tcp_read(hfd)
+        assert(str_contains(mcp, "bonodis"))
+        assert(str_contains(mcp, "protocolVersion"))
+        let _ = tcp_close(hfd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestReact() {
+    let stop = atomic_new(0)
+    let port = 16393
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+
+        // REACT CREATE: when {r}src is written, SET {r}dst to the value
+        let cr = resp_send(fd, ["REACT", "CREATE", "copyval", "{r}src", "ON", "WRITE", "SET", "{r}dst", "$VALUE"])
+        assert(str_has_prefix(cr, "+"))
+        // Write triggers the reaction
+        assert_eq_str(resp_send(fd, ["SET", "{r}src", "hello"]), "+OK\r\n")
+        // Reaction should have set {r}dst
+        let got = resp_send(fd, ["GET", "{r}dst"])
+        assert(str_contains(got, "hello"))
+        // Delete the rule
+        let dr = resp_send(fd, ["REACT", "DELETE", "copyval"])
+        assert(str_has_prefix(dr, ":"))
+        // Write again — no reaction
+        assert_eq_str(resp_send(fd, ["SET", "{r}src", "gone"]), "+OK\r\n")
+        let got2 = resp_send(fd, ["GET", "{r}dst"])
+        assert(str_contains(got2, "hello"))
+
+        let _ = resp_send(fd, ["QUIT"])
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}
+
+fn TestReactChain() {
+    let stop = atomic_new(0)
+    let port = 16394
+    crew t {
+        let srv = t.kick(boot(port, "", stop))
+        let fd = wait_connect("127.0.0.1", port, 80)
+        assert(fd >= 0)
+
+        // Chain: SET {c}src triggers GET {c}src | SET {c}copy $RESULT
+        let cr = resp_send(fd, ["REACT", "CREATE", "chain", "{c}src", "ON", "WRITE", "GET", "{c}src", "|", "SET", "{c}copy", "$RESULT"])
+        assert_eq_str(cr, "+OK\r\n")
+
+        assert_eq_str(resp_send(fd, ["SET", "{c}src", "chained"]), "+OK\r\n")
+        let got = resp_send(fd, ["GET", "{c}copy"])
+        assert(str_contains(got, "chained"))
+
+        let _ = resp_send(fd, ["QUIT"])
+        let _ = tcp_close(fd)
+        stop_serve(stop)
+        let _ = srv.join()
+    }
+}

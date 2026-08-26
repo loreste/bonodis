@@ -1,0 +1,290 @@
+pack bonodis
+
+fn csv_has(s: string, item: string) -> int {
+    if str_len(s) == 0 or str_len(item) == 0 {
+        return 0
+    }
+    let parts = str_split(s, ",")
+    let mut i = 0
+    while i < len(parts) {
+        if str_eq(parts[i], item) {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn csv_add(s: string, item: string) -> string {
+    if csv_has(s, item) == 1 {
+        return s
+    }
+    if str_len(s) == 0 {
+        return item
+    }
+    return s + "," + item
+}
+
+fn csv_del(s: string, item: string) -> string {
+    let parts = str_split(s, ",")
+    let mut out = ""
+    let mut i = 0
+    while i < len(parts) {
+        if str_len(parts[i]) > 0 and not str_eq(parts[i], item) {
+            if str_len(out) == 0 {
+                out = parts[i]
+            } else {
+                out = out + "," + parts[i]
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn pubsub_count(feed: CMap, id: string) -> int {
+    return int_of(cmap_get(feed, "ps:n:" + id))
+}
+
+fn pubsub_sub(feed: CMap, id: string, channel: string) -> int {
+    let ck = "ps:c:" + id
+    let chans = csv_add(cmap_get(feed, ck), channel)
+    cmap_set(feed, ck, chans)
+    let sk = "ps:s:" + channel
+    cmap_set(feed, sk, csv_add(cmap_get(feed, sk), id))
+    cmap_set(feed, "ps:all", csv_add(cmap_get(feed, "ps:all"), channel))
+    let parts = str_split(chans, ",")
+    let mut n = 0
+    let mut i = 0
+    while i < len(parts) {
+        if str_len(parts[i]) > 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    cmap_set(feed, "ps:n:" + id, format_int(n))
+    return n
+}
+
+fn pubsub_unsub(feed: CMap, id: string, channel: string) -> int {
+    let ck = "ps:c:" + id
+    let chans = csv_del(cmap_get(feed, ck), channel)
+    cmap_set(feed, ck, chans)
+    let sk = "ps:s:" + channel
+    cmap_set(feed, sk, csv_del(cmap_get(feed, sk), id))
+    let parts = str_split(chans, ",")
+    let mut n = 0
+    let mut i = 0
+    while i < len(parts) {
+        if str_len(parts[i]) > 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    cmap_set(feed, "ps:n:" + id, format_int(n))
+    return n
+}
+
+fn pub_message(channel: string, payload: string) -> string {
+    let b = str_builder()
+    builder_write(b, "*3\r\n")
+    builder_write(b, r_bulk("message"))
+    builder_write(b, r_bulk(channel))
+    builder_write(b, r_bulk(payload))
+    return builder_string(b)
+}
+
+fn psub_message(pat: string, channel: string, payload: string) -> string {
+    let b = str_builder()
+    builder_write(b, "*4\r\n")
+    builder_write(b, r_bulk("pmessage"))
+    builder_write(b, r_bulk(pat))
+    builder_write(b, r_bulk(channel))
+    builder_write(b, r_bulk(payload))
+    return builder_string(b)
+}
+
+fn pubsub_count_subs(feed: CMap, id: string) -> int {
+    let mut n = 0
+    let chans = str_split(cmap_get(feed, "ps:c:" + id), ",")
+    let mut i = 0
+    while i < len(chans) {
+        if str_len(chans[i]) > 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    let pats = str_split(cmap_get(feed, "ps:p:" + id), ",")
+    i = 0
+    while i < len(pats) {
+        if str_len(pats[i]) > 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn pubsub_psub(feed: CMap, id: string, pat: string) -> int {
+    let pk = "ps:p:" + id
+    cmap_set(feed, pk, csv_add(cmap_get(feed, pk), pat))
+    let plist = cmap_get(feed, "ps:plist")
+    cmap_set(feed, "ps:plist", plist + id + "\t" + pat + "\n")
+    let n = pubsub_count_subs(feed, id)
+    cmap_set(feed, "ps:n:" + id, format_int(n))
+    return n
+}
+
+fn pubsub_publish(feed: CMap, channel: string, payload: string) -> int {
+    let ids = str_split(cmap_get(feed, "ps:s:" + channel), ",")
+    let msg = pub_message(channel, payload)
+    let mut n = 0
+    let mut i = 0
+    while i < len(ids) {
+        if str_len(ids[i]) > 0 {
+            let mk = "ps:m:" + ids[i]
+            cmap_set(feed, mk, cmap_get(feed, mk) + msg)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    let plist = str_split(cmap_get(feed, "ps:plist"), "\n")
+    i = 0
+    while i < len(plist) {
+        let rec = plist[i]
+        let tab = str_index(rec, "\t")
+        if tab > 0 {
+            let pid = rec[:tab]
+            let pat = rec[tab + 1:]
+            if glob_match(pat, channel) == 1 {
+                let mk = "ps:m:" + pid
+                cmap_set(feed, mk, cmap_get(feed, mk) + psub_message(pat, channel, payload))
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn pubsub_drain(fd: int, feed: CMap, id: string, tls_on: int, tc: TlsConn) {
+    let mk = "ps:m:" + id
+    let body = cmap_get(feed, mk)
+    if str_len(body) > 0 {
+        cmap_set(feed, mk, "")
+        let _ = conn_write(fd, tls_on, tc, body)
+    }
+}
+
+fn pubsub_cmd(argv: []string, feed: CMap) -> string {
+    if len(argv) < 2 {
+        return r_arity("pubsub")
+    }
+    let sub = str_to_upper(argv[1])
+    if str_eq(sub, "CHANNELS") {
+        let chans = str_split(cmap_get(feed, "ps:all"), ",")
+        let mut out = make([]string, 0, len(chans))
+        let mut i = 0
+        while i < len(chans) {
+            if str_len(chans[i]) > 0 {
+                out = append(out, chans[i])
+            }
+            i = i + 1
+        }
+        return r_array_bulks(out)
+    }
+    if str_eq(sub, "NUMSUB") {
+        let mut items = make([]string, 0, 8)
+        let mut i = 2
+        while i < len(argv) {
+            items = append(items, argv[i])
+            let ids = str_split(cmap_get(feed, "ps:s:" + argv[i]), ",")
+            let mut n = 0
+            let mut j = 0
+            while j < len(ids) {
+                if str_len(ids[j]) > 0 {
+                    n = n + 1
+                }
+                j = j + 1
+            }
+            items = append(items, format_int(n))
+            i = i + 1
+        }
+        return r_array_bulks(items)
+    }
+    if str_eq(sub, "NUMPAT") {
+        let plist = str_split(cmap_get(feed, "ps:plist"), "\n")
+        let mut n = 0
+        let mut i = 0
+        while i < len(plist) {
+            if str_len(plist[i]) > 2 {
+                n = n + 1
+            }
+            i = i + 1
+        }
+        return r_int(n)
+    }
+    return r_err("ERR unknown PUBSUB subcommand")
+}
+
+fn sub_reply(kind: string, chan: string, n: int) -> string {
+    let b = str_builder()
+    builder_write(b, "*3\r\n")
+    builder_write(b, r_bulk(kind))
+    builder_write(b, r_bulk(chan))
+    builder_write(b, r_int(n))
+    return builder_string(b)
+}
+
+fn monitor_on(feed: CMap, id: string) -> int {
+    if str_eq(cmap_get(feed, "mon:" + id), "1") {
+        return 1
+    }
+    return 0
+}
+
+fn monitor_line(db: int, conn_id: int, argv: []string) -> string {
+    let b = str_builder()
+    builder_write(b, "+")
+    builder_write(b, format_int(wall_ms() / 1000))
+    builder_write(b, ".000000 [")
+    builder_write(b, format_int(db))
+    builder_write(b, " id=")
+    builder_write(b, format_int(conn_id))
+    builder_write(b, "]")
+    let mut i = 0
+    while i < len(argv) {
+        builder_write(b, " \"")
+        builder_write(b, argv[i])
+        builder_write(b, "\"")
+        i = i + 1
+    }
+    builder_write(b, "\r\n")
+    return builder_string(b)
+}
+
+fn monitor_fanout(feed: CMap, db: int, conn_id: int, argv: []string) {
+    let ids = cmap_get(feed, "monids")
+    if str_len(ids) == 0 {
+        return
+    }
+    let line = monitor_line(db, conn_id, argv)
+    let parts = str_split(ids, ",")
+    let mut i = 0
+    while i < len(parts) {
+        if str_len(parts[i]) > 0 {
+            let mk = "monm:" + parts[i]
+            cmap_set(feed, mk, cmap_get(feed, mk) + line)
+        }
+        i = i + 1
+    }
+}
+
+fn monitor_drain(fd: int, feed: CMap, id: string, tls_on: int, tc: TlsConn) {
+    let mk = "monm:" + id
+    let body = cmap_get(feed, mk)
+    if str_len(body) > 0 {
+        cmap_set(feed, mk, "")
+        let _ = conn_write(fd, tls_on, tc, body)
+    }
+}

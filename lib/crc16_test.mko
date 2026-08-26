@@ -1,0 +1,30 @@
+fn TestOsSupported() {
+    assert(os_supported() == 1)
+    let s = os_name()
+    assert(str_eq(s, "Darwin") or str_eq(s, "Linux"))
+}
+
+fn TestCrc16Xmodem() {
+    assert_eq(crc16("123456789"), 12739)
+}
+
+fn TestKeyslotFoo() {
+    assert_eq(key_slot("foo"), 12182)
+}
+
+fn TestHashTag() {
+    assert_eq(key_slot("{user}.profile"), key_slot("{user}.posts"))
+    assert(key_slot("{user}.profile") != key_slot("user.profile"))
+}
+
+fn TestShardStable() {
+    assert_eq(key_shard("foo", 16), key_slot("foo") % 16)
+}
+
+fn TestCrc16RangeHashtag() {
+    assert_eq(crc16_range("foo", 0, 3), crc16("foo"))
+    let a, b = hash_tag_span("{user}.profile")
+    assert_eq(a, 1)
+    assert_eq(b, 5)
+    assert_eq(key_slot("{user}.profile"), key_slot("user"))
+}

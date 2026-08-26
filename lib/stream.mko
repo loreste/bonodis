@@ -1,0 +1,1035 @@
+pack bonodis
+
+fn Store_cmd_xadd(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 5 or (len(argv) % 2) == 0 {
+        return r_arity("xadd")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t != T_NONE and t != T_STREAM {
+        return r_wrongtype()
+    }
+    if t == T_NONE {
+        self.streams[ik] = make([]string, 0, 4)
+        self.types[ik] = T_STREAM
+        self.xseq[ik] = 0
+    }
+    let mut seq = 0
+    if has(self.xseq, ik) {
+        seq = self.xseq[ik]
+    }
+    seq = seq + 1
+    self.xseq[ik] = seq
+    let mut id = format_int(wall_ms()) + "-" + format_int(seq)
+    if not str_eq(argv[2], "*") {
+        id = argv[2]
+    }
+    let mut rec = id
+    let mut i = 3
+    while i + 1 < len(argv) {
+        rec = rec + "\u001f" + argv[i] + "\u001f" + argv[i + 1]
+        i = i + 2
+    }
+    let mut xs = self.streams[ik]
+    xs = append(xs, rec)
+    self.streams[ik] = xs
+    return r_bulk(id)
+}
+
+fn Store_cmd_xlen(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("xlen")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_STREAM {
+        return r_wrongtype()
+    }
+    return r_int(len(self.streams[ik]))
+}
+
+fn xrange_cmp(a: string, b: string) -> int {
+    // returns -1, 0, 1
+    let da = str_index(a, "-")
+    let db2 = str_index(b, "-")
+    let mut ma = int_of(a)
+    let mut sa = 0
+    let mut mb = int_of(b)
+    let mut sb = 0
+    if da > 0 {
+        ma = int_of(a[:da])
+        sa = int_of(a[da + 1:])
+    }
+    if db2 > 0 {
+        mb = int_of(b[:db2])
+        sb = int_of(b[db2 + 1:])
+    }
+    if ma < mb {
+        return 0 - 1
+    }
+    if ma > mb {
+        return 1
+    }
+    if sa < sb {
+        return 0 - 1
+    }
+    if sa > sb {
+        return 1
+    }
+    return 0
+}
+
+fn xrange_match(rec: string, start: string, endid: string) -> int {
+    let sep = str_index(rec, "\u001f")
+    let mut id = rec
+    if sep > 0 {
+        id = rec[:sep]
+    }
+    if str_len(id) == 0 {
+        return 0
+    }
+    if not str_eq(start, "-") {
+        if xrange_cmp(id, start) < 0 {
+            return 0
+        }
+    }
+    if not str_eq(endid, "+") {
+        if xrange_cmp(id, endid) > 0 {
+            return 0
+        }
+    }
+    return 1
+}
+
+fn Store_cmd_xrange(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("xrange")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        let none: []string = []
+        return r_array_bulks(none)
+    }
+    if t != T_STREAM {
+        return r_wrongtype()
+    }
+    let xs = self.streams[ik]
+    let start = argv[2]
+    let endid = argv[3]
+    // two-pass: count then emit (avoid intermediate array)
+    let mut cnt = 0
+    let mut i = 0
+    while i < len(xs) {
+        if xrange_match(xs[i], start, endid) == 1 {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(cnt))
+    builder_write(b, "\r\n")
+    i = 0
+    while i < len(xs) {
+        if xrange_match(xs[i], start, endid) == 1 {
+            let parts = str_split(xs[i], "\u001f")
+            builder_write(b, "*2\r\n")
+            builder_write(b, r_bulk(parts[0]))
+            let mut rest = make([]string, 0, 4)
+            let mut j = 1
+            while j < len(parts) {
+                rest = append(rest, parts[j])
+                j = j + 1
+            }
+            builder_write(b, r_array_bulks(rest))
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn Store_cmd_xread(mut self: Store, db: int, argv: []string) -> string {
+    // XREAD STREAMS key id
+    let mut ki = -1
+    let mut i = 1
+    while i < len(argv) {
+        if str_eq(str_to_upper(argv[i]), "STREAMS") {
+            ki = i + 1
+            break
+        }
+        i = i + 1
+    }
+    if ki < 0 or ki >= len(argv) {
+        return r_syntax()
+    }
+    return self.cmd_xrange(db, ["XRANGE", argv[ki], "-", "+"])
+}
+
+fn Store_cmd_xdel(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("xdel")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_STREAM {
+        return r_wrongtype()
+    }
+    let xs = self.streams[ik]
+    let mut out = make([]string, 0, len(xs))
+    let mut n = 0
+    let mut i = 0
+    while i < len(xs) {
+        let rec = xs[i]
+        let parts = str_split(rec, "\u001f")
+        let mut keep = 1
+        let mut j = 2
+        while j < len(argv) {
+            if str_eq(parts[0], argv[j]) {
+                keep = 0
+            }
+            j = j + 1
+        }
+        if keep == 1 {
+            out = append(out, rec)
+        } else {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if len(out) == 0 {
+        let _ = self.drop_key(ik)
+    } else {
+        self.streams[ik] = out
+    }
+    return r_int(n)
+}
+
+fn Store_cmd_xrevrange(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("xrevrange")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        let none: []string = []
+        return r_array_bulks(none)
+    }
+    if t != T_STREAM {
+        return r_wrongtype()
+    }
+    let xs = self.streams[ik]
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(len(xs)))
+    builder_write(b, "\r\n")
+    let mut i = len(xs) - 1
+    while i >= 0 {
+        let rec = xs[i]
+        let parts = str_split(rec, "\u001f")
+        builder_write(b, "*2\r\n")
+        builder_write(b, r_bulk(parts[0]))
+        let mut rest = make([]string, 0, 4)
+        let mut j = 1
+        while j < len(parts) {
+            rest = append(rest, parts[j])
+            j = j + 1
+        }
+        builder_write(b, r_array_bulks(rest))
+        i = i - 1
+    }
+    return builder_string(b)
+}
+
+fn Store_cmd_xtrim(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("xtrim")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_STREAM {
+        return r_wrongtype()
+    }
+    let mut maxlen = -1
+    let mut i = 2
+    while i + 1 < len(argv) {
+        if str_eq(str_to_upper(argv[i]), "MAXLEN") {
+            maxlen = int_of(argv[i + 1])
+        }
+        i = i + 1
+    }
+    if maxlen < 0 {
+        return r_syntax()
+    }
+    let xs = self.streams[ik]
+    if len(xs) <= maxlen {
+        return r_int(0)
+    }
+    let dropn = len(xs) - maxlen
+    let mut out = make([]string, 0, maxlen)
+    i = dropn
+    while i < len(xs) {
+        out = append(out, xs[i])
+        i = i + 1
+    }
+    self.streams[ik] = out
+    return r_int(dropn)
+}
+
+fn xg_slot(ik: string, group: string) -> string {
+    return ik + "\u001e" + group
+}
+
+fn xid_gt(a: string, b: string) -> int {
+    if str_eq(b, "0-0") or str_eq(b, "-") or str_eq(b, "") {
+        if str_len(a) > 0 {
+            return 1
+        }
+        return 0
+    }
+    if str_eq(a, b) {
+        return 0
+    }
+    let da = str_index(a, "-")
+    let db = str_index(b, "-")
+    let mut ma = int_of(a)
+    let mut sa = 0
+    let mut mb = int_of(b)
+    let mut sb = 0
+    if da > 0 {
+        ma = int_of(a[:da])
+        sa = int_of(a[da + 1:])
+    }
+    if db > 0 {
+        mb = int_of(b[:db])
+        sb = int_of(b[db + 1:])
+    }
+    if ma > mb {
+        return 1
+    }
+    if ma < mb {
+        return 0
+    }
+    if sa > sb {
+        return 1
+    }
+    return 0
+}
+
+fn stream_last_id(xs: []string) -> string {
+    if len(xs) == 0 {
+        return "0-0"
+    }
+    let rec = xs[len(xs) - 1]
+    let parts = str_split(rec, "\u001f")
+    if len(parts) == 0 {
+        return "0-0"
+    }
+    return parts[0]
+}
+
+fn xid_gte(a: string, b: string) -> int {
+    if str_eq(a, b) {
+        return 1
+    }
+    return xid_gt(a, b)
+}
+
+fn xid_lte(a: string, b: string) -> int {
+    if str_eq(a, b) {
+        return 1
+    }
+    return xid_gt(b, a)
+}
+
+fn stream_find(xs: []string, id: string) -> string {
+    let mut i = 0
+    while i < len(xs) {
+        let parts = str_split(xs[i], "\u001f")
+        if len(parts) > 0 {
+            if str_eq(parts[0], id) {
+                return xs[i]
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn stream_entry_resp(rec: string) -> string {
+    let parts = str_split(rec, "\u001f")
+    let b = str_builder()
+    builder_write(b, "*2\r\n")
+    if len(parts) == 0 {
+        builder_write(b, r_bulk(""))
+        let none: []string = []
+        builder_write(b, r_array_bulks(none))
+        return builder_string(b)
+    }
+    builder_write(b, r_bulk(parts[0]))
+    let mut rest = make([]string, 0, 4)
+    let mut j = 1
+    while j < len(parts) {
+        rest = append(rest, parts[j])
+        j = j + 1
+    }
+    builder_write(b, r_array_bulks(rest))
+    return builder_string(b)
+}
+
+fn pel_rec(id: string, consumer: string, ms: int, n: int) -> string {
+    return id + "\u001e" + consumer + "\u001e" + format_int(ms) + "\u001e" + format_int(n)
+}
+
+fn pel_id(rec: string) -> string {
+    let p = str_split(rec, "\u001e")
+    if len(p) == 0 {
+        return rec
+    }
+    return p[0]
+}
+
+fn pel_consumer(rec: string) -> string {
+    let p = str_split(rec, "\u001e")
+    if len(p) < 2 {
+        return ""
+    }
+    return p[1]
+}
+
+fn pel_ms(rec: string) -> int {
+    let p = str_split(rec, "\u001e")
+    if len(p) < 3 {
+        return 0
+    }
+    return int_of(p[2])
+}
+
+fn pel_n(rec: string) -> int {
+    let p = str_split(rec, "\u001e")
+    if len(p) < 4 {
+        return 1
+    }
+    let n = int_of(p[3])
+    if n < 1 {
+        return 1
+    }
+    return n
+}
+
+fn pel_rows(blob: string) -> []string {
+    let mut out = make([]string, 0, 4)
+    if str_len(blob) == 0 {
+        return out
+    }
+    if str_index(blob, "\u001e") < 0 {
+        let parts = str_split(blob, ",")
+        let mut i = 0
+        while i < len(parts) {
+            if str_len(parts[i]) > 0 {
+                out = append(out, pel_rec(parts[i], "", 0, 1))
+            }
+            i = i + 1
+        }
+        return out
+    }
+    let parts = str_split(blob, "\n")
+    let mut i = 0
+    while i < len(parts) {
+        if str_len(parts[i]) > 0 {
+            out = append(out, parts[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn pel_join(rows: []string) -> string {
+    let b = str_builder()
+    let mut first = 1
+    let mut i = 0
+    while i < len(rows) {
+        if str_len(rows[i]) > 0 {
+            if first == 0 {
+                builder_write(b, "\n")
+            }
+            builder_write(b, rows[i])
+            first = 0
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn pel_find(rows: []string, id: string) -> int {
+    let mut i = 0
+    while i < len(rows) {
+        if str_eq(pel_id(rows[i]), id) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn Store_cmd_xgroup(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("xgroup")
+    }
+    let sub = str_to_upper(argv[1])
+    let ik = ikey(db, argv[2])
+    if str_eq(sub, "CREATE") {
+        if len(argv) < 5 {
+            return r_arity("xgroup")
+        }
+        if self.kind(ik) != T_STREAM and self.kind(ik) != T_NONE {
+            return r_wrongtype()
+        }
+        if self.kind(ik) == T_NONE {
+            self.streams[ik] = make([]string, 0, 0)
+            self.types[ik] = T_STREAM
+            self.xseq[ik] = 0
+        }
+        let slot = xg_slot(ik, argv[3])
+        if has(self.xg, slot) {
+            return r_err("BUSYGROUP Consumer Group name already exists")
+        }
+        let mut last = "0-0"
+        if str_eq(argv[4], "$") {
+            last = stream_last_id(self.streams[ik])
+        } else {
+            last = argv[4]
+        }
+        self.xg[slot] = last
+        self.xp[slot] = ""
+        return r_ok()
+    }
+    if str_eq(sub, "DESTROY") {
+        let slot = xg_slot(ik, argv[3])
+        if not has(self.xg, slot) {
+            return r_int(0)
+        }
+        delete(self.xg, slot)
+        delete(self.xp, slot)
+        return r_int(1)
+    }
+    if str_eq(sub, "SETID") {
+        if len(argv) < 5 {
+            return r_arity("xgroup")
+        }
+        let slot = xg_slot(ik, argv[3])
+        if not has(self.xg, slot) {
+            return r_err("NOGROUP No such consumer group")
+        }
+        let mut last = argv[4]
+        if str_eq(last, "$") {
+            last = stream_last_id(self.streams[ik])
+        }
+        self.xg[slot] = last
+        return r_ok()
+    }
+    return r_err("ERR unknown XGROUP subcommand")
+}
+
+fn Store_cmd_xreadgroup(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 6 {
+        return r_arity("xreadgroup")
+    }
+    let mut group = ""
+    let mut consumer = ""
+    let mut count = 10
+    let mut noack = 0
+    let mut ki = -1
+    let mut i = 1
+    while i < len(argv) {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "GROUP") and i + 2 < len(argv) {
+            group = argv[i + 1]
+            consumer = argv[i + 2]
+            i = i + 3
+        } else if str_eq(o, "COUNT") and i + 1 < len(argv) {
+            count = int_of(argv[i + 1])
+            i = i + 2
+        } else if str_eq(o, "NOACK") {
+            noack = 1
+            i = i + 1
+        } else if str_eq(o, "STREAMS") {
+            ki = i + 1
+            break
+        } else {
+            i = i + 1
+        }
+    }
+    if ki < 0 or ki >= len(argv) or str_len(group) == 0 or str_len(consumer) == 0 {
+        return r_syntax()
+    }
+    if count < 1 {
+        count = 10
+    }
+    let key = argv[ki]
+    let mut sid = ">"
+    if ki + 1 < len(argv) {
+        sid = argv[ki + 1]
+    }
+    let ik = ikey(db, key)
+    if self.kind(ik) != T_STREAM {
+        return r_nil()
+    }
+    let slot = xg_slot(ik, group)
+    if not has(self.xg, slot) {
+        return r_err("NOGROUP No such consumer group")
+    }
+    let now = wall_ms()
+    let b = str_builder()
+    let mut body = str_builder()
+    let mut nent = 0
+    if str_eq(sid, ">") {
+        let last = self.xg[slot]
+        let xs = self.streams[ik]
+        let mut last_seen = last
+        let mut rows = pel_rows(self.xp[slot])
+        i = 0
+        while i < len(xs) and nent < count {
+            let rec = xs[i]
+            let parts = str_split(rec, "\u001f")
+            let id = parts[0]
+            if xid_gt(id, last) == 1 {
+                builder_write(body, stream_entry_resp(rec))
+                nent = nent + 1
+                last_seen = id
+                if noack == 0 {
+                    let idx = pel_find(rows, id)
+                    if idx < 0 {
+                        rows = append(rows, pel_rec(id, consumer, now, 1))
+                    } else {
+                        rows[idx] = pel_rec(id, consumer, now, pel_n(rows[idx]) + 1)
+                    }
+                }
+            }
+            i = i + 1
+        }
+        if nent == 0 {
+            return r_nil()
+        }
+        self.xg[slot] = last_seen
+        if noack == 0 {
+            self.xp[slot] = pel_join(rows)
+        }
+    } else {
+        let rows = pel_rows(self.xp[slot])
+        i = 0
+        while i < len(rows) and nent < count {
+            let id = pel_id(rows[i])
+            if str_eq(pel_consumer(rows[i]), consumer) and xid_gt(id, sid) == 1 {
+                let rec = stream_find(self.streams[ik], id)
+                if str_len(rec) > 0 {
+                    builder_write(body, stream_entry_resp(rec))
+                    nent = nent + 1
+                }
+            }
+            i = i + 1
+        }
+        if nent == 0 {
+            return r_nil()
+        }
+    }
+    builder_write(b, "*1\r\n*2\r\n")
+    builder_write(b, r_bulk(key))
+    builder_write(b, "*")
+    builder_write(b, format_int(nent))
+    builder_write(b, "\r\n")
+    builder_write(b, builder_string(body))
+    return builder_string(b)
+}
+
+fn Store_cmd_xack(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("xack")
+    }
+    let ik = ikey(db, argv[1])
+    let slot = xg_slot(ik, argv[2])
+    if not has(self.xp, slot) {
+        return r_int(0)
+    }
+    let mut rows = pel_rows(self.xp[slot])
+    let mut n = 0
+    let mut i = 3
+    while i < len(argv) {
+        let idx = pel_find(rows, argv[i])
+        if idx >= 0 {
+            rows[idx] = ""
+            n = n + 1
+        }
+        i = i + 1
+    }
+    self.xp[slot] = pel_join(rows)
+    return r_int(n)
+}
+
+fn Store_cmd_xpending(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("xpending")
+    }
+    let ik = ikey(db, argv[1])
+    let slot = xg_slot(ik, argv[2])
+    if not has(self.xg, slot) {
+        return r_err("NOGROUP No such consumer group")
+    }
+    let rows = pel_rows(self.xp[slot])
+    let now = wall_ms()
+    if len(argv) == 3 {
+        let mut n = 0
+        let mut minid = ""
+        let mut maxid = ""
+        let mut counts = make(map[string]int)
+        let mut i = 0
+        while i < len(rows) {
+            let id = pel_id(rows[i])
+            let c = pel_consumer(rows[i])
+            n = n + 1
+            if str_eq(minid, "") or xid_gt(minid, id) == 1 {
+                minid = id
+            }
+            if str_eq(maxid, "") or xid_gt(id, maxid) == 1 {
+                maxid = id
+            }
+            if has(counts, c) {
+                counts[c] = counts[c] + 1
+            } else {
+                counts[c] = 1
+            }
+            i = i + 1
+        }
+        let b = str_builder()
+        builder_write(b, "*4\r\n")
+        builder_write(b, r_int(n))
+        if n == 0 {
+            builder_write(b, r_nil())
+            builder_write(b, r_nil())
+            builder_write(b, "*0\r\n")
+            return builder_string(b)
+        }
+        builder_write(b, r_bulk(minid))
+        builder_write(b, r_bulk(maxid))
+        let mut nc = 0
+        let cb = str_builder()
+        for name, cnt in range counts {
+            builder_write(cb, "*2\r\n")
+            builder_write(cb, r_bulk(name))
+            builder_write(cb, r_bulk(format_int(cnt)))
+            nc = nc + 1
+        }
+        builder_write(b, "*")
+        builder_write(b, format_int(nc))
+        builder_write(b, "\r\n")
+        builder_write(b, builder_string(cb))
+        return builder_string(b)
+    }
+    if len(argv) < 6 {
+        return r_syntax()
+    }
+    let start = argv[3]
+    let end = argv[4]
+    let mut take = int_of(argv[5])
+    let mut cons = ""
+    if len(argv) >= 7 {
+        cons = argv[6]
+    }
+    if take < 0 {
+        take = 0
+    }
+    let b = str_builder()
+    let mut body = str_builder()
+    let mut n = 0
+    let mut i = 0
+    while i < len(rows) and n < take {
+        let id = pel_id(rows[i])
+        let c = pel_consumer(rows[i])
+        let mut okstart = 0
+        if str_eq(start, "-") {
+            okstart = 1
+        } else if xid_gte(id, start) == 1 {
+            okstart = 1
+        }
+        let mut okend = 0
+        if str_eq(end, "+") {
+            okend = 1
+        } else if xid_lte(id, end) == 1 {
+            okend = 1
+        }
+        let mut okc = 0
+        if str_len(cons) == 0 or str_eq(c, cons) {
+            okc = 1
+        }
+        if okstart == 1 and okend == 1 and okc == 1 {
+            builder_write(body, "*4\r\n")
+            builder_write(body, r_bulk(id))
+            builder_write(body, r_bulk(c))
+            let mut idle = now - pel_ms(rows[i])
+            if idle < 0 {
+                idle = 0
+            }
+            builder_write(body, r_int(idle))
+            builder_write(body, r_int(pel_n(rows[i])))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    builder_write(b, "*")
+    builder_write(b, format_int(n))
+    builder_write(b, "\r\n")
+    builder_write(b, builder_string(body))
+    return builder_string(b)
+}
+
+fn Store_cmd_xclaim(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 6 {
+        return r_arity("xclaim")
+    }
+    let ik = ikey(db, argv[1])
+    let group = argv[2]
+    let consumer = argv[3]
+    let minidle = int_of(argv[4])
+    let slot = xg_slot(ik, group)
+    if not has(self.xg, slot) {
+        return r_err("NOGROUP No such consumer group")
+    }
+    let mut force = 0
+    let mut justid = 0
+    let mut idle_set = 0
+    let mut idle_ms = 0
+    let mut time_ms = wall_ms()
+    let mut retry = 0 - 1
+    let mut ids = make([]string, 0, 4)
+    let mut i = 5
+    while i < len(argv) {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "IDLE") and i + 1 < len(argv) {
+            idle_ms = int_of(argv[i + 1])
+            idle_set = 1
+            i = i + 2
+        } else if str_eq(o, "TIME") and i + 1 < len(argv) {
+            time_ms = int_of(argv[i + 1])
+            i = i + 2
+        } else if str_eq(o, "RETRYCOUNT") and i + 1 < len(argv) {
+            retry = int_of(argv[i + 1])
+            i = i + 2
+        } else if str_eq(o, "FORCE") {
+            force = 1
+            i = i + 1
+        } else if str_eq(o, "JUSTID") {
+            justid = 1
+            i = i + 1
+        } else if str_eq(o, "LASTID") and i + 1 < len(argv) {
+            i = i + 2
+        } else {
+            ids = append(ids, argv[i])
+            i = i + 1
+        }
+    }
+    let now = wall_ms()
+    let mut deliv = time_ms
+    if idle_set == 1 {
+        deliv = now - idle_ms
+        if deliv < 0 {
+            deliv = 0
+        }
+    }
+    let mut rows = pel_rows(self.xp[slot])
+    let b = str_builder()
+    let mut body = str_builder()
+    let mut nent = 0
+    i = 0
+    while i < len(ids) {
+        let id = ids[i]
+        let idx = pel_find(rows, id)
+        let mut rec = ""
+        if idx >= 0 {
+            let mut idle = now - pel_ms(rows[idx])
+            if idle < 0 {
+                idle = 0
+            }
+            if idle >= minidle or force == 1 {
+                rec = stream_find(self.streams[ik], id)
+                if str_len(rec) > 0 {
+                    let mut dn = pel_n(rows[idx]) + 1
+                    if retry >= 0 {
+                        dn = retry
+                    }
+                    rows[idx] = pel_rec(id, consumer, deliv, dn)
+                }
+            }
+        } else if force == 1 {
+            rec = stream_find(self.streams[ik], id)
+            if str_len(rec) > 0 {
+                let mut dn = 1
+                if retry >= 0 {
+                    dn = retry
+                }
+                rows = append(rows, pel_rec(id, consumer, deliv, dn))
+            }
+        }
+        if str_len(rec) > 0 {
+            if justid == 1 {
+                builder_write(body, r_bulk(id))
+            } else {
+                builder_write(body, stream_entry_resp(rec))
+            }
+            nent = nent + 1
+        }
+        i = i + 1
+    }
+    self.xp[slot] = pel_join(rows)
+    builder_write(b, "*")
+    builder_write(b, format_int(nent))
+    builder_write(b, "\r\n")
+    builder_write(b, builder_string(body))
+    return builder_string(b)
+}
+
+fn Store_cmd_xautoclaim(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 6 {
+        return r_arity("xautoclaim")
+    }
+    let ik = ikey(db, argv[1])
+    let group = argv[2]
+    let consumer = argv[3]
+    let minidle = int_of(argv[4])
+    let start = argv[5]
+    let mut count = 100
+    let mut justid = 0
+    let mut i = 6
+    while i < len(argv) {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "COUNT") and i + 1 < len(argv) {
+            count = int_of(argv[i + 1])
+            i = i + 2
+        } else if str_eq(o, "JUSTID") {
+            justid = 1
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+    if count < 1 {
+        count = 100
+    }
+    let slot = xg_slot(ik, group)
+    if not has(self.xg, slot) {
+        return r_err("NOGROUP No such consumer group")
+    }
+    let now = wall_ms()
+    let mut rows = pel_rows(self.xp[slot])
+    let mut body = str_builder()
+    let mut nent = 0
+    let mut next = "0-0"
+    i = 0
+    while i < len(rows) {
+        let id = pel_id(rows[i])
+        let mut idle = now - pel_ms(rows[i])
+        if idle < 0 {
+            idle = 0
+        }
+        let mut after = 0
+        if str_eq(start, "0-0") or str_eq(start, "-") or xid_gte(id, start) == 1 {
+            after = 1
+        }
+        if after == 1 and idle >= minidle {
+            if nent >= count {
+                next = id
+                break
+            }
+            let rec = stream_find(self.streams[ik], id)
+            if str_len(rec) > 0 {
+                rows[i] = pel_rec(id, consumer, now, pel_n(rows[i]) + 1)
+                if justid == 1 {
+                    builder_write(body, r_bulk(id))
+                } else {
+                    builder_write(body, stream_entry_resp(rec))
+                }
+                nent = nent + 1
+                next = "0-0"
+            }
+        }
+        i = i + 1
+    }
+    self.xp[slot] = pel_join(rows)
+    let b = str_builder()
+    builder_write(b, "*2\r\n")
+    builder_write(b, r_bulk(next))
+    builder_write(b, "*")
+    builder_write(b, format_int(nent))
+    builder_write(b, "\r\n")
+    builder_write(b, builder_string(body))
+    return builder_string(b)
+}
+
+fn Store_cmd_xinfo(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("xinfo")
+    }
+    let sub = str_to_upper(argv[1])
+    let ik = ikey(db, argv[2])
+    if str_eq(sub, "STREAM") {
+        let mut items = make([]string, 0, 4)
+        items = append(items, "length")
+        if self.kind(ik) == T_STREAM {
+            items = append(items, format_int(len(self.streams[ik])))
+            items = append(items, "last-generated-id")
+            items = append(items, stream_last_id(self.streams[ik]))
+        } else {
+            items = append(items, "0")
+            items = append(items, "last-generated-id")
+            items = append(items, "0-0")
+        }
+        return r_array_bulks(items)
+    }
+    if str_eq(sub, "GROUPS") {
+        let pref = ik + "\u001e"
+        let mut lines = make([]string, 0, 4)
+        for gk, last in range self.xg {
+            if str_has_prefix(gk, pref) {
+                let gname = gk[str_len(pref):]
+                let mut npend = 0
+                if has(self.xp, gk) {
+                    npend = len(pel_rows(self.xp[gk]))
+                }
+                lines = append(lines, gname + " " + last + " " + format_int(npend))
+            }
+        }
+        return r_array_bulks(lines)
+    }
+    if str_eq(sub, "CONSUMERS") {
+        if len(argv) < 4 {
+            return r_arity("xinfo")
+        }
+        let slot = xg_slot(ik, argv[3])
+        let rows = pel_rows(self.xp[slot])
+        let mut counts = make(map[string]int)
+        let mut i = 0
+        while i < len(rows) {
+            let c = pel_consumer(rows[i])
+            if has(counts, c) {
+                counts[c] = counts[c] + 1
+            } else {
+                counts[c] = 1
+            }
+            i = i + 1
+        }
+        let mut lines = make([]string, 0, 4)
+        for name, cnt in range counts {
+            lines = append(lines, name + " " + format_int(cnt))
+        }
+        return r_array_bulks(lines)
+    }
+    return r_err("ERR unknown XINFO subcommand")
+}

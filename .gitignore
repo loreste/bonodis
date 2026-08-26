@@ -1,0 +1,13 @@
+/bonodis
+/bonodis-cli
+/bonodis-server
+**/.mako/
+**/*.dSYM/
+*.o
+.DS_Store
+appendonly.aof
+data/
+dump.bonodis
+nodes.conf
+.claude/
+tmp/

@@ -1,0 +1,16 @@
+[Unit]
+Description=Bonodis Redis-protocol store
+After=network.target
+
+[Service]
+Type=simple
+User=bonodis
+Group=bonodis
+ExecStart=/usr/local/bin/bonodis --prod --bind 0.0.0.0 --port 6379 --dir /var/lib/bonodis --appendonly yes --appendfsync everysec --maxmemory 268435456 --requirepass CHANGE_ME --protected-mode yes --log-level info --maxclients 50000 --accept-threads 4 --accept-rate 50000
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

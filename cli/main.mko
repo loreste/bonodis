@@ -1,0 +1,596 @@
+pack main
+
+fn usage() {
+    print("bonodis-cli — RESP2 client (Mako)")
+    print("Usage: bonodis-cli [-h HOST] [-p PORT] [-s SOCKET] [-a PASS] [-u USER] [--tls] [--tls-ca PATH] [CMD args...]")
+    print("       bonodis-cli --cluster create [--replicas N] host:port [host:port ...]")
+    print("       bonodis-cli --cluster add-node new:port existing:port [--slave]")
+    print("Platforms: linux, macOS")
+}
+
+fn require_unix() {
+    let s = syscall_uname_sysname()
+    if str_eq(s, "Darwin") or str_eq(s, "Linux") {
+        return
+    }
+    print("bonodis-cli: linux and macOS only (this is " + s + ")")
+    exit(1)
+}
+
+fn bulk(s: string) -> string {
+    return "$" + format_int(str_len(s)) + "\r\n" + s + "\r\n"
+}
+
+fn encode(argv: []string) -> string {
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(len(argv)))
+    builder_write(b, "\r\n")
+    let mut i = 0
+    while i < len(argv) {
+        builder_write(b, bulk(argv[i]))
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn tls_write_all(tc: TlsConn, s: string) -> int {
+    let mut off = 0
+    let n = str_len(s)
+    while off < n {
+        let w = tls_write(tc, s[off:])
+        if w <= 0 {
+            return -1
+        }
+        off = off + w
+    }
+    return n
+}
+
+fn send(fd: int, argv: []string) -> string {
+    let n = tcp_write_all(fd, encode(argv))
+    if n < 0 {
+        return ""
+    }
+    return tcp_read(fd)
+}
+
+fn send_tls(tc: TlsConn, argv: []string) -> string {
+    let n = tls_write_all(tc, encode(argv))
+    if n < 0 {
+        return ""
+    }
+    return tls_read(tc, 65536)
+}
+
+fn last_colon(s: string) -> int {
+    let mut i = str_len(s) - 1
+    while i >= 0 {
+        if str_byte_at(s, i) == 58 {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+fn parse_addr(s: string) -> (string, int) {
+    let c = last_colon(s)
+    if c <= 0 {
+        return (s, 6379)
+    }
+    let mut p = 0
+    match parse_int(s[c + 1:]) {
+        Ok(n) => {
+            p = n
+        },
+        Err(_) => {
+            p = 6379
+        },
+    }
+    return (s[:c], p)
+}
+
+fn crlf_at(s: string) -> int {
+    let n = str_len(s)
+    let mut i = 0
+    while i + 1 < n {
+        if str_byte_at(s, i) == 13 and str_byte_at(s, i + 1) == 10 {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn bulk_str(r: string) -> string {
+    if str_len(r) == 0 or str_byte_at(r, 0) != 36 {
+        return r
+    }
+    let cr = crlf_at(r)
+    if cr < 2 {
+        return ""
+    }
+    let mut ln = 0
+    match parse_int(r[1:cr]) {
+        Ok(n) => {
+            ln = n
+        },
+        Err(_) => {
+            return ""
+        },
+    }
+    if ln <= 0 {
+        return ""
+    }
+    let start = cr + 2
+    if start + ln > str_len(r) {
+        return r[start:]
+    }
+    return r[start:start + ln]
+}
+
+fn ok_reply(r: string) -> int {
+    if str_has_prefix(r, "+OK") {
+        return 1
+    }
+    return 0
+}
+
+fn split_slots(n: int) -> []string {
+    let none: []string = []
+    if n <= 0 {
+        return none
+    }
+    let total = 16384
+    let base = total / n
+    let extra = total % n
+    let mut out = make([]string, 0, n)
+    let mut start = 0
+    let mut i = 0
+    while i < n {
+        let mut sz = base
+        if i < extra {
+            sz = sz + 1
+        }
+        let stop = start + sz - 1
+        out = append(out, format_int(start) + "-" + format_int(stop))
+        start = stop + 1
+        i = i + 1
+    }
+    return out
+}
+
+fn count_node_lines(blob: string) -> int {
+    let lines = str_split(blob, "\n")
+    let mut c = 0
+    let mut i = 0
+    while i < len(lines) {
+        if str_len(lines[i]) > 5 {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+fn wait_n_nodes(host: string, port: int, want: int) -> int {
+    let mut n = 0
+    while n < 80 {
+        let r = send_to(host, port, ["CLUSTER", "NODES"])
+        if count_node_lines(bulk_str(r)) >= want {
+            return 1
+        }
+        sleep_ms(50)
+        n = n + 1
+    }
+    return 0
+}
+
+fn send_to(host: string, port: int, argv: []string) -> string {
+    let fd = tcp_connect(host, port)
+    if fd < 0 {
+        return ""
+    }
+    let _ = tcp_nodelay(fd)
+    let r = send(fd, argv)
+    let _ = tcp_close(fd)
+    return r
+}
+
+fn cluster_create(replicas: int, addrs: []string) {
+    if len(addrs) < 1 {
+        print("need at least one host:port")
+        exit(1)
+    }
+    let mut nrep = replicas
+    if nrep < 0 {
+        nrep = 0
+    }
+    let group = nrep + 1
+    if (len(addrs) % group) != 0 {
+        print("need a multiple of (replicas+1) nodes, got " + format_int(len(addrs)))
+        exit(1)
+    }
+    let nmasters = len(addrs) / group
+    let mut hosts = make([]string, 0, len(addrs))
+    let mut ports = make([]int, 0, len(addrs))
+    let mut ids = make([]string, 0, len(addrs))
+    let mut i = 0
+    while i < len(addrs) {
+        let h, p = parse_addr(addrs[i])
+        let ping = send_to(h, p, ["PING"])
+        if not str_has_prefix(ping, "+PONG") {
+            print("cannot reach " + addrs[i] + " (start with --cluster-enabled yes)")
+            exit(1)
+        }
+        let id = bulk_str(send_to(h, p, ["CLUSTER", "MYID"]))
+        if str_len(id) < 8 {
+            print("CLUSTER MYID failed on " + addrs[i] + " — is cluster enabled?")
+            exit(1)
+        }
+        hosts = append(hosts, h)
+        ports = append(ports, p)
+        ids = append(ids, id)
+        i = i + 1
+    }
+    i = 1
+    while i < len(addrs) {
+        let r = send_to(hosts[0], ports[0], ["CLUSTER", "MEET", hosts[i], format_int(ports[i])])
+        if ok_reply(r) == 0 {
+            print("MEET " + addrs[i] + " failed: " + r)
+            exit(1)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < len(addrs) {
+        if wait_n_nodes(hosts[i], ports[i], len(addrs)) == 0 {
+            print("timeout waiting for cluster membership on " + addrs[i])
+            exit(1)
+        }
+        i = i + 1
+    }
+    let parts = split_slots(nmasters)
+    i = 0
+    while i < nmasters {
+        let rg = parts[i]
+        let mut dash = 0
+        let mut k = 0
+        while k < str_len(rg) {
+            if str_byte_at(rg, k) == 45 {
+                dash = k
+            }
+            k = k + 1
+        }
+        let r = send_to(hosts[i], ports[i], ["CLUSTER", "ADDSLOTSRANGE", rg[:dash], rg[dash + 1:]])
+        if ok_reply(r) == 0 {
+            print("ADDSLOTSRANGE on " + addrs[i] + " failed: " + r)
+            exit(1)
+        }
+        i = i + 1
+    }
+    i = nmasters
+    while i < len(addrs) {
+        let mi = (i - nmasters) % nmasters
+        let r = send_to(hosts[i], ports[i], ["CLUSTER", "REPLICATE", ids[mi]])
+        if ok_reply(r) == 0 {
+            print("REPLICATE on " + addrs[i] + " failed: " + r)
+            exit(1)
+        }
+        print(addrs[i] + " -> replica of " + addrs[mi])
+        i = i + 1
+    }
+    let mut n = 0
+    while n < 80 {
+        let info = bulk_str(send_to(hosts[0], ports[0], ["CLUSTER", "INFO"]))
+        if str_contains(info, "cluster_state:ok") {
+            print("[OK] cluster is up, " + format_int(nmasters) + " masters, " + format_int(nrep) + " replica(s) each")
+            return
+        }
+        sleep_ms(50)
+        n = n + 1
+    }
+    print("cluster formed; waiting for gossip to mark cluster_state:ok")
+}
+
+fn cluster_add_node(nw: string, existing: string, slave: int) {
+    let nh, np = parse_addr(nw)
+    let eh, ep = parse_addr(existing)
+    let ping = send_to(eh, ep, ["PING"])
+    if not str_has_prefix(ping, "+PONG") {
+        print("cannot reach " + existing)
+        exit(1)
+    }
+    let r = send_to(eh, ep, ["CLUSTER", "MEET", nh, format_int(np)])
+    if ok_reply(r) == 0 {
+        print("MEET failed: " + r)
+        exit(1)
+    }
+    if wait_n_nodes(nh, np, 2) == 0 {
+        print("new node did not join")
+        exit(1)
+    }
+    if slave == 1 {
+        let mid = bulk_str(send_to(eh, ep, ["CLUSTER", "MYID"]))
+        let rr = send_to(nh, np, ["CLUSTER", "REPLICATE", mid])
+        if ok_reply(rr) == 0 {
+            print("REPLICATE failed: " + rr)
+            exit(1)
+        }
+        print("[OK] " + nw + " is a replica of " + existing)
+        return
+    }
+    print("[OK] " + nw + " joined the cluster (assign slots with CLUSTER ADDSLOTSRANGE)")
+}
+
+fn show(r: string) {
+    if str_len(r) == 0 {
+        print("(empty)")
+        return
+    }
+    if str_has_prefix(r, "+") or str_has_prefix(r, ":") or str_has_prefix(r, "-") {
+        let n = str_len(r)
+        let mut end = n
+        if n >= 2 and str_byte_at(r, n - 2) == 13 {
+            end = n - 2
+        }
+        if str_has_prefix(r, "-") {
+            print("(error) " + r[1:end])
+        } else {
+            print(r[1:end])
+        }
+        return
+    }
+    if str_has_prefix(r, "$-1") {
+        print("(nil)")
+        return
+    }
+    if str_has_prefix(r, "$") {
+        let mut cr = 0
+        let n = str_len(r)
+        while cr + 1 < n {
+            if str_byte_at(r, cr) == 13 and str_byte_at(r, cr + 1) == 10 {
+                break
+            }
+            cr = cr + 1
+        }
+        if cr + 2 < n {
+            let mut ln = 0
+            match parse_int(r[1:cr]) {
+                Ok(x) => {
+                    ln = x
+                },
+                Err(_) => {
+                    print_raw(r)
+                    return
+                },
+            }
+            if ln >= 0 and cr + 2 + ln <= n {
+                print(r[cr + 2:cr + 2 + ln])
+                return
+            }
+        }
+    }
+    print_raw(r)
+}
+
+fn cluster_main() {
+    let n = argc()
+    let mut replicas = 0
+    let mut slave = 0
+    let mut op = ""
+    let mut addrs = make([]string, 0, 8)
+    let mut i = 2
+    while i < n {
+        let a = arg_get(i)
+        if str_eq(a, "create") or str_eq(a, "add-node") {
+            op = a
+            i = i + 1
+            continue
+        }
+        if str_eq(a, "--replicas") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(x) => {
+                    replicas = x
+                },
+                Err(_) => {
+                    print("bad --replicas")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--slave") or str_eq(a, "--replica") {
+            slave = 1
+            i = i + 1
+            continue
+        }
+        if str_eq(a, "--help") {
+            usage()
+            return
+        }
+        addrs = append(addrs, a)
+        i = i + 1
+    }
+    if str_eq(op, "create") {
+        cluster_create(replicas, addrs)
+        return
+    }
+    if str_eq(op, "add-node") {
+        if len(addrs) < 2 {
+            print("usage: --cluster add-node new:port existing:port [--slave]")
+            exit(1)
+        }
+        cluster_add_node(addrs[0], addrs[1], slave)
+        return
+    }
+    usage()
+    exit(1)
+}
+
+fn main() {
+    require_unix()
+    if argc() >= 2 and str_eq(arg_get(1), "--cluster") {
+        cluster_main()
+        return
+    }
+    let mut host = "127.0.0.1"
+    let mut port = 6379
+    let mut sock = ""
+    let mut pass = ""
+    let mut user = ""
+    let mut use_tls = 0
+    let mut tls_ca = ""
+    let mut cmd = make([]string, 0, 8)
+    let n = argc()
+    let mut i = 1
+    while i < n {
+        let a = arg_get(i)
+        if str_eq(a, "--help") {
+            usage()
+            return
+        }
+        if str_eq(a, "-h") or str_eq(a, "--host") {
+            if i + 1 >= n {
+                print("missing host")
+                exit(1)
+            }
+            host = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "-p") or str_eq(a, "--port") {
+            if i + 1 >= n {
+                print("missing port")
+                exit(1)
+            }
+            match parse_int(arg_get(i + 1)) {
+                Ok(p) => {
+                    port = p
+                },
+                Err(_) => {
+                    print("bad port")
+                    exit(1)
+                },
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "-a") or str_eq(a, "--pass") {
+            if i + 1 >= n {
+                print("missing password")
+                exit(1)
+            }
+            pass = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "-u") or str_eq(a, "--user") {
+            if i + 1 >= n {
+                print("missing user")
+                exit(1)
+            }
+            user = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "--tls") {
+            use_tls = 1
+            i = i + 1
+            continue
+        }
+        if str_eq(a, "--tls-ca") {
+            if i + 1 >= n {
+                print("missing --tls-ca path")
+                exit(1)
+            }
+            tls_ca = arg_get(i + 1)
+            use_tls = 1
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "-s") or str_eq(a, "--socket") or str_eq(a, "--unixsocket") {
+            if i + 1 >= n {
+                print("missing socket path")
+                exit(1)
+            }
+            sock = arg_get(i + 1)
+            i = i + 2
+            continue
+        }
+        cmd = append(cmd, a)
+        i = i + 1
+    }
+    if len(cmd) == 0 {
+        cmd = append(cmd, "PING")
+    }
+    let mut fd = -1
+    if str_len(sock) > 0 {
+        fd = unix_connect(sock)
+        if fd < 0 {
+            print("could not connect to unix socket " + sock)
+            exit(1)
+        }
+        use_tls = 0
+    } else {
+        fd = tcp_connect(host, port)
+        if fd < 0 {
+            print("could not connect to " + host + ":" + format_int(port))
+            exit(1)
+        }
+        let _ = tcp_nodelay(fd)
+    }
+    let mut tc = tls_accept(tls_server_new("", ""), -1)
+    let mut cli = tls_client_new_insecure()
+    if use_tls == 1 {
+        if str_len(tls_ca) > 0 {
+            let _ = tls_client_free(cli)
+            cli = tls_client_new(tls_ca)
+        }
+        tc = tls_connect(cli, fd, host)
+        if tls_conn_fd(tc) < 0 {
+            print("TLS handshake failed")
+            let _ = tcp_close(fd)
+            let _ = tls_client_free(cli)
+            exit(1)
+        }
+    }
+    if str_len(pass) > 0 {
+        let mut ar = ""
+        if str_len(user) > 0 {
+            if use_tls == 1 {
+                ar = send_tls(tc, ["AUTH", user, pass])
+            } else {
+                ar = send(fd, ["AUTH", user, pass])
+            }
+        } else {
+            if use_tls == 1 {
+                ar = send_tls(tc, ["AUTH", pass])
+            } else {
+                ar = send(fd, ["AUTH", pass])
+            }
+        }
+        if not str_has_prefix(ar, "+OK") {
+            show(ar)
+            if use_tls == 1 {
+                let _ = tls_conn_close(tc)
+            } else {
+                let _ = tcp_close(fd)
+            }
+            let _ = tls_client_free(cli)
+            exit(1)
+        }
+    }
+    let mut r = ""
+    if use_tls == 1 {
+        r = send_tls(tc, cmd)
+        let _ = tls_conn_close(tc)
+    } else {
+        r = send(fd, cmd)
+        let _ = tcp_close(fd)
+    }
+    let _ = tls_client_free(cli)
+    show(r)
+}
