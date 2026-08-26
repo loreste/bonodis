@@ -11,7 +11,7 @@
 ### macOS
 
 ```
-brew install loreste/tap/mako
+brew install loreste/tap/makori
 ```
 
 ### Linux
@@ -30,7 +30,7 @@ cd mako && make install
 Verify:
 
 ```
-mako --version
+makori --version
 ```
 
 ## Get Bonodis
@@ -52,21 +52,21 @@ cd bonodis
 No build step needed. Mako compiles and runs in one command:
 
 ```
-mako run -p lib -- --bind 127.0.0.1 --port 6379 --protected-mode no
+makori run -p lib -- --bind 127.0.0.1 --port 6379 --protected-mode no
 ```
 
 In another terminal:
 
 ```
-mako run -p cli -- PING
-mako run -p cli -- SET hello world
-mako run -p cli -- GET hello
+makori run -p cli -- PING
+makori run -p cli -- SET hello world
+makori run -p cli -- GET hello
 ```
 
 ## Run tests
 
 ```
-mako test .
+makori test .
 ```
 
 All 12 test suites should pass.
@@ -76,7 +76,7 @@ All 12 test suites should pass.
 For production use, run the server with persistence and memory limits:
 
 ```
-mako run -p lib -- --prod --bind 0.0.0.0 --port 6379 \
+makori run -p lib -- --prod --bind 0.0.0.0 --port 6379 \
     --requirepass <password> \
     --appendonly yes --dir /var/lib/bonodis \
     --maxmemory 1073741824 \
@@ -108,7 +108,7 @@ docker build -t bonodis .
 docker run --name bonodis -p 6379:6379 -v bonodis-data:/data bonodis
 ```
 
-The Dockerfile expects a `bonodis` binary in the repo root. Build it first with `mako run -p lib` on a Linux host, or use a multi-stage build.
+The Dockerfile expects a `bonodis` binary in the repo root. Build it first with `makori run -p lib` on a Linux host, or use a multi-stage build.
 
 ## Connecting
 
@@ -140,8 +140,8 @@ rdb.Get(ctx, "k")
 ```
 # CLI
 bonodis-cli -h 127.0.0.1 -p 6379 PING
-# or via mako
-mako run -p cli -- -h 127.0.0.1 -p 6379 PING
+# or via makori
+makori run -p cli -- -h 127.0.0.1 -p 6379 PING
 ```
 
 ## Platform notes

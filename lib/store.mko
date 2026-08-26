@@ -3045,5 +3045,7 @@ fn touch_store_methods() -> int {
     let _ = Store_cmd_turn(st, 0, a)
     let _ = Store_cmd_react(st, 0, a)
     Store_react_fire(st, 0, "k", "v")
+    let none: []float = []
+    let _, _ = Store_vsim_rank(st, "k", none, "", 1)
     return 0
 }

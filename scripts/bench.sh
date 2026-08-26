@@ -7,7 +7,7 @@ PORT="${2:-6379}"
 N="${3:-20000}"
 CLI="${BONODIS_CLI:-./bonodis-cli}"
 if [ ! -x "$CLI" ]; then
-  CLI="mako run -p cli --"
+  CLI="makori run -p cli --"
 fi
 
 echo "bench SET/GET n=$N $HOST:$PORT"

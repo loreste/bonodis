@@ -1511,7 +1511,7 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
             } else if str_eq(k, "default-ttl") {
                 cmap_set(replcfg, "defttl", v)
             } else if str_eq(k, "auto-failover") {
-                cmap_set(replcfg, "autofail", format_int(yn(v, 0)))
+                cmap_set(replcfg, "autofail", format_int(parse_yn(v, 0)))
             } else if str_eq(k, "timeout") {
                 cmap_set(replcfg, "timeout", v)
             } else if str_eq(k, "tcp-keepalive") {

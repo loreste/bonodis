@@ -8,7 +8,7 @@ Bonodis is written in Mako. You need the Mako compiler to build it.
 
 ```
 # macOS
-brew install loreste/tap/mako
+brew install loreste/tap/makori
 
 # Linux (from source)
 git clone https://github.com/loreste/mako
@@ -18,8 +18,8 @@ cd mako && make install
 Verify:
 
 ```
-mako --version
-# should print mako 0.5.x or later
+makori --version
+# should print makori 0.5.x or later
 ```
 
 ## Build Bonodis
@@ -27,8 +27,8 @@ mako --version
 ```
 git clone https://github.com/loreste/bonodis
 cd bonodis
-mako build --release -p lib -o bonodis
-mako build --release -p cli -o bonodis-cli
+makori build --release -p lib -o bonodis
+makori build --release -p cli -o bonodis-cli
 ```
 
 This produces two binaries: `bonodis` (the server) and `bonodis-cli` (the command-line client).
