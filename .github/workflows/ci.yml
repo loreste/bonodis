@@ -11,44 +11,49 @@ jobs:
   test:
     strategy:
       matrix:
-        include:
-          - os: ubuntu-latest
-            asset: mako-x86_64-unknown-linux-gnu.tar.gz
-            dir: mako-x86_64-unknown-linux-gnu
-          - os: macos-latest
-            asset: mako-aarch64-apple-darwin.tar.gz
-            dir: mako-aarch64-apple-darwin
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/makori
+          key: ${{ runner.os }}-cargo-makori-${{ hashFiles('mako.toml') }}
+
       - name: install makori
         run: |
-          gh release download v0.5.15 -R loreste/mako -p "${{ matrix.asset }}" -D /tmp
-          tar xzf "/tmp/${{ matrix.asset }}" -C /tmp
-          mkdir -p "$HOME/.local/bin" "$HOME/.local/share"
-          cp /tmp/${{ matrix.dir }}/bin/mako "$HOME/.local/bin/mako"
-          chmod +x "$HOME/.local/bin/mako"
-          cp -r /tmp/${{ matrix.dir }}/share/mako "$HOME/.local/share/mako"
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-        env:
-          GH_TOKEN: ${{ github.token }}
+          if ! command -v makori &>/dev/null; then
+            cargo install --git https://github.com/loreste/mako --bin makori 2>/dev/null \
+              || cargo install --git https://github.com/loreste/mako --bin mako
+            # symlink whichever name was installed
+            if command -v mako &>/dev/null && ! command -v makori &>/dev/null; then
+              ln -sf "$(which mako)" "$(dirname $(which mako))/makori"
+            fi
+          fi
 
       - name: verify
-        run: mako --version
+        run: makori --version || mako --version
 
       - name: test
         shell: bash {0}
         run: |
-          mako test . 2>&1 | tee /tmp/test-output.txt
+          makori test . 2>&1 | tee /tmp/test-output.txt
+          rc=${PIPESTATUS[0]}
           passed=$(grep "mako test:" /tmp/test-output.txt | tail -1 | grep -o '[0-9]* passed' | grep -o '[0-9]*')
           failed=$(grep "mako test:" /tmp/test-output.txt | tail -1 | grep -o '[0-9]* failed' | grep -o '[0-9]*')
           echo "result: ${passed:-0} passed, ${failed:-0} failed"
           if [ "${passed:-0}" -ge 11 ] && [ "${failed:-0}" -le 1 ]; then
             exit 0
-          else
-            exit 1
           fi
+          exit ${rc:-1}
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
