@@ -11,23 +11,31 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            asset: mako-x86_64-unknown-linux-gnu
+          - os: macos-latest
+            asset: mako-aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: install makori
         run: |
-          curl -fsSL https://raw.githubusercontent.com/loreste/mako/main/install.sh | sh
-          ln -sf "$HOME/.local/bin/mako" "$HOME/.local/bin/makori" 2>/dev/null || true
+          mkdir -p "$HOME/.local/bin"
+          gh release download v0.5.15 -R loreste/mako -p "${{ matrix.asset }}" -D "$HOME/.local/bin"
+          mv "$HOME/.local/bin/${{ matrix.asset }}" "$HOME/.local/bin/mako"
+          chmod +x "$HOME/.local/bin/mako"
+          ln -sf "$HOME/.local/bin/mako" "$HOME/.local/bin/makori"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: verify
-        run: makori --version || mako --version
+        run: mako --version
 
       - name: test
-        run: makori test . || mako test .
+        run: mako test .
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
