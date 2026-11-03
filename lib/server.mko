@@ -10,15 +10,18 @@ fn wait_reply(replies: CMap, id: string) -> string {
             let _ = cmap_del(replies, id)
             return r
         }
-        if n >= WAIT_SPIN {
-            if n < WAIT_NEAR {
-                sleep_us(10)
-            } else {
-                sleep_us(50)
+        if n < WAIT_SPIN {
+            if n >= 8 {
+                sleep_ns(200)
             }
+        } else if n < WAIT_NEAR {
+            sleep_us(10)
+        } else {
+            sleep_us(50)
         }
         n = n + 1
     }
+    let _ = cmap_del(replies, id)
     log_timeout("wait_reply", id)
     return r_err("ERR timeout")
 }
@@ -39,13 +42,13 @@ fn send_job(bus: []chan[string], shard: int, id: string, db: int, argv: []string
     let b = str_builder()
     builder_write(b, id)
     builder_write(b, "\n")
-    builder_write(b, format_int(db))
+    builder_write(b, fmt_int_fast(db))
     builder_write(b, "\n")
-    builder_write(b, format_int(len(argv)))
+    builder_write(b, fmt_int_fast(len(argv)))
     builder_write(b, "\n")
     let mut i = 0
     while i < len(argv) {
-        builder_write(b, format_int(str_len(argv[i])))
+        builder_write(b, fmt_int_fast(str_len(argv[i])))
         builder_write(b, "\n")
         builder_write(b, argv[i])
         i = i + 1
@@ -151,14 +154,18 @@ fn merge_arrays(parts: []string) -> string {
 }
 
 fn pick_bulk(parts: []string) -> string {
+    let mut cands = make([]string, 0, len(parts))
     let mut i = 0
     while i < len(parts) {
         if str_has_prefix(parts[i], "$") and not str_has_prefix(parts[i], "$-1") {
-            return parts[i]
+            cands = append(cands, parts[i])
         }
         i = i + 1
     }
-    return r_nil()
+    if len(cands) == 0 {
+        return r_nil()
+    }
+    return cands[rand_intn(len(cands))]
 }
 
 fn dispatch_blpop(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
@@ -235,6 +242,91 @@ fn dispatch_bzpop(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: in
                 }
             }
             i = i + 1
+        }
+        sleep_ms(10)
+        if to == 0 {
+            deadline = wall_ms() + 86400000
+        }
+    }
+    return r_null_arr()
+}
+
+fn dispatch_blmove(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    let mut wfrom = "RIGHT"
+    let mut wto = "LEFT"
+    let mut to_str = ""
+    if str_eq(cmd, "BRPOPLPUSH") {
+        if len(argv) != 4 {
+            return r_arity("brpoplpush")
+        }
+        to_str = argv[3]
+    } else {
+        if len(argv) != 6 {
+            return r_arity("blmove")
+        }
+        wfrom = str_to_upper(argv[3])
+        wto = str_to_upper(argv[4])
+        if (not str_eq(wfrom, "LEFT") and not str_eq(wfrom, "RIGHT")) or (not str_eq(wto, "LEFT") and not str_eq(wto, "RIGHT")) {
+            return r_syntax()
+        }
+        to_str = argv[5]
+    }
+    let to, ok = int_ok(to_str)
+    if ok == 0 or to < 0 {
+        return r_notint()
+    }
+    let mut deadline = wall_ms() + to * 1000
+    if to == 0 {
+        deadline = wall_ms() + 86400000
+    }
+    while wall_ms() <= deadline {
+        let r = dispatch(bus, replies, ids, shards, db, ["LMOVE", argv[1], argv[2], wfrom, wto])
+        if str_has_prefix(r, "-") {
+            return r
+        }
+        if not str_has_prefix(r, "$-1") {
+            return r
+        }
+        sleep_ms(10)
+        if to == 0 {
+            deadline = wall_ms() + 86400000
+        }
+    }
+    return r_nil()
+}
+
+fn dispatch_bmpop(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    if len(argv) < 5 {
+        return r_arity(str_to_lower(cmd))
+    }
+    let to, ok = int_ok(argv[1])
+    if ok == 0 or to < 0 {
+        return r_notint()
+    }
+    let mut sub_cmd = "LMPOP"
+    if str_eq(cmd, "BZMPOP") {
+        sub_cmd = "ZMPOP"
+    }
+    let mut sub = make([]string, 0, len(argv) - 1)
+    sub = append(sub, sub_cmd)
+    let mut i = 2
+    while i < len(argv) {
+        sub = append(sub, argv[i])
+        i = i + 1
+    }
+    let mut deadline = wall_ms() + to * 1000
+    if to == 0 {
+        deadline = wall_ms() + 86400000
+    }
+    while wall_ms() <= deadline {
+        let r = dispatch_numkeys(bus, replies, ids, shards, db, sub, 1)
+        if str_has_prefix(r, "-") {
+            return r
+        }
+        if not str_has_prefix(r, "*-1") and not str_has_prefix(r, "$-1") {
+            return r
         }
         sleep_ms(10)
         if to == 0 {
@@ -501,6 +593,12 @@ fn dispatch(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db:
     if str_eq(cmd, "BZPOPMIN") or str_eq(cmd, "BZPOPMAX") {
         return dispatch_bzpop(bus, replies, ids, shards, db, argv)
     }
+    if str_eq(cmd, "BLMOVE") or str_eq(cmd, "BRPOPLPUSH") {
+        return dispatch_blmove(bus, replies, ids, shards, db, argv)
+    }
+    if str_eq(cmd, "BLMPOP") or str_eq(cmd, "BZMPOP") {
+        return dispatch_bmpop(bus, replies, ids, shards, db, argv)
+    }
     if str_eq(cmd, "SWAPDB") {
         let parts = broadcast(bus, replies, ids, shards, db, argv)
         let mut i = 0
@@ -512,11 +610,122 @@ fn dispatch(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db:
         }
         return r_ok()
     }
-    if str_eq(cmd, "ZUNION") or str_eq(cmd, "ZINTER") or str_eq(cmd, "ZDIFF") or str_eq(cmd, "SINTERCARD") or str_eq(cmd, "LMPOP") or str_eq(cmd, "ZMPOP") {
+    if str_eq(cmd, "ZUNION") or str_eq(cmd, "ZINTER") or str_eq(cmd, "ZDIFF") or str_eq(cmd, "SINTERCARD") or str_eq(cmd, "ZINTERCARD") or str_eq(cmd, "LMPOP") or str_eq(cmd, "ZMPOP") {
         return dispatch_numkeys(bus, replies, ids, shards, db, argv, 1)
     }
     if str_eq(cmd, "ZINTERSTORE") or str_eq(cmd, "ZDIFFSTORE") {
         return dispatch_numkeys(bus, replies, ids, shards, db, argv, 2)
+    }
+    if str_eq(cmd, "LOCK") {
+        if len(argv) >= 3 {
+            return call_shard(bus, replies, ids, key_shard(argv[2], shards), db, argv)
+        }
+        return r_arity("lock")
+    }
+    if str_eq(cmd, "JSON.MGET") {
+        if len(argv) < 3 {
+            return r_arity("json.mget")
+        }
+        let path = argv[len(argv) - 1]
+        let nkeys = len(argv) - 2
+        let mut items = make([]string, 0, nkeys)
+        let mut hit = make([]int, 0, nkeys)
+        let mut i = 1
+        while i < len(argv) - 1 {
+            let r = call_shard(bus, replies, ids, key_shard(argv[i], shards), db, ["JSON.GET", argv[i], path])
+            if str_has_prefix(r, "-") {
+                return r
+            }
+            if str_has_prefix(r, "$-1") {
+                items = append(items, "")
+                hit = append(hit, 0)
+            } else {
+                items = append(items, bulk_payload(r))
+                hit = append(hit, 1)
+            }
+            i = i + 1
+        }
+        return r_array_opt(items, hit)
+    }
+    if str_eq(cmd, "TS.MADD") {
+        if len(argv) < 4 or ((len(argv) - 1) % 3) != 0 {
+            return r_arity("ts.madd")
+        }
+        let n = (len(argv) - 1) / 3
+        let b = str_builder()
+        builder_write(b, "*")
+        builder_write(b, fmt_int_fast(n))
+        builder_write(b, "\r\n")
+        let mut i = 1
+        while i + 2 < len(argv) {
+            let r = call_shard(bus, replies, ids, key_shard(argv[i], shards), db, ["TS.ADD", argv[i], argv[i + 1], argv[i + 2]])
+            builder_write(b, r)
+            i = i + 3
+        }
+        return builder_string(b)
+    }
+    if str_eq(cmd, "LMOVE") or str_eq(cmd, "RPOPLPUSH") {
+        let mut wfrom = "RIGHT"
+        let mut wto = "LEFT"
+        if str_eq(cmd, "RPOPLPUSH") {
+            if len(argv) != 3 {
+                return r_arity("rpoplpush")
+            }
+        } else {
+            if len(argv) != 5 {
+                return r_arity("lmove")
+            }
+            wfrom = str_to_upper(argv[3])
+            wto = str_to_upper(argv[4])
+            if (not str_eq(wfrom, "LEFT") and not str_eq(wfrom, "RIGHT")) or (not str_eq(wto, "LEFT") and not str_eq(wto, "RIGHT")) {
+                return r_syntax()
+            }
+        }
+        let sh1 = key_shard(argv[1], shards)
+        let sh2 = key_shard(argv[2], shards)
+        if sh1 == sh2 {
+            return call_shard(bus, replies, ids, sh1, db, argv)
+        }
+        let mut pop_cmd = "RPOP"
+        if str_eq(wfrom, "LEFT") {
+            pop_cmd = "LPOP"
+        }
+        let pr = call_shard(bus, replies, ids, sh1, db, [pop_cmd, argv[1]])
+        if str_has_prefix(pr, "-") or str_has_prefix(pr, "$-1") {
+            return pr
+        }
+        let val = bulk_payload(pr)
+        let mut push_cmd = "LPUSH"
+        if str_eq(wto, "RIGHT") {
+            push_cmd = "RPUSH"
+        }
+        let pshr = call_shard(bus, replies, ids, sh2, db, [push_cmd, argv[2], val])
+        if str_has_prefix(pshr, "-") {
+            return pshr
+        }
+        return pr
+    }
+    if str_eq(cmd, "SMOVE") {
+        if len(argv) != 4 {
+            return r_arity("smove")
+        }
+        let sh1 = key_shard(argv[1], shards)
+        let sh2 = key_shard(argv[2], shards)
+        if sh1 == sh2 {
+            return call_shard(bus, replies, ids, sh1, db, argv)
+        }
+        let sr = call_shard(bus, replies, ids, sh1, db, ["SREM", argv[1], argv[3]])
+        if str_has_prefix(sr, "-") {
+            return sr
+        }
+        if parse_int_reply(sr) == 0 {
+            return r_int(0)
+        }
+        let ar = call_shard(bus, replies, ids, sh2, db, ["SADD", argv[2], argv[3]])
+        if str_has_prefix(ar, "-") {
+            return ar
+        }
+        return r_int(1)
     }
     if str_eq(cmd, "XGROUP") or str_eq(cmd, "XINFO") {
         if len(argv) >= 3 {
@@ -540,14 +749,83 @@ fn dispatch(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db:
         }
         return call_shard(bus, replies, ids, key_shard(argv[1], shards), db, argv)
     }
+    if str_eq(cmd, "ZRANGESTORE") {
+        if len(argv) < 5 {
+            return r_arity("zrangestore")
+        }
+        let sh_dst = key_shard(argv[1], shards)
+        let sh_src = key_shard(argv[2], shards)
+        if sh_dst == sh_src {
+            return call_shard(bus, replies, ids, sh_dst, db, argv)
+        }
+        let mut sub = make([]string, 0, len(argv))
+        sub = append(sub, "ZRANGE")
+        let mut zi = 2
+        while zi < len(argv) {
+            if str_eq(str_to_upper(argv[zi]), "WITHSCORES") {
+                return r_syntax()
+            }
+            sub = append(sub, argv[zi])
+            zi = zi + 1
+        }
+        let zr = call_shard(bus, replies, ids, sh_src, db, sub)
+        if str_has_prefix(zr, "-") {
+            return zr
+        }
+        let mems = parse_array_bulks(zr)
+        let _ = call_shard(bus, replies, ids, sh_dst, db, ["DEL", argv[1]])
+        if len(mems) == 0 {
+            return r_int(0)
+        }
+        let mut zm = make([]string, 0, len(mems) + 2)
+        zm = append(zm, "ZMSCORE")
+        zm = append(zm, argv[2])
+        zi = 0
+        while zi < len(mems) {
+            zm = append(zm, mems[zi])
+            zi = zi + 1
+        }
+        let sc_r = call_shard(bus, replies, ids, sh_src, db, zm)
+        let scs = parse_array_bulks(sc_r)
+        let mut zadd = make([]string, 0, len(mems) * 2 + 2)
+        zadd = append(zadd, "ZADD")
+        zadd = append(zadd, argv[1])
+        zi = 0
+        while zi < len(mems) and zi < len(scs) {
+            zadd = append(zadd, scs[zi])
+            zadd = append(zadd, mems[zi])
+            zi = zi + 1
+        }
+        let _ = call_shard(bus, replies, ids, sh_dst, db, zadd)
+        return r_int(len(mems))
+    }
+    if str_eq(cmd, "LCS") {
+        if len(argv) < 3 {
+            return r_arity("lcs")
+        }
+        let sh1 = key_shard(argv[1], shards)
+        let sh2 = key_shard(argv[2], shards)
+        if sh1 == sh2 {
+            return call_shard(bus, replies, ids, sh1, db, argv)
+        }
+        let r1 = call_shard(bus, replies, ids, sh1, db, ["GET", argv[1]])
+        if str_has_prefix(r1, "-") {
+            return r1
+        }
+        let r2 = call_shard(bus, replies, ids, sh2, db, ["GET", argv[2]])
+        if str_has_prefix(r2, "-") {
+            return r2
+        }
+        return lcs_compute(bulk_payload(r1), bulk_payload(r2), argv, 3)
+    }
     if str_eq(cmd, "MEMORY") {
         if len(argv) >= 3 {
             return call_shard(bus, replies, ids, key_shard(argv[2], shards), db, argv)
         }
     }
-    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") {
+    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") or str_eq(cmd, "EVAL_RO") or str_eq(cmd, "EVALSHA_RO") {
         if len(argv) < 3 {
-            return r_arity("eval")
+            return r_arity(str_to_lower(cmd))
         }
         let nk, ok = int_ok(argv[2])
         if ok == 0 or nk < 0 {
@@ -636,14 +914,39 @@ fn dispatch(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db:
     }
     if str_eq(cmd, "REACT") {
         if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "LIST") {
-            // LIST returns from all shards; broadcast and merge
-            return merge_arrays(broadcast(bus, replies, ids, shards, db, argv))
+            let parts = broadcast(bus, replies, ids, shards, db, argv)
+            let mut seen = make(map[string]int)
+            let mut out = make([]string, 0, 8)
+            let mut pi = 0
+            while pi < len(parts) {
+                let ks = parse_array_bulks(parts[pi])
+                let mut pj = 0
+                while pj + 1 < len(ks) {
+                    if not has(seen, ks[pj]) {
+                        seen[ks[pj]] = 1
+                        out = append(out, ks[pj])
+                        out = append(out, ks[pj + 1])
+                    }
+                    pj = pj + 2
+                }
+                pi = pi + 1
+            }
+            return r_array_bulks(out)
         }
         if len(argv) >= 4 and str_eq(str_to_upper(argv[1]), "CREATE") {
-            // route to shard of the trigger key (argv[3])
+            if react_is_glob(argv[3]) == 1 {
+                let parts = broadcast(bus, replies, ids, shards, db, argv)
+                let mut pi = 0
+                while pi < len(parts) {
+                    if str_has_prefix(parts[pi], "-") {
+                        return parts[pi]
+                    }
+                    pi = pi + 1
+                }
+                return r_ok()
+            }
             return call_shard(bus, replies, ids, key_shard(argv[3], shards), db, argv)
         }
-        // DELETE: broadcast to all shards (name could be anywhere)
         let parts = broadcast(bus, replies, ids, shards, db, argv)
         let mut total = 0
         let mut i = 0
@@ -651,7 +954,58 @@ fn dispatch(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, db:
             total = total + parse_int_reply(parts[i])
             i = i + 1
         }
+        if total > 1 {
+            total = 1
+        }
         return r_int(total)
+    }
+    if str_has_prefix(cmd, "FT.") {
+        if str_eq(cmd, "FT.CREATE") or str_eq(cmd, "FT.DROPINDEX") {
+            let parts = broadcast(bus, replies, ids, shards, db, argv)
+            let mut pi = 0
+            while pi < len(parts) {
+                if str_has_prefix(parts[pi], "-") {
+                    return parts[pi]
+                }
+                pi = pi + 1
+            }
+            return r_ok()
+        }
+        if str_eq(cmd, "FT._LIST") or str_eq(cmd, "FT.INFO") {
+            return call_shard(bus, replies, ids, 0, db, argv)
+        }
+        if str_eq(cmd, "FT.SEARCH") {
+            if shards <= 1 {
+                return call_shard(bus, replies, ids, 0, db, argv)
+            }
+            let parts = broadcast(bus, replies, ids, shards, db, argv)
+            let mut total_hits = 0
+            let mut total_frames = 0
+            let fb = str_builder()
+            let mut pi = 0
+            while pi < len(parts) {
+                let pr = parts[pi]
+                if str_has_prefix(pr, "-") {
+                    return pr
+                }
+                let nl0 = find_nl(pr, 0)
+                if nl0 > 0 {
+                    let le = line_end_cr(pr, 1, nl0)
+                    let arr_len, ok = parse_int_span(pr, 1, le)
+                    if ok == 1 and arr_len >= 1 {
+                        let p0 = nl0 + 1
+                        let p1 = resp_frame_end(pr, p0)
+                        total_hits = total_hits + parse_int_reply(pr[p0:p1])
+                        if arr_len > 1 and p1 < str_len(pr) {
+                            builder_write(fb, pr[p1:])
+                            total_frames = total_frames + (arr_len - 1)
+                        }
+                    }
+                }
+                pi = pi + 1
+            }
+            return "*" + fmt_int_fast(1 + total_frames) + "\r\n:" + fmt_int_fast(total_hits) + "\r\n" + builder_string(fb)
+        }
     }
     if len(argv) >= 2 {
         let sh = key_shard(argv[1], shards)
@@ -679,12 +1033,12 @@ fn collect_dump_recs(bus: []chan[string], replies: CMap, ids: AtomicInt, shards:
         let mut pos = 0
         let n = str_len(payload)
         while pos < n {
-            let argv, used, st = parse_cmd(payload[pos:])
-            if st != 1 or used <= 0 or len(argv) == 0 {
+            let argv, next_pos, st = parse_cmd_at(payload, pos)
+            if st != 1 or next_pos <= pos or len(argv) == 0 {
                 break
             }
-            recs = append(recs, format_int(db) + "\n" + payload[pos:pos + used])
-            pos = pos + used
+            recs = append(recs, format_int(db) + "\n" + payload[pos:next_pos])
+            pos = next_pos
         }
         db = db + 1
     }
@@ -748,28 +1102,28 @@ fn merge_scan(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int, d
         return r_arity("SCAN")
     }
     let mut pat = "*"
-    if len(argv) >= 4 {
-        let mut i = 2
-        while i + 1 < len(argv) {
-            if str_eq(str_to_upper(argv[i]), "MATCH") {
-                pat = argv[i + 1]
-            }
-            i = i + 2
-        }
-    }
-    let parts = broadcast(bus, replies, ids, shards, db, ["__SCANKEYS", pat])
-    let merged = parse_array_bulks(merge_arrays(parts))
-    let cursor, _ = int_ok(argv[1])
+    let mut want_type = ""
     let mut count = 10
     let mut i = 2
     while i + 1 < len(argv) {
-        if str_eq(str_to_upper(argv[i]), "COUNT") {
+        let opt = str_to_upper(argv[i])
+        if str_eq(opt, "MATCH") {
+            pat = argv[i + 1]
+        } else if str_eq(opt, "COUNT") {
             let n, ok = int_ok(argv[i + 1])
             if ok == 1 and n > 0 {
                 count = n
             }
+        } else if str_eq(opt, "TYPE") {
+            want_type = str_to_lower(argv[i + 1])
         }
         i = i + 2
+    }
+    let parts = broadcast(bus, replies, ids, shards, db, ["__SCANKEYS", pat, want_type])
+    let merged = sort_strings(parse_array_bulks(merge_arrays(parts)))
+    let mut cursor, cok = int_ok(argv[1])
+    if cok == 0 or cursor < 0 {
+        cursor = 0
     }
     let chunk = slice_skip_take(merged, cursor, count)
     let mut next = cursor + len(chunk)
@@ -908,6 +1262,25 @@ fn dispatch_mget(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int
         return r_arity("mget")
     }
     let nkeys = len(argv) - 1
+    let first = key_shard(argv[1], shards)
+    if nkeys == 1 {
+        return call_shard(bus, replies, ids, first, db, argv)
+    }
+    let mut ksh = make([]int, 0, nkeys)
+    ksh = append(ksh, first)
+    let mut same = 1
+    let mut i = 2
+    while i < len(argv) {
+        let sh = key_shard(argv[i], shards)
+        if sh != first {
+            same = 0
+        }
+        ksh = append(ksh, sh)
+        i = i + 1
+    }
+    if same == 1 {
+        return call_shard(bus, replies, ids, first, db, argv)
+    }
     let mut items = make([]string, 0, nkeys)
     let mut hit = make([]int, 0, nkeys)
     let mut k = 0
@@ -916,36 +1289,49 @@ fn dispatch_mget(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int
         hit = append(hit, 0)
         k = k + 1
     }
+    let mut job_ids = make([]string, 0, shards)
+    let mut job_shs = make([]int, 0, shards)
     let mut sh = 0
     while sh < shards {
         let mut sub = make([]string, 0, 4)
         sub = append(sub, "MGET")
-        let mut idx = make([]int, 0, 4)
-        let mut i = 1
-        while i < len(argv) {
-            if key_shard(argv[i], shards) == sh {
-                sub = append(sub, argv[i])
-                idx = append(idx, i - 1)
+        i = 0
+        while i < nkeys {
+            if ksh[i] == sh {
+                sub = append(sub, argv[i + 1])
             }
             i = i + 1
         }
         if len(sub) > 1 {
-            let r = call_shard(bus, replies, ids, sh, db, sub)
-            if str_has_prefix(r, "-") {
-                return r
-            }
-            let nils = resp_nil_mask(r)
-            let got = parse_array_bulks(r)
-            let mut j = 0
-            while j < len(got) and j < len(idx) {
-                items[idx[j]] = got[j]
+            let jid = next_id(ids)
+            send_job(bus, sh, jid, db, sub)
+            job_ids = append(job_ids, jid)
+            job_shs = append(job_shs, sh)
+        }
+        sh = sh + 1
+    }
+    let mut ji = 0
+    while ji < len(job_ids) {
+        let r = wait_reply(replies, job_ids[ji])
+        if str_has_prefix(r, "-") {
+            return r
+        }
+        let target_sh = job_shs[ji]
+        let nils = resp_nil_mask(r)
+        let got = parse_array_bulks(r)
+        let mut j = 0
+        i = 0
+        while i < nkeys and j < len(got) {
+            if ksh[i] == target_sh {
+                items[i] = got[j]
                 if j >= len(nils) or nils[j] == 0 {
-                    hit[idx[j]] = 1
+                    hit[i] = 1
                 }
                 j = j + 1
             }
+            i = i + 1
         }
-        sh = sh + 1
+        ji = ji + 1
     }
     return r_array_opt(items, hit)
 }
@@ -955,41 +1341,56 @@ fn dispatch_mset(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: int
     if len(argv) < 3 or (len(argv) % 2) == 0 {
         return r_arity("mset")
     }
-    let mut first = -1
-    let mut i = 1
+    let npairs = (len(argv) - 1) / 2
+    let first = key_shard(argv[1], shards)
+    if npairs == 1 {
+        return call_shard(bus, replies, ids, first, db, argv)
+    }
+    let mut ksh = make([]int, 0, npairs)
+    ksh = append(ksh, first)
+    let mut same = 1
+    let mut i = 3
     while i < len(argv) {
         let sh = key_shard(argv[i], shards)
-        if first < 0 {
-            first = sh
-        } else if sh != first {
+        if sh != first {
+            same = 0
             if str_eq(cmd, "MSETNX") {
                 return r_err("CROSSSLOT Keys in request don't hash to the same slot")
             }
         }
+        ksh = append(ksh, sh)
         i = i + 2
     }
-    if str_eq(cmd, "MSETNX") {
+    if same == 1 or str_eq(cmd, "MSETNX") {
         return call_shard(bus, replies, ids, first, db, argv)
     }
+    let mut job_ids = make([]string, 0, shards)
     let mut sh = 0
     while sh < shards {
         let mut sub = make([]string, 0, 4)
         sub = append(sub, "MSET")
-        i = 1
-        while i + 1 < len(argv) {
-            if key_shard(argv[i], shards) == sh {
-                sub = append(sub, argv[i])
-                sub = append(sub, argv[i + 1])
+        let mut pi = 0
+        while pi < npairs {
+            if ksh[pi] == sh {
+                sub = append(sub, argv[1 + pi * 2])
+                sub = append(sub, argv[2 + pi * 2])
             }
-            i = i + 2
+            pi = pi + 1
         }
         if len(sub) > 1 {
-            let r = call_shard(bus, replies, ids, sh, db, sub)
-            if str_has_prefix(r, "-") {
-                return r
-            }
+            let jid = next_id(ids)
+            send_job(bus, sh, jid, db, sub)
+            job_ids = append(job_ids, jid)
         }
         sh = sh + 1
+    }
+    let mut ji = 0
+    while ji < len(job_ids) {
+        let r = wait_reply(replies, job_ids[ji])
+        if str_has_prefix(r, "-") {
+            return r
+        }
+        ji = ji + 1
     }
     return r_ok()
 }
@@ -998,16 +1399,26 @@ fn dispatch_multikey(bus: []chan[string], replies: CMap, ids: AtomicInt, shards:
     if len(argv) < 2 {
         return r_arity(str_to_lower(argv[0]))
     }
-    let mut n = 0
+    if len(argv) == 2 {
+        return call_shard(bus, replies, ids, key_shard(argv[1], shards), db, argv)
+    }
+    let mut job_ids = make([]string, 0, len(argv) - 1)
     let mut i = 1
     while i < len(argv) {
-        let sh = key_shard(argv[i], shards)
-        let r = call_shard(bus, replies, ids, sh, db, [argv[0], argv[i]])
+        let jid = next_id(ids)
+        send_job(bus, key_shard(argv[i], shards), jid, db, [argv[0], argv[i]])
+        job_ids = append(job_ids, jid)
+        i = i + 1
+    }
+    let mut n = 0
+    let mut ji = 0
+    while ji < len(job_ids) {
+        let r = wait_reply(replies, job_ids[ji])
         if str_has_prefix(r, "-") {
             return r
         }
         n = n + parse_int_reply(r)
-        i = i + 1
+        ji = ji + 1
     }
     return r_int(n)
 }
@@ -1023,15 +1434,45 @@ fn dispatch_rename(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: i
         if s1 == s2 {
             return call_shard(bus, replies, ids, s1, db, argv)
         }
-        let g = call_shard(bus, replies, ids, s1, db, ["GET", argv[1]])
-        if str_has_prefix(g, "-") {
-            return g
+        let mut dst_db = db
+        let mut nx = 0
+        let mut i = 3
+        while i < len(argv) {
+            let opt = str_to_upper(argv[i])
+            if str_eq(opt, "NX") {
+                nx = 1
+                i = i + 1
+            } else if str_eq(opt, "REPLACE") {
+                i = i + 1
+            } else if str_eq(opt, "DB") and i + 1 < len(argv) {
+                let d, dok = int_ok(argv[i + 1])
+                if dok == 0 or d < 0 or d > 15 {
+                    return r_err("ERR DB index is out of range")
+                }
+                dst_db = d
+                i = i + 2
+            } else {
+                i = i + 1
+            }
         }
-        if str_eq(g, r_nil()) {
+        let d = call_shard(bus, replies, ids, s1, db, ["DUMP", argv[1]])
+        if str_has_prefix(d, "-") {
+            return d
+        }
+        if str_eq(d, r_nil()) {
             return r_int(0)
         }
-        let payload = bulk_payload(g)
-        let _ = call_shard(bus, replies, ids, s2, db, ["SET", argv[2], payload])
+        if nx == 1 {
+            let ex = call_shard(bus, replies, ids, s2, dst_db, ["EXISTS", argv[2]])
+            if str_eq(ex, ":1\r\n") {
+                return r_int(0)
+            }
+        }
+        let payload = bulk_payload(d)
+        let r = call_shard(bus, replies, ids, s2, dst_db, ["RESTORE", argv[2], "0", payload, "REPLACE"])
+        if str_has_prefix(r, "-") {
+            return r
+        }
         return r_int(1)
     }
     if len(argv) != 3 {
@@ -1039,10 +1480,32 @@ fn dispatch_rename(bus: []chan[string], replies: CMap, ids: AtomicInt, shards: i
     }
     let s1 = key_shard(argv[1], shards)
     let s2 = key_shard(argv[2], shards)
-    if s1 != s2 {
-        return r_err("CROSSSLOT Keys in request don't hash to the same slot")
+    if s1 == s2 {
+        return call_shard(bus, replies, ids, s1, db, argv)
     }
-    return call_shard(bus, replies, ids, s1, db, argv)
+    let d = call_shard(bus, replies, ids, s1, db, ["DUMP", argv[1]])
+    if str_has_prefix(d, "-") {
+        return d
+    }
+    if str_eq(d, r_nil()) {
+        return r_nokey()
+    }
+    if str_eq(cmd, "RENAMENX") {
+        let ex = call_shard(bus, replies, ids, s2, db, ["EXISTS", argv[2]])
+        if str_eq(ex, ":1\r\n") {
+            return r_int(0)
+        }
+    }
+    let payload = bulk_payload(d)
+    let r = call_shard(bus, replies, ids, s2, db, ["RESTORE", argv[2], "0", payload, "REPLACE"])
+    if str_has_prefix(r, "-") {
+        return r
+    }
+    let _ = call_shard(bus, replies, ids, s1, db, ["DEL", argv[1]])
+    if str_eq(cmd, "RENAMENX") {
+        return r_int(1)
+    }
+    return r_ok()
 }
 
 fn is_local_cmd(cmd: string) -> int {
@@ -1249,15 +1712,15 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
     let authed = atomic_load(authed_a)
     let cmd = cmd_name(argv)
     let _ = atomic_add(cmds, 1)
-    if str_eq(cmap_get(replcfg, "needauth"), "1") and authed == 0 {
+    if authed == 0 and str_eq(cmap_get(replcfg, "needauth"), "1") {
         if not str_eq(cmd, "AUTH") and not str_eq(cmd, "HELLO") and not str_eq(cmd, "PING") and not str_eq(cmd, "QUIT") {
             return finish(r_err("NOAUTH Authentication required."), db, authed, 0, db_a, authed_a, quit_a)
         }
     }
-    if authed == 1 and acl_allows(replcfg, cmap_get(feed, "au:" + format_int(conn_id)), cmd) == 0 {
+    if authed == 1 and acl_enabled(replcfg) == 1 and acl_allows(replcfg, cmap_get(feed, "au:" + format_int(conn_id)), cmd) == 0 {
         return finish(r_err("NOPERM this user has no permissions to run the '" + str_to_lower(cmd) + "' command"), db, authed, 0, db_a, authed_a, quit_a)
     }
-    if str_eq(cmap_get(replcfg, "role"), "slave") and is_write_cmd(cmd) == 1 {
+    if is_write_cmd(cmd) == 1 and str_eq(cmap_get(replcfg, "role"), "slave") {
         return finish(r_err("READONLY You can't write against a read only replica."), db, authed, 0, db_a, authed_a, quit_a)
     }
     if is_hot_key_cmd(cmd) == 1 {
@@ -1298,7 +1761,7 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
             return finish(r_ok(), db, 1, 0, db_a, authed_a, quit_a)
         }
         log_auth_fail(conn_id)
-        return finish(r_err("WRONGPASS invalid username-password pair"), db, 0, 0, db_a, authed_a, quit_a)
+        return finish(r_err("WRONGPASS invalid username-password pair"), db, authed, 0, db_a, authed_a, quit_a)
     }
     if str_eq(cmd, "SELECT") {
         if len(argv) != 2 {
@@ -1333,7 +1796,7 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
                 let hu = argv[i + 1]
                 let hp = argv[i + 2]
                 if acl_check_pass(replcfg, hu, hp) == 0 and not (str_eq(hu, "default") and str_eq(hp, cmap_get(replcfg, "requirepass")) and str_len(cmap_get(replcfg, "requirepass")) > 0) {
-                    return finish(r_err("WRONGPASS invalid username-password pair"), db, 0, 0, db_a, authed_a, quit_a)
+                    return finish(r_err("WRONGPASS invalid username-password pair"), db, authed, 0, db_a, authed_a, quit_a)
                 }
                 cmap_set(feed, "au:" + format_int(conn_id), hu)
                 hello_authed = 1
@@ -1350,6 +1813,21 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
         return finish(hello_reply(proto, conn_id), db, hello_authed, 0, db_a, authed_a, quit_a)
     }
     if str_eq(cmd, "COMMAND") {
+        if len(argv) >= 2 {
+            let subc = str_to_upper(argv[1])
+            if str_eq(subc, "DOCS") {
+                return finish("*0\r\n", db, authed, 0, db_a, authed_a, quit_a)
+            }
+            if str_eq(subc, "GETKEYS") {
+                if len(argv) < 3 {
+                    return finish(r_arity("command"), db, authed, 0, db_a, authed_a, quit_a)
+                }
+                if len(argv) >= 4 {
+                    return finish(r_array_bulks([argv[3]]), db, authed, 0, db_a, authed_a, quit_a)
+                }
+                return finish("*0\r\n", db, authed, 0, db_a, authed_a, quit_a)
+            }
+        }
         let names = command_names()
         if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "COUNT") {
             return finish(r_int(len(names)), db, authed, 0, db_a, authed_a, quit_a)
@@ -1422,6 +1900,57 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
                 rec = "id=" + format_int(conn_id)
             }
             return finish(r_bulk(rec), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if str_eq(sub, "TRACKING") {
+            if len(argv) < 3 {
+                return finish(r_arity("client"), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            let sid_t = format_int(conn_id)
+            let mode_t = str_to_upper(argv[2])
+            if str_eq(mode_t, "ON") {
+                let mut bcast = 0
+                let mut pfx = ""
+                let mut ti = 3
+                while ti < len(argv) {
+                    let topt = str_to_upper(argv[ti])
+                    if str_eq(topt, "BCAST") {
+                        bcast = 1
+                        ti = ti + 1
+                    } else if str_eq(topt, "PREFIX") and ti + 1 < len(argv) {
+                        pfx = argv[ti + 1]
+                        ti = ti + 2
+                    } else if str_eq(topt, "REDIRECT") and ti + 1 < len(argv) {
+                        ti = ti + 2
+                    } else {
+                        ti = ti + 1
+                    }
+                }
+                if bcast == 1 {
+                    cmap_set(feed, "trk:" + sid_t, "bcast:" + pfx)
+                    cmap_set(feed, "trkbids", csv_add(cmap_get(feed, "trkbids"), sid_t))
+                } else {
+                    cmap_set(feed, "trk:" + sid_t, "on")
+                    cmap_set(feed, "trkon", "1")
+                }
+                return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            if str_eq(mode_t, "OFF") {
+                cmap_del(feed, "trk:" + sid_t)
+                cmap_set(feed, "trkbids", csv_del(cmap_get(feed, "trkbids"), sid_t))
+                return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+            }
+            return finish(r_syntax(), db, authed, 0, db_a, authed_a, quit_a)
+        }
+        if str_eq(sub, "TRACKINGINFO") {
+            let sid_t = format_int(conn_id)
+            let tv = cmap_get(feed, "trk:" + sid_t)
+            let mut flags = "off"
+            if str_eq(tv, "on") {
+                flags = "on"
+            } else if str_has_prefix(tv, "bcast:") {
+                flags = "on,bcast"
+            }
+            return finish(r_array_bulks(["flags", flags, "redirect", "0"]), db, authed, 0, db_a, authed_a, quit_a)
         }
         return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
     }
@@ -1525,6 +2054,10 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
             }
             return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
         }
+        if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "RESETSTAT") {
+            atomic_store(cmds, 0)
+            return finish(r_ok(), db, authed, 0, db_a, authed_a, quit_a)
+        }
         return finish(r_err("ERR unknown CONFIG subcommand"), db, authed, 0, db_a, authed_a, quit_a)
     }
     if str_eq(cmd, "ACL") {
@@ -1536,18 +2069,22 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
     if str_eq(cmd, "FUNCTION") {
         return finish(r_err("ERR Redis functions are not supported"), db, authed, 0, db_a, authed_a, quit_a)
     }
-    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") {
+    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") or str_eq(cmd, "EVAL_RO") or str_eq(cmd, "EVALSHA_RO") {
         let mut ev = argv
-        if str_eq(cmd, "EVALSHA") {
+        let mut target_cmd = "EVAL"
+        if str_eq(cmd, "EVAL_RO") or str_eq(cmd, "EVALSHA_RO") {
+            target_cmd = "EVAL_RO"
+        }
+        if str_eq(cmd, "EVALSHA") or str_eq(cmd, "EVALSHA_RO") {
             if len(argv) < 3 {
-                return finish(r_arity("evalsha"), db, authed, 0, db_a, authed_a, quit_a)
+                return finish(r_arity(str_to_lower(cmd)), db, authed, 0, db_a, authed_a, quit_a)
             }
             let src = cmap_get(replcfg, "lua:" + argv[1])
             if str_len(src) == 0 {
                 return finish(r_err("NOSCRIPT No matching script. Please use EVAL."), db, authed, 0, db_a, authed_a, quit_a)
             }
             ev = make([]string, 0, len(argv))
-            ev = append(ev, "EVAL")
+            ev = append(ev, target_cmd)
             ev = append(ev, src)
             let mut ei = 2
             while ei < len(argv) {
@@ -1555,7 +2092,7 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
                 ei = ei + 1
             }
         }
-        return apply_key_cmd("EVAL", ev, bus, replies, ids, shards, db, authed, wal_ch, aof, db_a, authed_a, quit_a, feed, replcfg, clus)
+        return apply_key_cmd(target_cmd, ev, bus, replies, ids, shards, db, authed, wal_ch, aof, db_a, authed_a, quit_a, feed, replcfg, clus)
     }
     if str_eq(cmd, "LATENCY") {
         let none: []string = []
@@ -1759,7 +2296,7 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
         }
         return finish(b, db, authed, 0, db_a, authed_a, quit_a)
     }
-    if str_eq(cmd, "UNSUBSCRIBE") or str_eq(cmd, "PUNSUBSCRIBE") {
+    if str_eq(cmd, "UNSUBSCRIBE") {
         let id = format_int(conn_id)
         if len(argv) < 2 {
             // unsubscribe from all channels
@@ -1775,7 +2312,7 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
                 ci = ci + 1
             }
             if str_len(b) == 0 {
-                b = sub_reply("unsubscribe", "", 0)
+                b = sub_reply("unsubscribe", "", pubsub_count_subs(feed, id))
             }
             return finish(b, db, authed, 0, db_a, authed_a, quit_a)
         }
@@ -1784,6 +2321,34 @@ fn handle_one(argv: []string, bus: []chan[string], replies: CMap, ids: AtomicInt
         while i < len(argv) {
             let n = pubsub_unsub(feed, id, argv[i])
             b = b + sub_reply("unsubscribe", argv[i], n)
+            i = i + 1
+        }
+        return finish(b, db, authed, 0, db_a, authed_a, quit_a)
+    }
+    if str_eq(cmd, "PUNSUBSCRIBE") {
+        let id = format_int(conn_id)
+        if len(argv) < 2 {
+            let pk = "ps:p:" + id
+            let pats = str_split(cmap_get(feed, pk), ",")
+            let mut b = ""
+            let mut pi = 0
+            while pi < len(pats) {
+                if str_len(pats[pi]) > 0 {
+                    let n = pubsub_punsub(feed, id, pats[pi])
+                    b = b + sub_reply("punsubscribe", pats[pi], n)
+                }
+                pi = pi + 1
+            }
+            if str_len(b) == 0 {
+                b = sub_reply("punsubscribe", "", pubsub_count_subs(feed, id))
+            }
+            return finish(b, db, authed, 0, db_a, authed_a, quit_a)
+        }
+        let mut b = ""
+        let mut i = 1
+        while i < len(argv) {
+            let n = pubsub_punsub(feed, id, argv[i])
+            b = b + sub_reply("punsubscribe", argv[i], n)
             i = i + 1
         }
         return finish(b, db, authed, 0, db_a, authed_a, quit_a)
@@ -1800,23 +2365,75 @@ fn apply_key_cmd(cmd: string, argv: []string, bus: []chan[string], replies: CMap
         return finish(redir, db, authed, 0, db_a, authed_a, quit_a)
     }
     let reply = dispatch(bus, replies, ids, shards, db, argv)
-    if aof == 1 and is_write_cmd(cmd) == 1 and not str_has_prefix(reply, "-") {
-        let _ = wal_ch.send(format_int(db) + "\n" + encode_array(argv))
+    let is_w = is_write_cmd(cmd)
+    if is_w == 0 and len(argv) >= 2 and str_eq(cmap_get(feed, "trkon"), "1") and not str_has_prefix(reply, "-") {
+        cmap_set(feed, "trkk:" + argv[1], "1")
     }
-    if is_write_cmd(cmd) == 1 and not str_has_prefix(reply, "-") and len(argv) >= 2 {
-        let ev = cmap_get(replcfg, "notify")
-        if str_len(ev) > 0 {
-            let kn = str_to_lower(cmd)
-            if str_contains(ev, "K") or str_contains(ev, "A") {
-                let _ = pubsub_publish(feed, "__keyspace@" + format_int(db) + "__:" + argv[1], kn)
+    if is_w == 1 and not str_has_prefix(reply, "-") {
+        if aof == 1 {
+            let _ = wal_ch.send(format_int(db) + "\n" + encode_array(argv))
+        }
+        if len(argv) >= 2 {
+            let mut kidx = 1
+            if str_eq(cmd, "LOCK") and len(argv) >= 3 {
+                kidx = 2
             }
-            if str_contains(ev, "E") or str_contains(ev, "A") {
-                let _ = pubsub_publish(feed, "__keyevent@" + format_int(db) + "__:" + kn, argv[1])
+            let wkey = argv[kidx]
+            let ev = cmap_get(replcfg, "notify")
+            if str_len(ev) > 0 {
+                let kn = str_to_lower(cmd)
+                if str_contains(ev, "K") or str_contains(ev, "A") {
+                    let _ = pubsub_publish(feed, "__keyspace@" + format_int(db) + "__:" + wkey, kn)
+                }
+                if str_contains(ev, "E") or str_contains(ev, "A") {
+                    let _ = pubsub_publish(feed, "__keyevent@" + format_int(db) + "__:" + kn, wkey)
+                }
+            }
+            if str_eq(cmap_get(feed, "trkk:" + wkey), "1") {
+                cmap_del(feed, "trkk:" + wkey)
+                let _ = pubsub_publish(feed, "__redis__:invalidate", wkey)
+            } else {
+                let bids = cmap_get(feed, "trkbids")
+                if str_len(bids) > 0 {
+                    let bparts = str_split(bids, ",")
+                    let mut bi = 0
+                    let mut hit_bcast = 0
+                    while bi < len(bparts) {
+                        if str_len(bparts[bi]) > 0 {
+                            let tv = cmap_get(feed, "trk:" + bparts[bi])
+                            if str_has_prefix(tv, "bcast:") {
+                                let pfx = tv[6:]
+                                if str_len(pfx) == 0 or str_has_prefix(wkey, pfx) {
+                                    hit_bcast = 1
+                                    break
+                                }
+                            }
+                        }
+                        bi = bi + 1
+                    }
+                    if hit_bcast == 1 {
+                        let _ = pubsub_publish(feed, "__redis__:invalidate", wkey)
+                    }
+                }
             }
         }
+        repl_publish(feed, db, argv, reply)
     }
-    repl_publish(feed, db, argv, reply)
     return finish(reply, db, authed, 0, db_a, authed_a, quit_a)
+}
+
+#[no_alloc]
+fn is_batchable_cmd(cmd: string) -> int {
+    if str_eq(cmd, "GET") or str_eq(cmd, "SET") or str_eq(cmd, "INCR") or str_eq(cmd, "DECR") or str_eq(cmd, "INCRBY") or str_eq(cmd, "DECRBY") {
+        return 1
+    }
+    if str_eq(cmd, "HGET") or str_eq(cmd, "HSET") or str_eq(cmd, "LPUSH") or str_eq(cmd, "RPUSH") or str_eq(cmd, "LPOP") or str_eq(cmd, "RPOP") or str_eq(cmd, "LLEN") or str_eq(cmd, "SADD") or str_eq(cmd, "SISMEMBER") or str_eq(cmd, "ZADD") or str_eq(cmd, "ZSCORE") {
+        return 1
+    }
+    if str_eq(cmd, "CAS") or str_eq(cmd, "CAD") or str_eq(cmd, "RATELIMIT") or str_eq(cmd, "BF.ADD") or str_eq(cmd, "BF.EXISTS") or str_eq(cmd, "CF.ADD") or str_eq(cmd, "CF.EXISTS") or str_eq(cmd, "CMS.INCRBY") or str_eq(cmd, "CMS.QUERY") or str_eq(cmd, "TOPK.ADD") or str_eq(cmd, "JSON.GET") or str_eq(cmd, "JSON.SET") or str_eq(cmd, "TS.ADD") or str_eq(cmd, "TS.GET") or str_eq(cmd, "QUEUE.PUSH") or str_eq(cmd, "QUEUE.POP") or str_eq(cmd, "QUEUE.ACK") {
+        return 1
+    }
+    return 0
 }
 
 fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string], replies: CMap, ids: AtomicInt, shards: int, pass: string, port: int, protected: int, connected: AtomicInt, cmds: AtomicInt, wal_ch: chan[string], aof: int, sl: CMap, slowlog_us: int, feed: CMap, replcfg: CMap, stop: AtomicInt, clus: CMap, peer0: string) -> int {
@@ -1903,7 +2520,7 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
         }
         buf = buf + chunk
         let mut cap = MAX_QUERY_BUF
-        if str_eq(cmap_get(replcfg, "needauth"), "1") and atomic_load(authed_a) == 0 {
+        if atomic_load(authed_a) == 0 and str_eq(cmap_get(replcfg, "needauth"), "1") {
             cap = MAX_UNAUTH_BUF
         }
         if str_len(buf) > cap {
@@ -1912,22 +2529,27 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
             running = 0
             break
         }
+        let mut bpos = 0
+        let mut psynced = 0
+        let out_b = str_builder()
+        let mut sl_us = int_of(cmap_get(replcfg, "slowlog_us"))
+        let mut has_mon = str_len(cmap_get(feed, "monids")) > 0
         while running == 1 {
-            let argv, used, st = parse_cmd(buf)
+            let argv, next_pos, st = parse_cmd_at(buf, bpos)
             if st == 0 {
                 break
             }
             if st < 0 {
                 log_proto(peer, "parse")
-                let _ = conn_write(fd, tls_on, tc, r_err("ERR protocol error"))
+                builder_write(out_b, r_err("ERR protocol error"))
                 running = 0
                 break
             }
-            buf = buf[used:]
+            bpos = next_pos
             let cmd = cmd_name(argv)
             if subbed == 1 {
                 if not str_eq(cmd, "SUBSCRIBE") and not str_eq(cmd, "UNSUBSCRIBE") and not str_eq(cmd, "PSUBSCRIBE") and not str_eq(cmd, "PUNSUBSCRIBE") and not str_eq(cmd, "PING") and not str_eq(cmd, "QUIT") and not str_eq(cmd, "PUBLISH") {
-                    let _ = conn_write(fd, tls_on, tc, r_err("ERR Can't execute '" + str_to_lower(cmd) + "': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context"))
+                    builder_write(out_b, r_err("ERR Can't execute '" + str_to_lower(cmd) + "': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context"))
                     continue
                 }
             }
@@ -1937,20 +2559,19 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
             }
             if str_eq(cmd, "MONITOR") {
                 monitoring = 1
+                has_mon = true
                 let _ = tcp_set_timeout(fd, 100)
             }
-            if monitoring == 0 and not str_eq(cmd, "AUTH") {
-                if str_len(cmap_get(feed, "monids")) > 0 {
-                    monitor_fanout(feed, atomic_load(db_a), conn_id, argv)
-                }
+            if monitoring == 0 and has_mon and not str_eq(cmd, "AUTH") {
+                monitor_fanout(feed, atomic_load(db_a), conn_id, argv)
             }
             if verbose == 1 or hot == 1 {
                 log_cmd(cmd, conn_id, len(argv), verbose)
             }
-            if str_eq(cmap_get(replcfg, "needauth"), "1") and atomic_load(authed_a) == 0 {
+            if atomic_load(authed_a) == 0 and str_eq(cmap_get(replcfg, "needauth"), "1") {
                 if not str_eq(cmd, "AUTH") and not str_eq(cmd, "HELLO") and not str_eq(cmd, "PING") and not str_eq(cmd, "QUIT") {
                     log_noauth(cmd, conn_id)
-                    let _ = conn_write(fd, tls_on, tc, r_err("NOAUTH Authentication required."))
+                    builder_write(out_b, r_err("NOAUTH Authentication required."))
                     continue
                 }
             }
@@ -1966,38 +2587,38 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
                     }
                 }
                 atomic_store(stop, 1)
-                let _ = conn_write(fd, tls_on, tc, r_ok())
+                builder_write(out_b, r_ok())
                 running = 0
                 continue
             }
             if str_eq(cmd, "MULTI") {
                 if multi == 1 {
-                    let _ = conn_write(fd, tls_on, tc, r_err("ERR MULTI calls can not be nested"))
+                    builder_write(out_b, r_err("ERR MULTI calls can not be nested"))
                     continue
                 }
                 multi = 1
                 queued = make([]string, 0, 0)
-                let _ = conn_write(fd, tls_on, tc, r_ok())
+                builder_write(out_b, r_ok())
                 continue
             }
             if str_eq(cmd, "DISCARD") {
                 if multi == 0 {
-                    let _ = conn_write(fd, tls_on, tc, r_err("ERR DISCARD without MULTI"))
+                    builder_write(out_b, r_err("ERR DISCARD without MULTI"))
                     continue
                 }
                 multi = 0
                 queued = make([]string, 0, 0)
                 cmap_set(wat, "keys", "")
-                let _ = conn_write(fd, tls_on, tc, r_ok())
+                builder_write(out_b, r_ok())
                 continue
             }
             if str_eq(cmd, "WATCH") {
                 if multi == 1 {
-                    let _ = conn_write(fd, tls_on, tc, r_err("ERR WATCH inside MULTI is not allowed"))
+                    builder_write(out_b, r_err("ERR WATCH inside MULTI is not allowed"))
                     continue
                 }
                 if len(argv) < 2 {
-                    let _ = conn_write(fd, tls_on, tc, r_arity("watch"))
+                    builder_write(out_b, r_arity("watch"))
                     continue
                 }
                 let dbw = atomic_load(db_a)
@@ -2008,17 +2629,17 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
                     cmap_set(wat, "keys", csv_add(cmap_get(wat, "keys"), argv[wi]))
                     wi = wi + 1
                 }
-                let _ = conn_write(fd, tls_on, tc, r_ok())
+                builder_write(out_b, r_ok())
                 continue
             }
             if str_eq(cmd, "UNWATCH") {
                 cmap_set(wat, "keys", "")
-                let _ = conn_write(fd, tls_on, tc, r_ok())
+                builder_write(out_b, r_ok())
                 continue
             }
             if str_eq(cmd, "EXEC") {
                 if multi == 0 {
-                    let _ = conn_write(fd, tls_on, tc, r_err("ERR EXEC without MULTI"))
+                    builder_write(out_b, r_err("ERR EXEC without MULTI"))
                     continue
                 }
                 let dbw = atomic_load(db_a)
@@ -2038,7 +2659,7 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
                 if dirty == 1 {
                     multi = 0
                     queued = make([]string, 0, 0)
-                    let _ = conn_write(fd, tls_on, tc, r_null_arr())
+                    builder_write(out_b, r_null_arr())
                     continue
                 }
                 multi = 0
@@ -2057,51 +2678,153 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
                 }
                 queued = make([]string, 0, 0)
                 log_multi(conn_id, len(replies_a))
-                let b = str_builder()
-                builder_write(b, "*")
-                builder_write(b, format_int(len(replies_a)))
-                builder_write(b, "\r\n")
+                builder_write(out_b, "*")
+                builder_write(out_b, format_int(len(replies_a)))
+                builder_write(out_b, "\r\n")
                 i = 0
                 while i < len(replies_a) {
-                    builder_write(b, replies_a[i])
+                    builder_write(out_b, replies_a[i])
                     i = i + 1
                 }
-                let _ = conn_write(fd, tls_on, tc, builder_string(b))
                 continue
             }
             if multi == 1 {
                 if len(queued) >= 10000 {
-                    let _ = conn_write(fd, tls_on, tc, r_err("ERR MULTI queue limit reached"))
+                    builder_write(out_b, r_err("ERR MULTI queue limit reached"))
                     continue
                 }
                 queued = append(queued, encode_array(argv))
-                let _ = conn_write(fd, tls_on, tc, r_queued())
+                builder_write(out_b, r_queued())
                 continue
             }
             if str_eq(cmd, "SYNC") or str_eq(cmd, "PSYNC") {
+                let pending = builder_string(out_b)
+                if str_len(pending) > 0 {
+                    let _ = conn_write(fd, tls_on, tc, pending)
+                }
                 log_master_psync(peer)
                 let rid = cmap_get(replcfg, "replid")
                 let _ = conn_write(fd, tls_on, tc, "+FULLRESYNC " + rid + " 0\r\n")
                 let _ = psync_dump(fd, bus, replies, ids, shards, tls_on, tc)
                 log_master_psync_done()
                 let _ = replica_serve(fd, feed, stop, tls_on, tc)
+                psynced = 1
                 running = 0
                 break
             }
             if str_eq(cmd, "SLOWLOG") {
                 if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "LEN") {
-                    let _ = conn_write(fd, tls_on, tc, r_int(int_of(cmap_get(sl, "n"))))
+                    builder_write(out_b, r_int(int_of(cmap_get(sl, "n"))))
                 } else if len(argv) >= 2 and str_eq(str_to_upper(argv[1]), "RESET") {
                     cmap_set(sl, "n", "0")
-                    let _ = conn_write(fd, tls_on, tc, r_ok())
+                    builder_write(out_b, r_ok())
                 } else {
                     let mut c = 10
                     if len(argv) >= 3 {
                         c = int_of(argv[2])
                     }
-                    let _ = conn_write(fd, tls_on, tc, slowlog_get(sl, c))
+                    builder_write(out_b, slowlog_get(sl, c))
                 }
                 continue
+            }
+            if bpos < str_len(buf) and len(argv) >= 2 and is_batchable_cmd(cmd) == 1 and aof == 0 and not has_mon and verbose == 0 and hot == 0 {
+                if acl_enabled(replcfg) == 0 and not str_eq(cmap_get(clus, "on"), "1") and not str_eq(cmap_get(replcfg, "role"), "slave") and str_len(cmap_get(replcfg, "notify")) == 0 and str_len(cmap_get(feed, "trkon")) == 0 and str_len(cmap_get(feed, "trkbids")) == 0 and str_eq(cmap_get(feed, "nrepl"), "0") {
+                    let target_sh = key_shard(argv[1], shards)
+                    let mut nargv, npos2, nst = parse_cmd_at(buf, bpos)
+                    if nst == 1 and len(nargv) >= 2 {
+                        let ncmd = cmd_name(nargv)
+                        if is_batchable_cmd(ncmd) == 1 {
+                            let mut sh_idx = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+                            let mut touched = make([]int, 0, 8)
+                            let mut sh_batches = make(map[string][]string)
+                            let mut cmd_t = make([]int, 0, 16)
+                            let mut b0 = make([]string, 0, 32)
+                            b0 = append(b0, "__BATCH")
+                            b0 = append(b0, fmt_int_fast(len(argv)))
+                            let mut ai = 0
+                            while ai < len(argv) {
+                                b0 = append(b0, argv[ai])
+                                ai = ai + 1
+                            }
+                            sh_idx[target_sh] = 0
+                            touched = append(touched, target_sh)
+                            sh_batches["0"] = b0
+                            cmd_t = append(cmd_t, 0)
+                            let mut b_count = 1
+                            while nst == 1 and len(nargv) >= 2 and b_count < 64 {
+                                let c2 = cmd_name(nargv)
+                                if is_batchable_cmd(c2) == 0 {
+                                    break
+                                }
+                                let sh2 = key_shard(nargv[1], shards)
+                                let mut tidx = sh_idx[sh2]
+                                let mut tk = fmt_int_fast(tidx)
+                                if tidx < 0 {
+                                    tidx = len(touched)
+                                    tk = fmt_int_fast(tidx)
+                                    sh_idx[sh2] = tidx
+                                    touched = append(touched, sh2)
+                                    let mut nb = make([]string, 0, 16)
+                                    nb = append(nb, "__BATCH")
+                                    sh_batches[tk] = nb
+                                }
+                                let mut cur_b = sh_batches[tk]
+                                cur_b = append(cur_b, fmt_int_fast(len(nargv)))
+                                ai = 0
+                                while ai < len(nargv) {
+                                    cur_b = append(cur_b, nargv[ai])
+                                    ai = ai + 1
+                                }
+                                sh_batches[tk] = cur_b
+                                cmd_t = append(cmd_t, tidx)
+                                bpos = npos2
+                                b_count = b_count + 1
+                                if bpos >= str_len(buf) {
+                                    break
+                                }
+                                let na3, np3, ns3 = parse_cmd_at(buf, bpos)
+                                nargv = na3
+                                npos2 = np3
+                                nst = ns3
+                            }
+                            let _ = atomic_add(cmds, b_count)
+                            let cur_db = atomic_load(db_a)
+                            if len(touched) == 1 {
+                                let br = call_shard(bus, replies, ids, target_sh, cur_db, sh_batches["0"])
+                                builder_write(out_b, br)
+                                continue
+                            }
+                            let mut job_ids = make([]string, 0, len(touched))
+                            let mut ti = 0
+                            while ti < len(touched) {
+                                let sh = touched[ti]
+                                let jid = next_id(ids)
+                                send_job(bus, sh, jid, cur_db, sh_batches[fmt_int_fast(ti)])
+                                job_ids = append(job_ids, jid)
+                                ti = ti + 1
+                            }
+                            let mut sh_rep = make([]string, 0, len(touched))
+                            let mut sh_pos = make([]int, 0, len(touched))
+                            ti = 0
+                            while ti < len(touched) {
+                                sh_rep = append(sh_rep, wait_reply(replies, job_ids[ti]))
+                                sh_pos = append(sh_pos, 0)
+                                ti = ti + 1
+                            }
+                            let mut ci = 0
+                            while ci < len(cmd_t) {
+                                let tidx = cmd_t[ci]
+                                let rep = sh_rep[tidx]
+                                let p0 = sh_pos[tidx]
+                                let p1 = resp_frame_end(rep, p0)
+                                builder_write(out_b, rep[p0:p1])
+                                sh_pos[tidx] = p1
+                                ci = ci + 1
+                            }
+                            continue
+                        }
+                    }
+                }
             }
             let t0 = mono_ns()
             let r = handle_one(argv, bus, replies, ids, shards, pass, conn_id, port, connected, cmds, wal_ch, aof, db_a, authed_a, quit_a, feed, replcfg, sl, clus)
@@ -2115,8 +2838,10 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
                     }
                 }
             }
+            if str_eq(cmd, "CONFIG") {
+                sl_us = int_of(cmap_get(replcfg, "slowlog_us"))
+            }
             let us = elapsed_ns(t0) / 1000
-            let sl_us = int_of(cmap_get(replcfg, "slowlog_us"))
             if sl_us >= 0 and us >= sl_us {
                 slowlog_add(sl, us, argv)
                 log_slow(cmd, conn_id, us)
@@ -2124,18 +2849,34 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
             if verbose == 1 or hot == 1 or str_has_prefix(r, "-") {
                 log_cmd_result(cmd, conn_id, us, r, verbose)
             }
-            let _ = conn_write(fd, tls_on, tc, r)
+            builder_write(out_b, r)
             if atomic_load(quit_a) == 1 {
                 running = 0
             }
         }
+        if bpos > 0 {
+            if bpos >= str_len(buf) {
+                buf = ""
+            } else {
+                buf = buf[bpos:]
+            }
+        }
+        if psynced == 0 {
+            let out_str = builder_string(out_b)
+            if str_len(out_str) > 0 {
+                let _ = conn_write(fd, tls_on, tc, out_str)
+            }
+        }
     }
     log_conn_close(peer, conn_id)
-    cmap_set(feed, "cliids", csv_del(cmap_get(feed, "cliids"), format_int(conn_id)))
-    cmap_set(feed, "cli:" + format_int(conn_id), "")
-    cmap_set(feed, "monids", csv_del(cmap_get(feed, "monids"), format_int(conn_id)))
-    cmap_set(feed, "mon:" + format_int(conn_id), "")
-    cmap_set(feed, "monm:" + format_int(conn_id), "")
+    cmap_set(feed, "cliids", csv_del(cmap_get(feed, "cliids"), sid))
+    cmap_del(feed, "cli:" + sid)
+    cmap_set(feed, "monids", csv_del(cmap_get(feed, "monids"), sid))
+    cmap_del(feed, "mon:" + sid)
+    cmap_del(feed, "monm:" + sid)
+    cmap_set(feed, "trkbids", csv_del(cmap_get(feed, "trkbids"), sid))
+    cmap_del(feed, "trk:" + sid)
+    pubsub_cleanup_conn(feed, sid)
     let _ = atomic_add(connected, 0 - 1)
     conn_close(fd, tls_on, tc)
     return 0

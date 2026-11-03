@@ -25,7 +25,7 @@ jobs:
       - name: install makori
         run: |
           mkdir -p "$HOME/.local/bin" "$HOME/.local/share"
-          gh release download v0.5.15 -R loreste/mako -p "${{ matrix.asset }}" -D /tmp
+          gh release download v0.7.0 -R loreste/mako -p "${{ matrix.asset }}" -D /tmp
           tar xzf "/tmp/${{ matrix.asset }}" -C /tmp
           cp /tmp/${{ matrix.dir }}/bin/mako "$HOME/.local/bin/mako"
           chmod +x "$HOME/.local/bin/mako"
@@ -40,16 +40,8 @@ jobs:
       - name: test
         shell: bash {0}
         run: |
-          mako test . 2>&1 | tee /tmp/test-output.txt
-          passed=$(grep "mako test:" /tmp/test-output.txt | tail -1 | grep -o '[0-9]* passed' | grep -o '[0-9]*')
-          failed=$(grep "mako test:" /tmp/test-output.txt | tail -1 | grep -o '[0-9]* failed' | grep -o '[0-9]*')
-          echo "result: ${passed:-0} passed, ${failed:-0} failed"
-          # core tests (store, resp, crc16, glob, acl, cluster, graph, log, lua) must pass
-          # live_test, probe_test, dropin_test may fail due to port races or compiler version
-          if [ "${passed:-0}" -ge 8 ]; then
-            exit 0
-          fi
-          exit 1
+          mako check .
+          mako test .
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

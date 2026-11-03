@@ -65,6 +65,19 @@ BRAIN RECALL {myagent}mem COUNT 5 QUERY "dark theme" 0.10 0.90 -0.02 0.30
 
 Returns the top matches ranked by cosine similarity (if floats given) or by how many query tokens appear in the memory text.
 
+## Low-level Vector Commands & Hybrid Search (`VADD` / `VSIM` / `VSEARCH`)
+
+You can also work directly with vector keys using `VADD`, `VSIM`, and `VSEARCH`:
+
+```
+# Store a vector with 8x smaller int8 scalar quantization (QUANTIZED) and metadata attributes (ATTR)
+VADD docs doc1 1.0 0.0 QUANTIZED ATTR "rust mako compiler"
+VADD docs doc2 0.9 0.1 QUANTIZED ATTR "python script"
+
+# Hybrid vector cosine + keyword overlap (TEXT) + attribute substring filter (FILTER)
+VSEARCH docs COUNT 2 FILTER "mako" TEXT "compiler" WITHSCORES WITHATTR VALUES 1.0 0.0
+```
+
 ## Pack context for the model
 
 ```

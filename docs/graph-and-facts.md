@@ -117,9 +117,9 @@ SPEND {bot}sess 900
 
 `TURN` includes the remaining budget.
 
-## Leases
+## Leases and Fenced Distributed Locks (`LOCK`)
 
-Single-holder locks with a TTL:
+Simple single-holder locks with a TTL (`LEASE`):
 
 ```
 LEASE {bot}lock 30     # acquire for 30 seconds
@@ -134,7 +134,70 @@ LEASED {bot}lock       # check
 UNLEASE {bot}lock      # release early
 ```
 
-The lease expires automatically after the TTL.
+For production distributed locking with owner verification and monotonic fencing tokens (protecting against GC pauses and split-brain), use `LOCK`:
+
+```
+# Returns [acquired (1|0), fencing_token, pttl_ms]
+LOCK ACQUIRE resource:1 workerA 5000
+# 1) (integer) 1
+# 2) (integer) 1
+# 3) (integer) 5000
+
+# Renew only if owned by workerA (optional fencing token check)
+LOCK RENEW resource:1 workerA 8000 1
+# :1
+
+# Release only if owned by workerA
+LOCK RELEASE resource:1 workerA 1
+# :1
+
+# Inspect current owner, fencing token, and remaining PTTL
+LOCK INFO resource:1
+```
+
+## Native Delayed & Retryable Job Queues (`QUEUE.*`)
+
+Built-in priority job queue with delayed execution, visibility timeouts, retry budgets, and a Dead-Letter Queue (DLQ):
+
+```
+# Push jobs with optional DELAY (ms), PRIORITY (higher = first), and MAXRETRIES
+QUEUE.PUSH q:jobs j1 '{"task":"email"}' PRIORITY 1 MAXRETRIES 2
+QUEUE.PUSH q:jobs j2 '{"task":"urgent"}' PRIORITY 10 DELAY 0 MAXRETRIES 2
+
+# Pop highest-priority ready job with a 30s visibility window
+# Returns [job_id, payload, attempt_number]
+QUEUE.POP q:jobs worker1 VISIBILITY 30000
+
+# Acknowledge completion
+QUEUE.ACK q:jobs j2
+
+# Negative-acknowledge (re-queues immediately or after DELAY ms; moves to DLQ if attempts > maxretries)
+QUEUE.NACK q:jobs j1 DELAY 1000
+
+# Inspect, retry, or purge the Dead-Letter Queue
+QUEUE.DLQ q:jobs LIST
+QUEUE.DLQ q:jobs RETRY j1
+QUEUE.DLQ q:jobs PURGE
+
+# Queue state counts (ready, delayed, inflight, dlq, total)
+QUEUE.STATS q:jobs
+```
+
+## Native Full-Text & Secondary Indexing (`FT.*`)
+
+RediSearch-compatible secondary indexing over `HASH` and `JSON` documents on the shard:
+
+```
+FT.CREATE idx:books ON HASH PREFIX 1 book: SCHEMA title TEXT genre TAG price NUMERIC SORTABLE
+HSET book:1 title "Systems Programming in Mako" genre "tech,systems" price 45
+HSET book:2 title "Distributed Databases" genre "tech,db" price 60
+
+# Search by tag, numeric range, and text with sorting
+FT.SEARCH idx:books "@genre:{tech} @price:[40 70]" SORTBY price DESC NOCONTENT
+FT.INFO idx:books
+FT._LIST
+FT.DROPINDEX idx:books
+```
 
 ## Hash tag requirement
 

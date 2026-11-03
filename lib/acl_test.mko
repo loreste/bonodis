@@ -9,6 +9,12 @@ fn TestAclQuorumCmdOk() {
     assert_eq(acl_cmd_ok("-@all +get", "SET"), 0)
     assert_eq(acl_cmd_ok("+@all -flushall", "FLUSHALL"), 0)
     assert_eq(acl_cmd_ok("+@all -flushall", "GET"), 1)
+    assert_eq(acl_cmd_ok("+@all -getset", "GET"), 1)
+    assert_eq(acl_cmd_ok("+@all -getset", "GETSET"), 0)
+    assert_eq(acl_cmd_ok("+@all -get", "GET"), 0)
+    assert_eq(acl_cmd_ok("+@all -get", "GETSET"), 1)
+    assert_eq(acl_cmd_ok("+@all -@write +set", "SET"), 1)
+    assert_eq(acl_cmd_ok("+@all -@write +set", "DEL"), 0)
 }
 
 fn TestAclSetuserAndAuth() {

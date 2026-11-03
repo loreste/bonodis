@@ -11,14 +11,35 @@ fn grow_bytes(s: string, n: int) -> string {
     return builder_string(b)
 }
 
-fn pow2(n: int) -> int {
-    let mut v = 1
-    let mut i = 0
-    while i < n {
-        v = v * 2
-        i = i + 1
+#[no_alloc]
+const fn pow2(n: int) -> int {
+    return 1 << n
+}
+
+#[no_alloc]
+const fn popcount_u8(x: int) -> int {
+    let v0 = x & 255
+    let v1 = v0 - ((v0 >> 1) & 85)
+    let v2 = (v1 & 51) + ((v1 >> 2) & 51)
+    return (v2 + (v2 >> 4)) & 15
+}
+
+#[no_alloc]
+fn bitpos_u8(v: int) -> int {
+    let mut x = v & 255
+    let mut pos = 0
+    if (x & 240) == 0 {
+        pos = pos + 4
+        x = x << 4
     }
-    return v
+    if (x & 192) == 0 {
+        pos = pos + 2
+        x = x << 2
+    }
+    if (x & 128) == 0 {
+        pos = pos + 1
+    }
+    return pos
 }
 
 fn Store_cmd_setbit(mut self: Store, db: int, argv: []string) -> string {
@@ -105,6 +126,29 @@ fn Store_cmd_bitcount(mut self: Store, db: int, argv: []string) -> string {
     if len(argv) < 2 {
         return r_arity("bitcount")
     }
+    if len(argv) != 2 and len(argv) != 4 and len(argv) != 5 {
+        return r_syntax()
+    }
+    let mut a0 = 0
+    let mut b0 = -1
+    let mut bit_mode = 0
+    if len(argv) >= 4 {
+        let sa, oka = int_ok(argv[2])
+        let sb, okb = int_ok(argv[3])
+        if oka == 0 or okb == 0 {
+            return r_notint()
+        }
+        a0 = sa
+        b0 = sb
+        if len(argv) == 5 {
+            let mode = str_to_upper(argv[4])
+            if str_eq(mode, "BIT") {
+                bit_mode = 1
+            } else if not str_eq(mode, "BYTE") {
+                return r_syntax()
+            }
+        }
+    }
     let ik = ikey(db, argv[1])
     let t = self.kind(ik)
     if t == T_NONE {
@@ -114,19 +158,67 @@ fn Store_cmd_bitcount(mut self: Store, db: int, argv: []string) -> string {
         return r_wrongtype()
     }
     let s = self.strs[ik]
-    let mut n = 0
-    let mut i = 0
-    while i < str_len(s) {
-        let mut v = str_byte_at(s, i)
-        while v > 0 {
-            n = n + (v % 2)
-            v = v / 2
+    let slen = str_len(s)
+    if slen == 0 {
+        return r_int(0)
+    }
+    if bit_mode == 1 {
+        let total_bits = slen * 8
+        let mut ba = a0
+        let mut bb = b0
+        if ba < 0 {
+            ba = total_bits + ba
         }
+        if bb < 0 {
+            bb = total_bits + bb
+        }
+        if ba < 0 {
+            ba = 0
+        }
+        if bb >= total_bits {
+            bb = total_bits - 1
+        }
+        if ba > bb {
+            return r_int(0)
+        }
+        let mut n = 0
+        let mut bi = ba
+        while bi <= bb {
+            let byte_idx = bi / 8
+            let bit_pos = 7 - (bi % 8)
+            let v = str_byte_at(s, byte_idx)
+            n = n + ((v / pow2(bit_pos)) % 2)
+            bi = bi + 1
+        }
+        return r_int(n)
+    }
+    let mut a = a0
+    let mut b = b0
+    if a < 0 {
+        a = slen + a
+    }
+    if b < 0 {
+        b = slen + b
+    }
+    if a < 0 {
+        a = 0
+    }
+    if b >= slen {
+        b = slen - 1
+    }
+    if a > b {
+        return r_int(0)
+    }
+    let mut n = 0
+    let mut i = a
+    while i <= b {
+        n = n + popcount_u8(str_byte_at(s, i))
         i = i + 1
     }
     return r_int(n)
 }
 
+#[no_alloc]
 fn bitop_bytes(op: string, a: int, b: int) -> int {
     if str_eq(op, "AND") {
         return a & b
@@ -251,14 +343,16 @@ fn Store_cmd_bitpos(mut self: Store, db: int, argv: []string) -> string {
     let s = self.strs[ik]
     let mut i = 0
     while i < str_len(s) {
-        let mut b = 7
-        while b >= 0 {
-            let v = str_byte_at(s, i)
-            let cur = (v / pow2(b)) % 2
-            if cur == bit {
-                return r_int(i * 8 + (7 - b))
+        let v = str_byte_at(s, i) & 255
+        if bit == 1 {
+            if v != 0 {
+                return r_int(i * 8 + bitpos_u8(v))
             }
-            b = b - 1
+        } else {
+            let inv = (255 - v) & 255
+            if inv != 0 {
+                return r_int(i * 8 + bitpos_u8(inv))
+            }
         }
         i = i + 1
     }
@@ -268,6 +362,7 @@ fn Store_cmd_bitpos(mut self: Store, db: int, argv: []string) -> string {
     return r_int(0 - 1)
 }
 
+#[no_alloc]
 fn bf_bit_at(s: string, off: int) -> int {
     if off < 0 {
         return 0

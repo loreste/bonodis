@@ -466,3 +466,122 @@ fn TestReactUnit() {
     let _ = st.dispatch_cmd(0, rargv)
     assert_eq_str(st.dispatch_cmd(0, ["GET", "dst"]), "$4\r\ntest\r\n")
 }
+
+fn TestStoreBugfixStream() {
+    let mut st = new_store()
+    assert(str_has_prefix(st.apply(0, ["XADD", "s", "0-0", "f", "v"]), "-ERR"))
+    let r1 = st.apply(0, ["XADD", "s", "10-1", "f", "v1"])
+    assert_eq_str(r1, "$4\r\n10-1\r\n")
+    assert(str_has_prefix(st.apply(0, ["XADD", "s", "10-1", "f", "v2"]), "-ERR"))
+    assert(str_has_prefix(st.apply(0, ["XADD", "s", "9-9", "f", "v2"]), "-ERR"))
+    let r2 = st.apply(0, ["XADD", "s", "MAXLEN", "2", "10-2", "f", "v2"])
+    assert_eq_str(r2, "$4\r\n10-2\r\n")
+    let r3 = st.apply(0, ["XADD", "s", "MAXLEN", "~", "2", "10-3", "f", "v3"])
+    assert_eq_str(r3, "$4\r\n10-3\r\n")
+    assert_eq_str(st.apply(0, ["XLEN", "s"]), ":2\r\n")
+    let xrd = st.apply(0, ["XREAD", "STREAMS", "s", "10-2"])
+    assert(str_contains(xrd, "10-3"))
+    assert(not str_contains(xrd, "10-2"))
+    assert_eq_str(st.apply(0, ["XREAD", "STREAMS", "s", "10-3"]), "$-1\r\n")
+}
+
+fn TestStoreBugfixZset() {
+    let mut st = new_store()
+    assert(str_has_prefix(st.apply(0, ["ZADD", "zs", "1e", "a"]), "-ERR"))
+    assert(str_has_prefix(st.apply(0, ["ZADD", "zs", "e5", "a"]), "-ERR"))
+    assert_eq_str(st.apply(0, ["ZADD", "zs", "10", "a", "20", "b"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["ZADD", "zs", "NX", "99", "a", "30", "c"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["ZSCORE", "zs", "a"]), "$2\r\n10\r\n")
+    assert_eq_str(st.apply(0, ["ZADD", "zs", "XX", "CH", "15", "a", "40", "d"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["ZADD", "zs", "GT", "CH", "12", "a"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["ZADD", "zs", "LT", "CH", "12", "a"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["ZADD", "zs", "INCR", "3", "a"]), "$20\r\n15.00000000000000000\r\n")
+
+    let _ = st.apply(0, ["ZADD", "z1", "2", "x", "5", "y"])
+    let _ = st.apply(0, ["ZADD", "z2", "3", "x", "7", "z"])
+    assert_eq_str(st.apply(0, ["ZINTERSTORE", "zint", "2", "z1", "z2"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["ZSCORE", "zint", "x"]), "$8\r\n5.000000\r\n")
+    let zrev = parse_array_bulks(st.apply(0, ["ZREVRANGEBYSCORE", "zs", "+inf", "-inf", "WITHSCORES", "LIMIT", "0", "2"]))
+    assert_eq(len(zrev), 4)
+    assert_eq_str(zrev[0], "c")
+    assert_eq_str(zrev[1], "30")
+    assert_eq_str(zrev[2], "b")
+    assert_eq_str(zrev[3], "20")
+}
+
+fn TestStoreBugfixMisc() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["PFADD", "hll1", "u1", "u2", "u3"])
+    let _ = st.apply(0, ["PFADD", "hll2", "u1", "u2", "u3"])
+    let c1 = st.apply(0, ["PFCOUNT", "hll1"])
+    let c12 = st.apply(0, ["PFCOUNT", "hll1", "hll2"])
+    assert_eq_str(c1, c12)
+
+    let _ = st.apply(0, ["SET", "bc", "foobar"])
+    assert_eq_str(st.apply(0, ["BITCOUNT", "bc"]), ":26\r\n")
+    assert_eq_str(st.apply(0, ["BITCOUNT", "bc", "0", "0"]), ":4\r\n")
+    assert_eq_str(st.apply(0, ["BITCOUNT", "bc", "1", "1"]), ":6\r\n")
+    assert_eq_str(st.apply(0, ["BITCOUNT", "bc", "0", "7", "BIT"]), ":4\r\n")
+
+    assert_eq_str(st.apply(0, ["SET", "node1", "val"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["FACT", "ADD", "node1", "role", "admin"]), "+OK\r\n")
+    assert(str_contains(st.apply(0, ["FACT", "WHO", "role", "admin"]), "node1"))
+    let _ = st.apply(0, ["DEL", "node1"])
+    assert(not str_contains(st.apply(0, ["FACT", "WHO", "role", "admin"]), "node1"))
+
+    assert_eq_str(st.dispatch_cmd(0, ["REACT", "CREATE", "r1", "k1", "ON", "WRITE", "SET", "out", "$KEY:$KEY:$VALUE"]), "+OK\r\n")
+    assert_eq_str(st.dispatch_cmd(0, ["REACT", "CREATE", "r1", "k2", "ON", "WRITE", "SET", "out", "$KEY:$KEY:$VALUE"]), "+OK\r\n")
+    assert_eq(len(st.react_collect(0, "k1", "v")), 0)
+    let rcmds = st.react_collect(0, "k2", "v")
+    assert_eq(len(rcmds), 1)
+    let rargv = react_decode_argv(rcmds[0])
+    assert_eq_str(rargv[2], "k2:k2:v")
+
+    let _ = st.apply(0, ["BRAIN", "REMEMBER", "m070", "id1", "alpha beta gamma", "1.0", "0.0", "0.0", "0.0", "2.0"])
+    let _ = st.apply(0, ["BRAIN", "REMEMBER", "m070", "id2", "alpha beta delta", "0.0", "1.0", "0.0", "0.0", "4.0"])
+    assert_eq_str(st.apply(0, ["BRAIN", "COMPACT", "m070"]), ":1\r\n")
+    let rec = parse_array_bulks(st.apply(0, ["BRAIN", "RECALL", "m070", "COUNT", "1", "0.5", "0.5", "0.0", "0.0", "3.0"]))
+    assert_eq(len(rec), 3)
+    assert_eq_str(rec[1], "1.0000")
+}
+
+fn TestHashFieldExpiryAndScanType() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["HSETEX", "h1", "EX", "60", "FIELDS", "2", "f1", "v1", "f2", "v2"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["HSETEX", "h1", "FNX", "EX", "120", "FIELDS", "1", "f1", "v_no"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["HGET", "h1", "f1"]), "$2\r\nv1\r\n")
+
+    let httl = st.apply(0, ["HTTL", "h1", "FIELDS", "3", "f1", "f2", "missing"])
+    assert(str_has_prefix(httl, "*3\r\n:"))
+    assert(str_contains(httl, ":-2\r\n"))
+
+    assert_eq_str(st.apply(0, ["HEXPIRE", "h1", "30", "GT", "FIELDS", "1", "f1"]), "*1\r\n:0\r\n")
+    assert_eq_str(st.apply(0, ["HEXPIRE", "h1", "30", "LT", "FIELDS", "1", "f1"]), "*1\r\n:1\r\n")
+    assert_eq_str(st.apply(0, ["HPERSIST", "h1", "FIELDS", "1", "f1"]), "*1\r\n:1\r\n")
+    assert_eq_str(st.apply(0, ["HTTL", "h1", "FIELDS", "1", "f1"]), "*1\r\n:-1\r\n")
+
+    let d = st.apply(0, ["DUMP", "h1"])
+    let payload = bulk_payload(d)
+    assert_eq_str(st.apply(0, ["RESTORE", "h1_copy", "0", payload]), "+OK\r\n")
+    let httl_copy = st.apply(0, ["HTTL", "h1_copy", "FIELDS", "2", "f1", "f2"])
+    assert(str_contains(httl_copy, ":-1\r\n"))
+    assert(not str_eq(httl_copy, "*2\r\n:-1\r\n:-1\r\n"))
+
+    assert_eq_str(st.apply(0, ["HEXPIRE", "h1", "0", "FIELDS", "1", "f2"]), "*1\r\n:2\r\n")
+    assert_eq_str(st.apply(0, ["HGET", "h1", "f2"]), "$-1\r\n")
+    assert_eq_str(st.apply(0, ["HEXPIRE", "h1", "-1", "FIELDS", "1", "f1"]), "*1\r\n:2\r\n")
+    assert_eq_str(st.apply(0, ["EXISTS", "h1"]), ":0\r\n")
+
+    let _ = st.apply(0, ["SET", "str_k", "v"])
+    let _ = st.apply(0, ["LPUSH", "list_k", "x"])
+    let sc_hash = st.apply(0, ["SCAN", "0", "TYPE", "hash"])
+    assert(str_contains(sc_hash, "h1_copy"))
+    assert(not str_contains(sc_hash, "str_k"))
+    assert(not str_contains(sc_hash, "list_k"))
+
+    let _ = st.apply(0, ["HSET", "hscan_k", "b_field", "2", "a_field", "1", "c_field", "3"])
+    let hsc1 = st.apply(0, ["HSCAN", "hscan_k", "0", "MATCH", "*_field", "COUNT", "2"])
+    assert(str_contains(hsc1, "a_field"))
+    assert(str_contains(hsc1, "b_field"))
+    assert(not str_contains(hsc1, "c_field"))
+}

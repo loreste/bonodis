@@ -124,3 +124,240 @@ fn TestZremrangeXdel() {
     assert_eq_str(n, ":1\r\n")
     let _ = st.apply(0, ["XTRIM", "s", "MAXLEN", "0"])
 }
+
+fn TestUnifiedZrangeLexAndRankWithScore() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["ZADD", "z", "0", "alpha", "0", "beta", "0", "delta", "0", "gamma"])
+    // ZLEXCOUNT & ZRANGEBYLEX / ZREVRANGEBYLEX
+    assert_eq_str(st.apply(0, ["ZLEXCOUNT", "z", "[alpha", "[delta"]), ":3\r\n")
+    assert_eq_str(st.apply(0, ["ZLEXCOUNT", "z", "(alpha", "(gamma"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["ZRANGEBYLEX", "z", "[beta", "+", "LIMIT", "0", "2"]), "*2\r\n$4\r\nbeta\r\n$5\r\ndelta\r\n")
+    assert_eq_str(st.apply(0, ["ZREVRANGEBYLEX", "z", "[gamma", "(alpha", "LIMIT", "0", "2"]), "*2\r\n$5\r\ngamma\r\n$5\r\ndelta\r\n")
+    // Unified ZRANGE with BYLEX + REV + LIMIT
+    assert_eq_str(st.apply(0, ["ZRANGE", "z", "[gamma", "[beta", "BYLEX", "REV", "LIMIT", "0", "2"]), "*2\r\n$5\r\ngamma\r\n$5\r\ndelta\r\n")
+    // ZRANGESTORE
+    assert_eq_str(st.apply(0, ["ZRANGESTORE", "zdst", "z", "[alpha", "[delta", "BYLEX"]), ":3\r\n")
+    assert_eq_str(st.apply(0, ["ZCARD", "zdst"]), ":3\r\n")
+    // ZREMRANGEBYLEX
+    assert_eq_str(st.apply(0, ["ZREMRANGEBYLEX", "zdst", "[beta", "[delta"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["ZCARD", "zdst"]), ":1\r\n")
+    // Unified ZRANGE with BYSCORE + REV + LIMIT + WITHSCORES
+    let _ = st.apply(0, ["ZADD", "zs", "10", "m1", "20", "m2", "30", "m3"])
+    assert_eq_str(st.apply(0, ["ZRANGE", "zs", "15", "35", "BYSCORE", "WITHSCORES"]), "*4\r\n$2\r\nm2\r\n$2\r\n20\r\n$2\r\nm3\r\n$2\r\n30\r\n")
+    assert_eq_str(st.apply(0, ["ZRANGE", "zs", "35", "10", "BYSCORE", "REV", "LIMIT", "1", "1"]), "*1\r\n$2\r\nm2\r\n")
+    // ZRANK / ZREVRANK WITHSCORE
+    assert_eq_str(st.apply(0, ["ZRANK", "zs", "m2", "WITHSCORE"]), "*2\r\n:1\r\n$2\r\n20\r\n")
+    assert_eq_str(st.apply(0, ["ZREVRANK", "zs", "m2", "WITHSCORE"]), "*2\r\n:1\r\n$2\r\n20\r\n")
+    assert_eq_str(st.apply(0, ["ZRANK", "zs", "missing", "WITHSCORE"]), "*-1\r\n")
+}
+
+fn TestHashGetexAndExpiretime() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["HSET", "h", "f1", "v1", "f2", "v2"])
+    assert_eq_str(st.apply(0, ["HEXPIRETIME", "h", "FIELDS", "3", "f1", "f2", "missing"]), "*3\r\n:-1\r\n:-1\r\n:-2\r\n")
+    let g = st.apply(0, ["HGETEX", "h", "EX", "60", "FIELDS", "2", "f1", "missing"])
+    assert_eq_str(g, "*2\r\n$2\r\nv1\r\n$-1\r\n")
+    let et = st.apply(0, ["HEXPIRETIME", "h", "FIELDS", "2", "f1", "f2"])
+    assert(str_has_prefix(et, "*2\r\n:"))
+    assert(str_contains(et, "\r\n:-1\r\n"))
+    let gp = st.apply(0, ["HGETEX", "h", "PERSIST", "FIELDS", "1", "f1"])
+    assert_eq_str(gp, "*1\r\n$2\r\nv1\r\n")
+    assert_eq_str(st.apply(0, ["HEXPIRETIME", "h", "FIELDS", "1", "f1"]), "*1\r\n:-1\r\n")
+}
+
+fn TestLcsAndSubstr() {
+    let mut st = new_store()
+    let _ = st.apply(0, ["SET", "k1", "ohmytext"])
+    let _ = st.apply(0, ["SET", "k2", "mynewtext"])
+    assert_eq_str(st.apply(0, ["SUBSTR", "k1", "2", "3"]), "$2\r\nmy\r\n")
+    assert_eq_str(st.apply(0, ["LCS", "k1", "k2"]), "$6\r\nmytext\r\n")
+    assert_eq_str(st.apply(0, ["LCS", "k1", "k2", "LEN"]), ":6\r\n")
+    let idx = st.apply(0, ["LCS", "k1", "k2", "IDX", "MINMATCHLEN", "2", "WITHMATCHLEN"])
+    assert(str_contains(idx, "matches"))
+    assert(str_contains(idx, ":6\r\n"))
+}
+
+fn TestKillerCasCadDelexRatelimitThrottle() {
+    let mut st = new_store()
+    assert_eq_str(st.apply(0, ["CAS", "lock", "v1", "v2"]), ":-1\r\n")
+    let _ = st.apply(0, ["SET", "lock", "v1"])
+    assert_eq_str(st.apply(0, ["CAS", "lock", "wrong", "v2"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["CAS", "lock", "v1", "v2", "EX", "60"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["GET", "lock"]), "$2\r\nv2\r\n")
+    assert(parse_int_reply(st.apply(0, ["TTL", "lock"])) > 0)
+    // CAD
+    assert_eq_str(st.apply(0, ["CAD", "lock", "v1"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["CAD", "lock", "v2"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["CAD", "lock", "v2"]), ":-1\r\n")
+    // DELEX
+    let _ = st.apply(0, ["SET", "dx", "tok1"])
+    assert_eq_str(st.apply(0, ["DELEX", "dx", "IFEQ", "tok2"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["DELEX", "dx", "IFNE", "tok1"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["DELEX", "dx", "IFEQ", "tok1"]), ":1\r\n")
+    // RATELIMIT
+    let rl1 = st.apply(0, ["RATELIMIT", "rl:ip", "2", "60000"])
+    assert(str_has_prefix(rl1, "*4\r\n:1\r\n:1\r\n"))
+    let rl2 = st.apply(0, ["RATELIMIT", "rl:ip", "2", "60000"])
+    assert(str_has_prefix(rl2, "*4\r\n:1\r\n:0\r\n"))
+    let rl3 = st.apply(0, ["RATELIMIT", "rl:ip", "2", "60000"])
+    assert(str_has_prefix(rl3, "*4\r\n:0\r\n:0\r\n"))
+    // CL.THROTTLE (redis-cell GCRA drop-in)
+    let ct1 = st.apply(0, ["CL.THROTTLE", "cell:u1", "1", "2", "60", "1"])
+    assert(str_has_prefix(ct1, "*5\r\n:0\r\n:2\r\n:1\r\n:-1\r\n"))
+    let ct2 = st.apply(0, ["CL.THROTTLE", "cell:u1", "1", "2", "60", "1"])
+    assert(str_has_prefix(ct2, "*5\r\n:0\r\n:2\r\n:0\r\n:-1\r\n"))
+    let ct3 = st.apply(0, ["CL.THROTTLE", "cell:u1", "1", "2", "60", "1"])
+    assert(str_has_prefix(ct3, "*5\r\n:1\r\n:2\r\n:0\r\n"))
+    // REACT ON DELETE
+    assert_eq_str(st.apply(0, ["REACT", "CREATE", "rdel", "sess:1", "ON", "DELETE", "INCR", "stats:del"]), "+OK\r\n")
+    st.xp["\u001eReactCurEvt\u001e"] = "WRITE"
+    assert_eq(len(st.react_collect(0, "sess:1", "v")), 0)
+    st.xp["\u001eReactCurEvt\u001e"] = "DELETE"
+    assert_eq(len(st.react_collect(0, "sess:1", "")), 1)
+}
+
+fn TestBloomJsonTimeSeries() {
+    let mut st = new_store()
+    // Bloom filter (BF.*)
+    assert_eq_str(st.apply(0, ["BF.RESERVE", "bf", "0.01", "1000"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["BF.ADD", "bf", "alice"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["BF.ADD", "bf", "alice"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["BF.MADD", "bf", "alice", "bob"]), "*2\r\n:0\r\n:1\r\n")
+    assert_eq_str(st.apply(0, ["BF.EXISTS", "bf", "alice"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["BF.EXISTS", "bf", "charlie"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["BF.MEXISTS", "bf", "bob", "charlie"]), "*2\r\n:1\r\n:0\r\n")
+    assert_eq_str(st.apply(0, ["BF.CARD", "bf"]), ":2\r\n")
+    assert(str_contains(st.apply(0, ["BF.INFO", "bf"]), "Number of items inserted"))
+
+    // Native JSON (JSON.*)
+    assert_eq_str(st.apply(0, ["JSON.SET", "u:1", "$", "{\"name\":\"Ada\",\"score\":10,\"tags\":[\"ai\"]}", "NX"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["JSON.SET", "u:1", "$", "{}", "NX"]), "$-1\r\n")
+    assert_eq_str(st.apply(0, ["JSON.GET", "u:1", ".name"]), "$5\r\n\"Ada\"\r\n")
+    assert_eq_str(st.apply(0, ["JSON.GET", "u:1", "$.name"]), "$7\r\n[\"Ada\"]\r\n")
+    assert_eq_str(st.apply(0, ["JSON.TYPE", "u:1", "$.score"]), "$7\r\ninteger\r\n")
+    assert_eq_str(st.apply(0, ["JSON.NUMINCRBY", "u:1", "$.score", "5"]), "$2\r\n15\r\n")
+    assert_eq_str(st.apply(0, ["JSON.STRAPPEND", "u:1", "$.name", "\" Lovelace\""]), ":12\r\n")
+    assert_eq_str(st.apply(0, ["JSON.STRLEN", "u:1", "$.name"]), ":12\r\n")
+    assert_eq_str(st.apply(0, ["JSON.ARRAPPEND", "u:1", "$.tags", "\"db\"", "\"fast\""]), ":3\r\n")
+    assert_eq_str(st.apply(0, ["JSON.ARRLEN", "u:1", "$.tags"]), ":3\r\n")
+    assert_eq_str(st.apply(0, ["JSON.OBJLEN", "u:1", "$"]), ":3\r\n")
+    assert_eq_str(st.apply(0, ["JSON.DEL", "u:1", "$.tags"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["JSON.OBJLEN", "u:1", "$"]), ":2\r\n")
+
+    // Native Time-Series (TS.*)
+    assert_eq_str(st.apply(0, ["TS.CREATE", "ts:cpu", "RETENTION", "60000", "LABELS", "host", "n1"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["TS.ADD", "ts:cpu", "1000", "10"]), ":1000\r\n")
+    assert_eq_str(st.apply(0, ["TS.ADD", "ts:cpu", "1500", "20"]), ":1500\r\n")
+    assert_eq_str(st.apply(0, ["TS.ADD", "ts:cpu", "2000", "30"]), ":2000\r\n")
+    assert_eq_str(st.apply(0, ["TS.GET", "ts:cpu"]), "*2\r\n:2000\r\n$2\r\n30\r\n")
+    let agg = st.apply(0, ["TS.RANGE", "ts:cpu", "-", "+", "AGGREGATION", "avg", "1000"])
+    assert(str_contains(agg, ":1000\r\n$7\r\n15.0000\r\n"))
+    assert(str_contains(agg, ":2000\r\n$7\r\n30.0000\r\n"))
+    assert(str_contains(st.apply(0, ["TS.INFO", "ts:cpu"]), "totalSamples"))
+}
+
+fn TestLockSexpireZexpireZintercardEvalRoVsearch() {
+    let mut st = new_store()
+    // Fenced Distributed Lock (LOCK)
+    let l1 = st.apply(0, ["LOCK", "ACQUIRE", "res:1", "workerA", "5000"])
+    assert_eq_str(l1, "*3\r\n:1\r\n:1\r\n:5000\r\n")
+    let l2 = st.apply(0, ["LOCK", "ACQUIRE", "res:1", "workerB", "5000"])
+    assert(str_has_prefix(l2, "*3\r\n:0\r\n:1\r\n:"))
+    assert_eq_str(st.apply(0, ["LOCK", "RENEW", "res:1", "workerA", "8000", "1"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["LOCK", "RELEASE", "res:1", "workerB"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["LOCK", "RELEASE", "res:1", "workerA", "1"]), ":1\r\n")
+    let l3 = st.apply(0, ["LOCK", "ACQUIRE", "res:1", "workerB", "5000"])
+    assert_eq_str(l3, "*3\r\n:1\r\n:2\r\n:5000\r\n")
+
+    // Sub-key TTLs for Sets and ZSets (SEXPIRE / ZEXPIRE)
+    let _ = st.apply(0, ["SADD", "s", "m1", "m2"])
+    assert_eq_str(st.apply(0, ["SEXPIRE", "s", "60", "MEMBERS", "2", "m1", "missing"]), "*2\r\n:1\r\n:-2\r\n")
+    let sttl = st.apply(0, ["STTL", "s", "MEMBERS", "2", "m1", "m2"])
+    assert(str_contains(sttl, "\r\n:-1\r\n"))
+    assert_eq_str(st.apply(0, ["SPERSIST", "s", "MEMBERS", "1", "m1"]), "*1\r\n:1\r\n")
+
+    let _ = st.apply(0, ["ZADD", "z", "1", "a", "2", "b"])
+    assert_eq_str(st.apply(0, ["ZEXPIRE", "z", "60", "MEMBERS", "2", "a", "missing"]), "*2\r\n:1\r\n:-2\r\n")
+    assert_eq_str(st.apply(0, ["ZPERSIST", "z", "MEMBERS", "1", "a"]), "*1\r\n:1\r\n")
+
+    // ZINTERCARD, SORT_RO, EVAL_RO
+    let _ = st.apply(0, ["ZADD", "z2", "5", "b", "6", "c"])
+    assert_eq_str(st.apply(0, ["ZINTERCARD", "2", "z", "z2"]), ":1\r\n")
+    assert(str_has_prefix(st.apply(0, ["SORT_RO", "s", "ALPHA", "STORE", "out"]), "-ERR"))
+    assert_eq_str(st.apply(0, ["EVAL_RO", "return redis.call('ZCARD', KEYS[1])", "1", "z"]), ":2\r\n")
+    assert(str_has_prefix(st.apply(0, ["EVAL_RO", "return redis.call('SET', KEYS[1], 'x')", "1", "z"]), "-ERR Write commands"))
+
+    // Quantized Vector + Hybrid VSEARCH + Glob REACT
+    assert_eq_str(st.apply(0, ["VADD", "idx", "doc1", "1.0", "0.0", "QUANTIZED", "ATTR", "rust mako compiler"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["VADD", "idx", "doc2", "0.9", "0.1", "QUANTIZED", "ATTR", "python script"]), ":1\r\n")
+    let vs = st.apply(0, ["VSEARCH", "idx", "COUNT", "2", "FILTER", "mako", "TEXT", "compiler", "VALUES", "1.0", "0.0"])
+    assert_eq_str(vs, "*1\r\n$4\r\ndoc1\r\n")
+
+    assert_eq_str(st.apply(0, ["REACT", "CREATE", "g1", "user:*", "ON", "EXPIRE", "INCR", "exp:cnt"]), "+OK\r\n")
+    st.xp["\u001eReactCurEvt\u001e"] = "EXPIRE"
+    assert_eq(len(st.react_collect(0, "user:42", "")), 1)
+}
+
+fn TestCuckooCmsTopkQueueFtLua() {
+    let mut st = new_store()
+    // O(1) Head-Slack List LPUSH / LPOP / LINDEX / LSET / LRANGE
+    let mut li = 0
+    while li < 100 {
+        let _ = st.apply(0, ["LPUSH", "dq", "v" + fmt_int_fast(li)])
+        li = li + 1
+    }
+    assert_eq_str(st.apply(0, ["LLEN", "dq"]), ":100\r\n")
+    assert_eq_str(st.apply(0, ["LINDEX", "dq", "0"]), "$3\r\nv99\r\n")
+    assert_eq_str(st.apply(0, ["LPOP", "dq"]), "$3\r\nv99\r\n")
+    assert_eq_str(st.apply(0, ["RPOP", "dq"]), "$2\r\nv0\r\n")
+    assert_eq_str(st.apply(0, ["LLEN", "dq"]), ":98\r\n")
+
+    // Cuckoo Filter (CF.*)
+    assert_eq_str(st.apply(0, ["CF.RESERVE", "cf", "1024"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["CF.ADD", "cf", "apple"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["CF.ADDNX", "cf", "apple"]), ":0\r\n")
+    assert_eq_str(st.apply(0, ["CF.ADD", "cf", "apple"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["CF.COUNT", "cf", "apple"]), ":2\r\n")
+    assert_eq_str(st.apply(0, ["CF.EXISTS", "cf", "apple"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["CF.DEL", "cf", "apple"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["CF.COUNT", "cf", "apple"]), ":1\r\n")
+
+    // Count-Min Sketch (CMS.*)
+    assert_eq_str(st.apply(0, ["CMS.INITBYDIM", "cms", "100", "5"]), "+OK\r\n")
+    assert_eq_str(st.apply(0, ["CMS.INCRBY", "cms", "k1", "5", "k2", "12"]), "*2\r\n:5\r\n:12\r\n")
+    assert_eq_str(st.apply(0, ["CMS.QUERY", "cms", "k1", "k2", "k3"]), "*3\r\n:5\r\n:12\r\n:0\r\n")
+
+    // Top-K (TOPK.*)
+    assert_eq_str(st.apply(0, ["TOPK.RESERVE", "tk", "2"]), "+OK\r\n")
+    let _ = st.apply(0, ["TOPK.INCRBY", "tk", "a", "10", "b", "20", "c", "30"])
+    assert_eq_str(st.apply(0, ["TOPK.LIST", "tk"]), "*2\r\n$1\r\nc\r\n$1\r\nb\r\n")
+    assert_eq_str(st.apply(0, ["TOPK.QUERY", "tk", "a", "b", "c"]), "*3\r\n:0\r\n:1\r\n:1\r\n")
+
+    // Native Delayed & Retryable Job Queues (QUEUE.*)
+    assert_eq_str(st.apply(0, ["QUEUE.PUSH", "q:jobs", "j1", "low-pri", "PRIORITY", "1", "MAXRETRIES", "1"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["QUEUE.PUSH", "q:jobs", "j2", "high-pri", "PRIORITY", "10", "MAXRETRIES", "1"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["QUEUE.POP", "q:jobs", "w1"]), "*3\r\n$2\r\nj2\r\n$8\r\nhigh-pri\r\n:1\r\n")
+    assert_eq_str(st.apply(0, ["QUEUE.ACK", "q:jobs", "j2"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["QUEUE.POP", "q:jobs", "w1"]), "*3\r\n$2\r\nj1\r\n$7\r\nlow-pri\r\n:1\r\n")
+    assert_eq_str(st.apply(0, ["QUEUE.NACK", "q:jobs", "j1"]), ":1\r\n")
+    assert_eq_str(st.apply(0, ["QUEUE.POP", "q:jobs", "w1"]), "*3\r\n$2\r\nj1\r\n$7\r\nlow-pri\r\n:2\r\n")
+    assert_eq_str(st.apply(0, ["QUEUE.NACK", "q:jobs", "j1"]), ":2\r\n")
+    assert(str_contains(st.apply(0, ["QUEUE.DLQ", "q:jobs"]), "j1"))
+    assert_eq_str(st.apply(0, ["QUEUE.DLQ", "q:jobs", "RETRY", "j1"]), ":1\r\n")
+
+    // RediSearch Full-Text & Secondary Indexing (FT.*)
+    assert_eq_str(st.apply(0, ["FT.CREATE", "idx:books", "ON", "HASH", "PREFIX", "1", "book:", "SCHEMA", "title", "TEXT", "genre", "TAG", "price", "NUMERIC", "SORTABLE"]), "+OK\r\n")
+    let _ = st.apply(0, ["HSET", "book:1", "title", "Systems Programming in Mako", "genre", "tech,systems", "price", "45"])
+    let _ = st.apply(0, ["HSET", "book:2", "title", "Distributed Databases", "genre", "tech,db", "price", "60"])
+    let _ = st.apply(0, ["HSET", "book:3", "title", "Cooking Pasta", "genre", "food", "price", "20"])
+    let sr1 = st.apply(0, ["FT.SEARCH", "idx:books", "@genre:{tech} @price:[40 50]", "NOCONTENT"])
+    assert_eq_str(sr1, "*2\r\n:1\r\n$6\r\nbook:1\r\n")
+    let sr2 = st.apply(0, ["FT.SEARCH", "idx:books", "@genre:{tech}", "SORTBY", "price", "DESC", "NOCONTENT"])
+    assert_eq_str(sr2, "*3\r\n:2\r\n$6\r\nbook:2\r\n$6\r\nbook:1\r\n")
+
+    // Production Lua Stdlib (string.*, math.*, cjson.*, redis.*)
+    assert_eq_str(st.apply(0, ["EVAL", "return string.upper(string.sub('bonodis', 1, 4))", "0"]), "$4\r\nBONO\r\n")
+    assert_eq_str(st.apply(0, ["EVAL", "return math.max(10, 42, 7) + math.abs(-8)", "0"]), ":50\r\n")
+    assert_eq_str(st.apply(0, ["EVAL", "local obj = cjson.decode(ARGV[1]); return obj.user .. ':' .. tostring(obj.lvl)", "0", "{\"user\":\"ada\",\"lvl\":9}"]), "$5\r\nada:9\r\n")
+    assert_eq_str(st.apply(0, ["EVAL", "return redis.status_reply('PONG_CUSTOM')", "0"]), "+PONG_CUSTOM\r\n")
+}

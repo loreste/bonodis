@@ -2,20 +2,37 @@ pack bonodis
 
 const HLL_M = 1024
 
+#[no_alloc]
 fn hll_mix(s: string) -> int {
     let a = crc16(s)
-    let b = crc16(s + "#")
+    let b = ((a << 8) ^ crc16_tab(((a >> 8) ^ 35) & 255)) & 65535
     return ((a * 65599) + b) & 2147483647
 }
 
+#[no_alloc]
 fn hll_rho(x: int) -> int {
-    let mut v = x
+    let mut v = x & 2147483647
+    if v == 0 {
+        return 32
+    }
     let mut r = 1
-    while r < 32 {
-        if (v & 1) == 1 {
-            return r
-        }
-        v = v / 2
+    if (v & 65535) == 0 {
+        r = r + 16
+        v = v >> 16
+    }
+    if (v & 255) == 0 {
+        r = r + 8
+        v = v >> 8
+    }
+    if (v & 15) == 0 {
+        r = r + 4
+        v = v >> 4
+    }
+    if (v & 3) == 0 {
+        r = r + 2
+        v = v >> 2
+    }
+    if (v & 1) == 0 {
         r = r + 1
     }
     return r
@@ -78,6 +95,7 @@ fn Store_cmd_pfadd(mut self: Store, db: int, argv: []string) -> string {
     return r_int(changed)
 }
 
+#[no_alloc]
 fn hll_count(raw: string) -> int {
     if str_len(raw) != HLL_M + 2 {
         return 0
@@ -86,33 +104,34 @@ fn hll_count(raw: string) -> int {
     let mut i = 0
     while i < HLL_M {
         let r = str_byte_at(raw, 2 + i)
-        let mut p = 1.0
-        let mut k = 0
-        while k < r {
-            p = p * 2.0
-            k = k + 1
-        }
-        sum = sum + 1.0 / p
+        sum = sum + 1.0 / float(1 << r)
         i = i + 1
     }
     if sum <= 0.0 {
         return 0
     }
-    let m = parse_float(format_int(HLL_M) + ".0")
+    let m = float(HLL_M)
     let est = 0.72134752 * m * m / sum
-    let s = format_float(est, 0)
-    let dot = str_index(s, ".")
-    if dot > 0 {
-        return int_of(s[:dot])
-    }
-    return int_of(s)
+    return int(est + 0.5)
 }
 
 fn Store_cmd_pfcount(mut self: Store, db: int, argv: []string) -> string {
     if len(argv) < 2 {
         return r_arity("pfcount")
     }
-    let mut total = 0
+    if len(argv) == 2 {
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t == T_NONE {
+            return r_int(0)
+        }
+        if t != T_STR or str_len(self.strs[ik]) != HLL_M + 2 or not str_has_prefix(self.strs[ik], "HL") {
+            return r_wrongtype()
+        }
+        return r_int(hll_count(self.strs[ik]))
+    }
+    let mut merged = hll_new()
+    let mut any = 0
     let mut i = 1
     while i < len(argv) {
         let ik = ikey(db, argv[i])
@@ -121,13 +140,31 @@ fn Store_cmd_pfcount(mut self: Store, db: int, argv: []string) -> string {
             i = i + 1
             continue
         }
-        if t != T_STR {
+        if t != T_STR or str_len(self.strs[ik]) != HLL_M + 2 or not str_has_prefix(self.strs[ik], "HL") {
             return r_wrongtype()
         }
-        total = total + hll_count(self.strs[ik])
+        any = 1
+        let src = self.strs[ik]
+        let sb = str_builder()
+        builder_write(sb, "HL")
+        let mut j = 0
+        while j < HLL_M {
+            let a = str_byte_at(merged, 2 + j)
+            let b = str_byte_at(src, 2 + j)
+            if b > a {
+                builder_write_byte(sb, byte(b))
+            } else {
+                builder_write_byte(sb, byte(a))
+            }
+            j = j + 1
+        }
+        merged = builder_string(sb)
         i = i + 1
     }
-    return r_int(total)
+    if any == 0 {
+        return r_int(0)
+    }
+    return r_int(hll_count(merged))
 }
 
 fn Store_cmd_pfmerge(mut self: Store, db: int, argv: []string) -> string {
@@ -175,4 +212,907 @@ fn Store_cmd_pfmerge(mut self: Store, db: int, argv: []string) -> string {
     self.strs[dik] = raw
     self.types[dik] = T_STR
     return r_ok()
+}
+
+const BF_BYTES = 2048
+const BF_BITS = 16384
+const BF_K = 5
+
+#[no_alloc]
+fn bf_h1(s: string) -> int {
+    let mut h = 2166136261
+    let mut i = 0
+    let n = str_len(s)
+    while i < n {
+        h = ((h ^ str_byte_at(s, i)) * 16777619) & 2147483647
+        i = i + 1
+    }
+    return h
+}
+
+#[no_alloc]
+fn bf_h2(s: string) -> int {
+    return (hll_mix(s) * 2654435761 + 1013904223) & 2147483647 | 1
+}
+
+fn bf_new() -> string {
+    let b = str_builder()
+    builder_write(b, "BF")
+    let mut i = 0
+    while i < BF_BYTES {
+        builder_write_byte(b, byte(0))
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn bf_is_valid(raw: string) -> int {
+    if str_len(raw) == BF_BYTES + 2 and str_has_prefix(raw, "BF") {
+        return 1
+    }
+    return 0
+}
+
+fn bf_set_bit(raw: string, bit: int) -> (string, int) {
+    let pos = 2 + (bit >> 3)
+    let mask = 1 << (bit & 7)
+    let cur = str_byte_at(raw, pos)
+    if (cur & mask) != 0 {
+        return (raw, 0)
+    }
+    let nw = cur | mask
+    let b = str_builder()
+    builder_write(b, raw[:pos])
+    builder_write_byte(b, byte(nw))
+    builder_write(b, raw[pos + 1:])
+    return (builder_string(b), 1)
+}
+
+#[no_alloc]
+fn bf_test_item(raw: string, item: string) -> int {
+    let h1 = bf_h1(item)
+    let h2 = bf_h2(item)
+    let mut i = 0
+    while i < BF_K {
+        let bit = (h1 + i * h2) & (BF_BITS - 1)
+        let pos = 2 + (bit >> 3)
+        let mask = 1 << (bit & 7)
+        if (str_byte_at(raw, pos) & mask) == 0 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn bf_add_item(raw: string, item: string) -> (string, int) {
+    let h1 = bf_h1(item)
+    let h2 = bf_h2(item)
+    let mut cur = raw
+    let mut changed = 0
+    let mut i = 0
+    while i < BF_K {
+        let bit = (h1 + i * h2) & (BF_BITS - 1)
+        let nxt, ch = bf_set_bit(cur, bit)
+        cur = nxt
+        if ch == 1 {
+            changed = 1
+        }
+        i = i + 1
+    }
+    return (cur, changed)
+}
+
+fn Store_cmd_bfreserve(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 4 {
+        return r_arity("bf.reserve")
+    }
+    let cap, cok = int_ok(argv[3])
+    if cok == 0 or cap <= 0 {
+        return r_err("ERR (capacity should be larger than 0)")
+    }
+    let ik = ikey(db, argv[1])
+    if self.kind(ik) != T_NONE {
+        return r_err("ERR item exists")
+    }
+    self.strs[ik] = bf_new()
+    self.types[ik] = T_STR
+    self.xseq["\u001eBFcap\u001e" + ik] = cap
+    self.xseq["\u001eBFcnt\u001e" + ik] = 0
+    return r_ok()
+}
+
+fn Store_cmd_bfadd(mut self: Store, db: int, argv: []string, multi: int) -> string {
+    if len(argv) < 3 or (multi == 0 and len(argv) != 3) {
+        return r_arity(str_to_lower(argv[0]))
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    let mut raw = ""
+    if t == T_NONE {
+        raw = bf_new()
+        self.strs[ik] = raw
+        self.types[ik] = T_STR
+        self.xseq["\u001eBFcap\u001e" + ik] = 1000
+        self.xseq["\u001eBFcnt\u001e" + ik] = 0
+    } else if t == T_STR {
+        raw = self.strs[ik]
+        if bf_is_valid(raw) == 0 {
+            return r_wrongtype()
+        }
+    } else {
+        return r_wrongtype()
+    }
+    let mut cnt = self.xseq["\u001eBFcnt\u001e" + ik]
+    if multi == 0 {
+        let nxt, ch = bf_add_item(raw, argv[2])
+        self.strs[ik] = nxt
+        if ch == 1 {
+            self.xseq["\u001eBFcnt\u001e" + ik] = cnt + 1
+        }
+        return r_int(ch)
+    }
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, fmt_int_fast(len(argv) - 2))
+    builder_write(b, "\r\n")
+    let mut i = 2
+    while i < len(argv) {
+        let nxt, ch = bf_add_item(raw, argv[i])
+        raw = nxt
+        if ch == 1 {
+            cnt = cnt + 1
+        }
+        builder_write(b, r_int(ch))
+        i = i + 1
+    }
+    self.strs[ik] = raw
+    self.xseq["\u001eBFcnt\u001e" + ik] = cnt
+    return builder_string(b)
+}
+
+fn Store_cmd_bfexists(mut self: Store, db: int, argv: []string, multi: int) -> string {
+    if len(argv) < 3 or (multi == 0 and len(argv) != 3) {
+        return r_arity(str_to_lower(argv[0]))
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t != T_NONE and t != T_STR {
+        return r_wrongtype()
+    }
+    let mut raw = ""
+    if t == T_STR {
+        raw = self.strs[ik]
+        if bf_is_valid(raw) == 0 {
+            return r_wrongtype()
+        }
+    }
+    if multi == 0 {
+        if t == T_NONE {
+            return r_int(0)
+        }
+        return r_int(bf_test_item(raw, argv[2]))
+    }
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, fmt_int_fast(len(argv) - 2))
+    builder_write(b, "\r\n")
+    let mut i = 2
+    while i < len(argv) {
+        if t == T_NONE {
+            builder_write(b, r_int(0))
+        } else {
+            builder_write(b, r_int(bf_test_item(raw, argv[i])))
+        }
+        i = i + 1
+    }
+    return builder_string(b)
+}
+
+fn Store_cmd_bfcard(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("bf.card")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_STR or bf_is_valid(self.strs[ik]) == 0 {
+        return r_wrongtype()
+    }
+    return r_int(self.xseq["\u001eBFcnt\u001e" + ik])
+}
+
+fn Store_cmd_bfinfo(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 2 {
+        return r_arity("bf.info")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_err("ERR not found")
+    }
+    if t != T_STR or bf_is_valid(self.strs[ik]) == 0 {
+        return r_wrongtype()
+    }
+    let mut cap = self.xseq["\u001eBFcap\u001e" + ik]
+    if cap <= 0 {
+        cap = 1000
+    }
+    let cnt = self.xseq["\u001eBFcnt\u001e" + ik]
+    let b = str_builder()
+    builder_write(b, "*10\r\n")
+    builder_write(b, r_bulk("Capacity"))
+    builder_write(b, r_int(cap))
+    builder_write(b, r_bulk("Size"))
+    builder_write(b, r_int(BF_BYTES))
+    builder_write(b, r_bulk("Number of filters"))
+    builder_write(b, r_int(1))
+    builder_write(b, r_bulk("Number of items inserted"))
+    builder_write(b, r_int(cnt))
+    builder_write(b, r_bulk("Expansion rate"))
+    builder_write(b, r_int(2))
+    return builder_string(b)
+}
+
+// ============================================================================
+// Cuckoo Filter (CF.RESERVE, CF.ADD, CF.ADDNX, CF.EXISTS, CF.MEXISTS, CF.DEL,
+// CF.COUNT, CF.INFO)
+// ============================================================================
+
+fn cf_is_valid(raw: string) -> int {
+    if str_has_prefix(raw, "CF1:") {
+        return 1
+    }
+    return 0
+}
+
+fn cf_item_count(raw: string, item: string) -> int {
+    if not str_has_prefix(raw, "CF1:") or str_len(raw) <= 4 {
+        return 0
+    }
+    let body = raw[4:]
+    let parts = str_split(body, "\n")
+    let mut i = 0
+    while i < len(parts) {
+        let ln = parts[i]
+        let tab = str_index(ln, "\t")
+        if tab > 0 and str_eq(ln[:tab], item) {
+            return int_of(ln[tab + 1:])
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn cf_item_set(raw: string, item: string, next_cnt: int) -> string {
+    let b = str_builder()
+    builder_write(b, "CF1:")
+    let mut wrote = 0
+    if str_has_prefix(raw, "CF1:") and str_len(raw) > 4 {
+        let parts = str_split(raw[4:], "\n")
+        let mut i = 0
+        while i < len(parts) {
+            let ln = parts[i]
+            if str_len(ln) > 0 {
+                let tab = str_index(ln, "\t")
+                if tab > 0 and str_eq(ln[:tab], item) {
+                    if next_cnt > 0 {
+                        builder_write(b, item)
+                        builder_write(b, "\t")
+                        builder_write(b, fmt_int_fast(next_cnt))
+                        builder_write(b, "\n")
+                    }
+                    wrote = 1
+                } else {
+                    builder_write(b, ln)
+                    builder_write(b, "\n")
+                }
+            }
+            i = i + 1
+        }
+    }
+    if wrote == 0 and next_cnt > 0 {
+        builder_write(b, item)
+        builder_write(b, "\t")
+        builder_write(b, fmt_int_fast(next_cnt))
+        builder_write(b, "\n")
+    }
+    return builder_string(b)
+}
+
+fn Store_cmd_cf(mut self: Store, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    if str_eq(cmd, "CF.RESERVE") {
+        if len(argv) < 3 {
+            return r_arity("cf.reserve")
+        }
+        let cap, ok = int_ok(argv[2])
+        if ok == 0 or cap <= 0 {
+            return r_err("ERR bad capacity")
+        }
+        let ik = ikey(db, argv[1])
+        if self.kind(ik) != T_NONE {
+            return r_err("ERR item exists")
+        }
+        self.strs[ik] = "CF1:"
+        self.types[ik] = T_STR
+        self.xseq["\u001eCFcap\u001e" + ik] = cap
+        self.xseq["\u001eCFcnt\u001e" + ik] = 0
+        self.xseq["\u001eCFdel\u001e" + ik] = 0
+        return r_ok()
+    }
+    if str_eq(cmd, "CF.ADD") or str_eq(cmd, "CF.ADDNX") {
+        if len(argv) != 3 {
+            return r_arity(str_to_lower(cmd))
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t != T_NONE and (t != T_STR or cf_is_valid(self.strs[ik]) == 0) {
+            return r_wrongtype()
+        }
+        let mut raw = "CF1:"
+        if t == T_STR {
+            raw = self.strs[ik]
+        }
+        let cur = cf_item_count(raw, argv[2])
+        if str_eq(cmd, "CF.ADDNX") and cur > 0 {
+            return r_int(0)
+        }
+        self.strs[ik] = cf_item_set(raw, argv[2], cur + 1)
+        self.types[ik] = T_STR
+        self.xseq["\u001eCFcnt\u001e" + ik] = self.xseq["\u001eCFcnt\u001e" + ik] + 1
+        return r_int(1)
+    }
+    if str_eq(cmd, "CF.EXISTS") {
+        if len(argv) != 3 {
+            return r_arity("cf.exists")
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t == T_NONE {
+            return r_int(0)
+        }
+        if t != T_STR or cf_is_valid(self.strs[ik]) == 0 {
+            return r_wrongtype()
+        }
+        if cf_item_count(self.strs[ik], argv[2]) > 0 {
+            return r_int(1)
+        }
+        return r_int(0)
+    }
+    if str_eq(cmd, "CF.MEXISTS") {
+        if len(argv) < 3 {
+            return r_arity("cf.mexists")
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t != T_NONE and (t != T_STR or cf_is_valid(self.strs[ik]) == 0) {
+            return r_wrongtype()
+        }
+        let mut raw = ""
+        if t == T_STR {
+            raw = self.strs[ik]
+        }
+        let b = str_builder()
+        builder_write(b, "*")
+        builder_write(b, fmt_int_fast(len(argv) - 2))
+        builder_write(b, "\r\n")
+        let mut i = 2
+        while i < len(argv) {
+            if t == T_STR and cf_item_count(raw, argv[i]) > 0 {
+                builder_write(b, r_int(1))
+            } else {
+                builder_write(b, r_int(0))
+            }
+            i = i + 1
+        }
+        return builder_string(b)
+    }
+    if str_eq(cmd, "CF.COUNT") {
+        if len(argv) != 3 {
+            return r_arity("cf.count")
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t == T_NONE {
+            return r_int(0)
+        }
+        if t != T_STR or cf_is_valid(self.strs[ik]) == 0 {
+            return r_wrongtype()
+        }
+        return r_int(cf_item_count(self.strs[ik], argv[2]))
+    }
+    if str_eq(cmd, "CF.DEL") {
+        if len(argv) != 3 {
+            return r_arity("cf.del")
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t == T_NONE {
+            return r_err("ERR Not found")
+        }
+        if t != T_STR or cf_is_valid(self.strs[ik]) == 0 {
+            return r_wrongtype()
+        }
+        let raw = self.strs[ik]
+        let cur = cf_item_count(raw, argv[2])
+        if cur <= 0 {
+            return r_int(0)
+        }
+        self.strs[ik] = cf_item_set(raw, argv[2], cur - 1)
+        let cnt = self.xseq["\u001eCFcnt\u001e" + ik]
+        if cnt > 0 {
+            self.xseq["\u001eCFcnt\u001e" + ik] = cnt - 1
+        }
+        self.xseq["\u001eCFdel\u001e" + ik] = self.xseq["\u001eCFdel\u001e" + ik] + 1
+        return r_int(1)
+    }
+    if str_eq(cmd, "CF.INFO") {
+        if len(argv) != 2 {
+            return r_arity("cf.info")
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t == T_NONE {
+            return r_err("ERR not found")
+        }
+        if t != T_STR or cf_is_valid(self.strs[ik]) == 0 {
+            return r_wrongtype()
+        }
+        let mut cap = self.xseq["\u001eCFcap\u001e" + ik]
+        if cap <= 0 {
+            cap = 1024
+        }
+        let cnt = self.xseq["\u001eCFcnt\u001e" + ik]
+        let del = self.xseq["\u001eCFdel\u001e" + ik]
+        let b = str_builder()
+        builder_write(b, "*16\r\n")
+        builder_write(b, r_bulk("Size"))
+        builder_write(b, r_int(cap))
+        builder_write(b, r_bulk("Number of buckets"))
+        builder_write(b, r_int(cap / 2))
+        builder_write(b, r_bulk("Number of filter"))
+        builder_write(b, r_int(1))
+        builder_write(b, r_bulk("Number of items inserted"))
+        builder_write(b, r_int(cnt))
+        builder_write(b, r_bulk("Number of items deleted"))
+        builder_write(b, r_int(del))
+        builder_write(b, r_bulk("Bucket size"))
+        builder_write(b, r_int(2))
+        builder_write(b, r_bulk("Expansion rate"))
+        builder_write(b, r_int(1))
+        builder_write(b, r_bulk("Max iterations"))
+        builder_write(b, r_int(20))
+        return builder_string(b)
+    }
+    return r_err("ERR unknown CF command")
+}
+
+// ============================================================================
+// Count-Min Sketch (CMS.INITBYDIM, CMS.INITBYPROB, CMS.INCRBY, CMS.QUERY, CMS.INFO)
+// ============================================================================
+
+fn cms_is_valid(raw: string) -> int {
+    if str_eq(raw, "CMS1") {
+        return 1
+    }
+    return 0
+}
+
+fn cms_cell_key(ik: string, row: int, col: int) -> string {
+    return "\u001eCMSc\u001e" + ik + "\u001e" + fmt_int_fast(row) + ":" + fmt_int_fast(col)
+}
+
+fn Store_cmd_cms(mut self: Store, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    if str_eq(cmd, "CMS.INITBYDIM") {
+        if len(argv) != 4 {
+            return r_arity("cms.initbydim")
+        }
+        let w, wok = int_ok(argv[2])
+        let d, dok = int_ok(argv[3])
+        if wok == 0 or dok == 0 or w <= 0 or d <= 0 {
+            return r_err("CMS: invalid width or depth")
+        }
+        let ik = ikey(db, argv[1])
+        if self.kind(ik) != T_NONE {
+            return r_err("CMS: key already exists")
+        }
+        self.strs[ik] = "CMS1"
+        self.types[ik] = T_STR
+        self.xseq["\u001eCMSw\u001e" + ik] = w
+        self.xseq["\u001eCMSd\u001e" + ik] = d
+        self.xseq["\u001eCMScnt\u001e" + ik] = 0
+        return r_ok()
+    }
+    if str_eq(cmd, "CMS.INITBYPROB") {
+        if len(argv) != 4 {
+            return r_arity("cms.initbyprob")
+        }
+        let err = parse_float(argv[2])
+        let prob = parse_float(argv[3])
+        if err <= 0.0 or err >= 1.0 or prob <= 0.0 or prob >= 1.0 {
+            return r_err("CMS: invalid overestimation or probability")
+        }
+        let ik = ikey(db, argv[1])
+        if self.kind(ik) != T_NONE {
+            return r_err("CMS: key already exists")
+        }
+        let mut w = int(2.718281828 / err)
+        if w < 16 {
+            w = 16
+        }
+        let mut d = 5
+        if prob <= 0.001 {
+            d = 10
+        } else if prob <= 0.01 {
+            d = 7
+        }
+        self.strs[ik] = "CMS1"
+        self.types[ik] = T_STR
+        self.xseq["\u001eCMSw\u001e" + ik] = w
+        self.xseq["\u001eCMSd\u001e" + ik] = d
+        self.xseq["\u001eCMScnt\u001e" + ik] = 0
+        return r_ok()
+    }
+    if str_eq(cmd, "CMS.INCRBY") {
+        if len(argv) < 4 or (len(argv) % 2) != 0 {
+            return r_arity("cms.incrby")
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t != T_NONE and (t != T_STR or cms_is_valid(self.strs[ik]) == 0) {
+            return r_wrongtype()
+        }
+        if t == T_NONE {
+            self.strs[ik] = "CMS1"
+            self.types[ik] = T_STR
+            self.xseq["\u001eCMSw\u001e" + ik] = 2000
+            self.xseq["\u001eCMSd\u001e" + ik] = 5
+            self.xseq["\u001eCMScnt\u001e" + ik] = 0
+        }
+        let w = self.xseq["\u001eCMSw\u001e" + ik]
+        let d = self.xseq["\u001eCMSd\u001e" + ik]
+        let b = str_builder()
+        builder_write(b, "*")
+        builder_write(b, fmt_int_fast((len(argv) - 2) / 2))
+        builder_write(b, "\r\n")
+        let mut i = 2
+        while i + 1 < len(argv) {
+            let item = argv[i]
+            let inc, iok = int_ok(argv[i + 1])
+            if iok == 0 or inc < 0 {
+                return r_err("CMS: Cannot parse number")
+            }
+            let mut min_v = -1
+            let mut r = 0
+            while r < d {
+                let h = (bf_h1(item) + r * bf_h2(item)) & 2147483647
+                let col = h % w
+                let ck = cms_cell_key(ik, r, col)
+                let nv = self.xseq[ck] + inc
+                self.xseq[ck] = nv
+                if min_v < 0 or nv < min_v {
+                    min_v = nv
+                }
+                r = r + 1
+            }
+            self.xseq["\u001eCMScnt\u001e" + ik] = self.xseq["\u001eCMScnt\u001e" + ik] + inc
+            builder_write(b, r_int(min_v))
+            i = i + 2
+        }
+        return builder_string(b)
+    }
+    if str_eq(cmd, "CMS.QUERY") {
+        if len(argv) < 3 {
+            return r_arity("cms.query")
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t == T_NONE {
+            return r_err("CMS: key does not exist")
+        }
+        if t != T_STR or cms_is_valid(self.strs[ik]) == 0 {
+            return r_wrongtype()
+        }
+        let w = self.xseq["\u001eCMSw\u001e" + ik]
+        let d = self.xseq["\u001eCMSd\u001e" + ik]
+        let b = str_builder()
+        builder_write(b, "*")
+        builder_write(b, fmt_int_fast(len(argv) - 2))
+        builder_write(b, "\r\n")
+        let mut i = 2
+        while i < len(argv) {
+            let item = argv[i]
+            let mut min_v = -1
+            let mut r = 0
+            while r < d {
+                let h = (bf_h1(item) + r * bf_h2(item)) & 2147483647
+                let col = h % w
+                let ck = cms_cell_key(ik, r, col)
+                let v = self.xseq[ck]
+                if min_v < 0 or v < min_v {
+                    min_v = v
+                }
+                r = r + 1
+            }
+            if min_v < 0 {
+                min_v = 0
+            }
+            builder_write(b, r_int(min_v))
+            i = i + 1
+        }
+        return builder_string(b)
+    }
+    if str_eq(cmd, "CMS.INFO") {
+        if len(argv) != 2 {
+            return r_arity("cms.info")
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t == T_NONE {
+            return r_err("CMS: key does not exist")
+        }
+        if t != T_STR or cms_is_valid(self.strs[ik]) == 0 {
+            return r_wrongtype()
+        }
+        let b = str_builder()
+        builder_write(b, "*6\r\n")
+        builder_write(b, r_bulk("width"))
+        builder_write(b, r_int(self.xseq["\u001eCMSw\u001e" + ik]))
+        builder_write(b, r_bulk("depth"))
+        builder_write(b, r_int(self.xseq["\u001eCMSd\u001e" + ik]))
+        builder_write(b, r_bulk("count"))
+        builder_write(b, r_int(self.xseq["\u001eCMScnt\u001e" + ik]))
+        return builder_string(b)
+    }
+    return r_err("ERR unknown CMS command")
+}
+
+// ============================================================================
+// Top-K (TOPK.RESERVE, TOPK.ADD, TOPK.INCRBY, TOPK.QUERY, TOPK.COUNT, TOPK.LIST,
+// TOPK.INFO)
+// ============================================================================
+
+fn topk_is_valid(raw: string) -> int {
+    if str_eq(raw, "TOPK1") {
+        return 1
+    }
+    return 0
+}
+
+fn topk_in_top(mems: []string, k: int, target: string) -> int {
+    let mut idx = len(mems) - 1
+    let mut cnt = 0
+    while idx >= 0 {
+        if cnt >= k {
+            break
+        }
+        if str_eq(mems[idx], target) {
+            return 1
+        }
+        cnt = cnt + 1
+        idx = idx - 1
+    }
+    return 0
+}
+
+fn topk_find_evicted(prev_mems: []string, cur_mems: []string, k: int) -> string {
+    let mut pi = len(prev_mems) - 1
+    let mut pt = 0
+    while pi >= 0 {
+        if pt >= k {
+            break
+        }
+        let pm = prev_mems[pi]
+        if topk_in_top(cur_mems, k, pm) == 0 {
+            return pm
+        }
+        pt = pt + 1
+        pi = pi - 1
+    }
+    return ""
+}
+
+fn Store_cmd_topk(mut self: Store, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    if str_eq(cmd, "TOPK.RESERVE") {
+        if len(argv) < 3 {
+            return r_arity("topk.reserve")
+        }
+        let k_res, kok = int_ok(argv[2])
+        if kok == 0 or k_res <= 0 {
+            return r_err("TopK: bad topk")
+        }
+        let mut w_res = 8
+        let mut d_res = 7
+        if len(argv) >= 5 {
+            w_res = int_of(argv[3])
+            d_res = int_of(argv[4])
+        }
+        let ik_res = ikey(db, argv[1])
+        if self.kind(ik_res) != T_NONE {
+            return r_err("TopK: key already exists")
+        }
+        self.strs[ik_res] = "TOPK1"
+        self.types[ik_res] = T_STR
+        self.xseq["\u001eTKk\u001e" + ik_res] = k_res
+        self.xseq["\u001eTKw\u001e" + ik_res] = w_res
+        self.xseq["\u001eTKd\u001e" + ik_res] = d_res
+        self.zsets["\u001eTKz\u001e" + ik_res] = make(map[string]string)
+        return r_ok()
+    }
+    if str_eq(cmd, "TOPK.ADD") or str_eq(cmd, "TOPK.INCRBY") {
+        let mut is_incr = 0
+        if str_eq(cmd, "TOPK.INCRBY") {
+            is_incr = 1
+        }
+        if is_incr == 0 and len(argv) < 3 {
+            return r_arity(str_to_lower(cmd))
+        }
+        if is_incr == 1 {
+            if len(argv) < 4 or (len(argv) % 2) != 0 {
+                return r_arity(str_to_lower(cmd))
+            }
+        }
+        let ik_add = ikey(db, argv[1])
+        let t_add = self.kind(ik_add)
+        if t_add == T_NONE {
+            return r_err("TopK: key does not exist")
+        }
+        if t_add != T_STR or topk_is_valid(self.strs[ik_add]) == 0 {
+            return r_wrongtype()
+        }
+        let k_add = self.xseq["\u001eTKk\u001e" + ik_add]
+        let zk_add = "\u001eTKz\u001e" + ik_add
+        let mut z_add = self.zsets[zk_add]
+        let mut n_ops = len(argv) - 2
+        if is_incr == 1 {
+            n_ops = (len(argv) - 2) / 2
+        }
+        let b_add = str_builder()
+        builder_write(b_add, "*")
+        builder_write(b_add, fmt_int_fast(n_ops))
+        builder_write(b_add, "\r\n")
+        let mut idx_add = 2
+        while idx_add < len(argv) {
+            let item_add = argv[idx_add]
+            let mut inc_val = 1
+            if is_incr == 1 {
+                inc_val = int_of(argv[idx_add + 1])
+                idx_add = idx_add + 2
+            } else {
+                idx_add = idx_add + 1
+            }
+            let prev_mems, _ = z_sorted(z_add)
+            let mut cur_val = 0
+            if has(z_add, item_add) {
+                cur_val = int_of(z_add[item_add])
+            }
+            z_add[item_add] = fmt_int_fast(cur_val + inc_val)
+            let cur_mems, _ = z_sorted(z_add)
+            let evicted = topk_find_evicted(prev_mems, cur_mems, k_add)
+            if str_len(evicted) > 0 {
+                builder_write(b_add, r_bulk(evicted))
+            } else {
+                builder_write(b_add, r_nil())
+            }
+        }
+        self.zsets[zk_add] = z_add
+        return builder_string(b_add)
+    }
+    if str_eq(cmd, "TOPK.QUERY") or str_eq(cmd, "TOPK.COUNT") {
+        if len(argv) < 3 {
+            return r_arity(str_to_lower(cmd))
+        }
+        let ik_q = ikey(db, argv[1])
+        let t_q = self.kind(ik_q)
+        if t_q == T_NONE {
+            return r_err("TopK: key does not exist")
+        }
+        if t_q != T_STR or topk_is_valid(self.strs[ik_q]) == 0 {
+            return r_wrongtype()
+        }
+        let k_q = self.xseq["\u001eTKk\u001e" + ik_q]
+        let z_q = self.zsets["\u001eTKz\u001e" + ik_q]
+        let mems_q, _ = z_sorted(z_q)
+        let mut is_cnt = 0
+        if str_eq(cmd, "TOPK.COUNT") {
+            is_cnt = 1
+        }
+        let b_q = str_builder()
+        builder_write(b_q, "*")
+        builder_write(b_q, fmt_int_fast(len(argv) - 2))
+        builder_write(b_q, "\r\n")
+        let mut idx_q = 2
+        while idx_q < len(argv) {
+            let item_q = argv[idx_q]
+            if is_cnt == 1 {
+                if has(z_q, item_q) {
+                    builder_write(b_q, r_int(int_of(z_q[item_q])))
+                } else {
+                    builder_write(b_q, r_int(0))
+                }
+            } else {
+                builder_write(b_q, r_int(topk_in_top(mems_q, k_q, item_q)))
+            }
+            idx_q = idx_q + 1
+        }
+        return builder_string(b_q)
+    }
+    if str_eq(cmd, "TOPK.LIST") {
+        if len(argv) < 2 or len(argv) > 3 {
+            return r_arity("topk.list")
+        }
+        let mut with_cnt = 0
+        if len(argv) == 3 {
+            if str_eq(str_to_upper(argv[2]), "WITHCOUNT") {
+                with_cnt = 1
+            }
+        }
+        let ik_l = ikey(db, argv[1])
+        let t_l = self.kind(ik_l)
+        if t_l == T_NONE {
+            return r_err("TopK: key does not exist")
+        }
+        if t_l != T_STR or topk_is_valid(self.strs[ik_l]) == 0 {
+            return r_wrongtype()
+        }
+        let k_l = self.xseq["\u001eTKk\u001e" + ik_l]
+        let z_l = self.zsets["\u001eTKz\u001e" + ik_l]
+        let mems_l, scs_l = z_sorted(z_l)
+        let mut take_l = len(mems_l)
+        if take_l > k_l {
+            take_l = k_l
+        }
+        let b_l = str_builder()
+        builder_write(b_l, "*")
+        if with_cnt == 1 {
+            builder_write(b_l, fmt_int_fast(take_l * 2))
+        } else {
+            builder_write(b_l, fmt_int_fast(take_l))
+        }
+        builder_write(b_l, "\r\n")
+        let mut ti_l = len(mems_l) - 1
+        let mut tc_l = 0
+        while ti_l >= 0 {
+            if tc_l >= take_l {
+                break
+            }
+            builder_write(b_l, r_bulk(mems_l[ti_l]))
+            if with_cnt == 1 {
+                builder_write(b_l, r_int(int_of(scs_l[ti_l])))
+            }
+            tc_l = tc_l + 1
+            ti_l = ti_l - 1
+        }
+        return builder_string(b_l)
+    }
+    if str_eq(cmd, "TOPK.INFO") {
+        if len(argv) != 2 {
+            return r_arity("topk.info")
+        }
+        let ik_i = ikey(db, argv[1])
+        let t_i = self.kind(ik_i)
+        if t_i == T_NONE {
+            return r_err("TopK: key does not exist")
+        }
+        if t_i != T_STR or topk_is_valid(self.strs[ik_i]) == 0 {
+            return r_wrongtype()
+        }
+        let b_i = str_builder()
+        builder_write(b_i, "*8\r\n")
+        builder_write(b_i, r_bulk("k"))
+        builder_write(b_i, r_int(self.xseq["\u001eTKk\u001e" + ik_i]))
+        builder_write(b_i, r_bulk("width"))
+        builder_write(b_i, r_int(self.xseq["\u001eTKw\u001e" + ik_i]))
+        builder_write(b_i, r_bulk("depth"))
+        builder_write(b_i, r_int(self.xseq["\u001eTKd\u001e" + ik_i]))
+        builder_write(b_i, r_bulk("decay"))
+        builder_write(b_i, r_bulk("0.9"))
+        return builder_string(b_i)
+    }
+    return r_err("ERR unknown TOPK command")
 }

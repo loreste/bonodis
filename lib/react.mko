@@ -54,30 +54,49 @@ fn react_decode_cmds(encoded: string) -> []string {
     return str_split(encoded[sep + 1:], "\t")
 }
 
-// Replace first occurrence of `old` with `new` in `s`.
+// Replace all occurrences of `old` with `nw` in `s`.
 fn react_replace(s: string, old: string, nw: string) -> string {
-    let i = str_index(s, old)
-    if i < 0 {
+    if str_len(old) == 0 {
         return s
     }
-    return s[:i] + nw + s[i + str_len(old):]
+    let parts = str_split(s, old)
+    if len(parts) <= 1 {
+        return s
+    }
+    let b = str_builder()
+    let mut i = 0
+    while i < len(parts) {
+        if i > 0 {
+            builder_write(b, nw)
+        }
+        builder_write(b, parts[i])
+        i = i + 1
+    }
+    return builder_string(b)
 }
 
-// Parse REACT CREATE name key ON WRITE cmd1 a1 a2 | cmd2 b1 b2
-fn react_parse_create(argv: []string) -> (string, string, []string, int) {
+fn react_is_glob(pat: string) -> int {
+    if str_contains(pat, "*") or str_contains(pat, "?") or str_contains(pat, "[") {
+        return 1
+    }
+    return 0
+}
+
+// Parse REACT CREATE name key ON WRITE|DELETE|EXPIRE|ANY cmd1 a1 a2 | cmd2 b1 b2
+fn react_parse_create(argv: []string) -> (string, string, string, []string, int) {
     let none: []string = []
     if len(argv) < 7 {
-        return ("", "", none, 0)
+        return ("", "", "", none, 0)
     }
     let name = argv[2]
     let key = argv[3]
     let o4 = str_to_upper(argv[4])
     let o5 = str_to_upper(argv[5])
     if not str_eq(o4, "ON") {
-        return ("", "", none, 0)
+        return ("", "", "", none, 0)
     }
-    if not str_eq(o5, "WRITE") {
-        return ("", "", none, 0)
+    if not str_eq(o5, "WRITE") and not str_eq(o5, "DELETE") and not str_eq(o5, "EXPIRE") and not str_eq(o5, "ANY") {
+        return ("", "", "", none, 0)
     }
     let mut tokens = make([]string, 0, len(argv) - 6)
     let mut i = 6
@@ -85,7 +104,7 @@ fn react_parse_create(argv: []string) -> (string, string, []string, int) {
         tokens = append(tokens, argv[i])
         i = i + 1
     }
-    return (name, key, tokens, 1)
+    return (name, key, o5, tokens, 1)
 }
 
 fn Store_cmd_react(mut self: Store, db: int, argv: []string) -> string {
@@ -93,24 +112,40 @@ fn Store_cmd_react(mut self: Store, db: int, argv: []string) -> string {
         return r_arity("react")
     }
     let sub = str_to_upper(argv[1])
+    let gkey = "\u001eReactGlobs\u001e" + fmt_int_fast(db)
     if str_eq(sub, "CREATE") {
-        let name, key, tokens, ok = react_parse_create(argv)
+        let name, key, evt, tokens, ok = react_parse_create(argv)
         if ok == 0 {
-            return r_err("ERR syntax: REACT CREATE name key ON WRITE cmd [arg ...] [| cmd [arg ...]]")
+            return r_err("ERR syntax: REACT CREATE name key ON WRITE|DELETE|EXPIRE|ANY cmd [arg ...] [| cmd [arg ...]]")
         }
         if str_len(name) == 0 or str_len(key) == 0 {
             return r_err("ERR name and key must be non-empty")
         }
         let rk = react_rule_key(name)
+        let prev = self.xp[rk]
+        if str_len(prev) > 0 {
+            let prev_key = react_decode_key(prev)
+            let prev_idx = REACT_IDX + ikey(db, prev_key)
+            self.xp[prev_idx] = csv_del(self.xp[prev_idx], name)
+            self.xp[gkey] = csv_del(self.xp[gkey], name)
+        }
         self.xp[rk] = react_encode_rule(key, tokens)
-        // add to key→name index
-        let idx_key = REACT_IDX + ikey(db, key)
-        let existing = self.xp[idx_key]
-        if str_len(existing) == 0 {
-            self.xp[idx_key] = name
+        self.xp["\u001eReactEvt\u001e" + name] = evt
+        if react_is_glob(key) == 1 {
+            let gcur = self.xp[gkey]
+            if csv_has(gcur, name) == 0 {
+                self.xp[gkey] = csv_add(gcur, name)
+            }
         } else {
-            if csv_has(existing, name) == 0 {
-                self.xp[idx_key] = csv_add(existing, name)
+            // add to key→name index
+            let idx_key = REACT_IDX + ikey(db, key)
+            let existing = self.xp[idx_key]
+            if str_len(existing) == 0 {
+                self.xp[idx_key] = name
+            } else {
+                if csv_has(existing, name) == 0 {
+                    self.xp[idx_key] = csv_add(existing, name)
+                }
             }
         }
         // track name in global list
@@ -131,13 +166,15 @@ fn Store_cmd_react(mut self: Store, db: int, argv: []string) -> string {
             return r_int(0)
         }
         let key = react_decode_key(encoded)
-        // remove from key→name index
+        // remove from key→name index and glob index
         let idx_key = REACT_IDX + ikey(db, key)
         self.xp[idx_key] = csv_del(self.xp[idx_key], name)
+        self.xp[gkey] = csv_del(self.xp[gkey], name)
         // remove from global name list
         self.xp[REACT_NAMES] = csv_del(self.xp[REACT_NAMES], name)
         // remove rule
         delete(self.xp, rk)
+        delete(self.xp, "\u001eReactEvt\u001e" + name)
         return r_int(1)
     }
     if str_eq(sub, "LIST") {
@@ -220,9 +257,31 @@ fn Store_react_collect(mut self: Store, db: int, key: string, value: string) -> 
         return none
     }
     let idx_key = REACT_IDX + ikey(db, key)
-    let names_csv = self.xp[idx_key]
+    let mut names_csv = self.xp[idx_key]
+    let gkey = "\u001eReactGlobs\u001e" + fmt_int_fast(db)
+    let globs_csv = self.xp[gkey]
+    if str_len(globs_csv) > 0 {
+        let gnames = str_split(globs_csv, ",")
+        let mut gi = 0
+        while gi < len(gnames) {
+            let gn = gnames[gi]
+            if str_len(gn) > 0 {
+                let enc = self.xp[react_rule_key(gn)]
+                if str_len(enc) > 0 and glob_match(react_decode_key(enc), key) == 1 {
+                    if csv_has(names_csv, gn) == 0 {
+                        names_csv = csv_add(names_csv, gn)
+                    }
+                }
+            }
+            gi = gi + 1
+        }
+    }
     if str_len(names_csv) == 0 {
         return none
+    }
+    let mut cur_evt = self.xp["\u001eReactCurEvt\u001e"]
+    if str_len(cur_evt) == 0 {
+        cur_evt = "WRITE"
     }
     let names = str_split(names_csv, ",")
     let mut cmds = make([]string, 0, 4)
@@ -230,26 +289,32 @@ fn Store_react_collect(mut self: Store, db: int, key: string, value: string) -> 
     while ni < len(names) {
         let name = names[ni]
         if str_len(name) > 0 {
-            let rk = react_rule_key(name)
-            let encoded = self.xp[rk]
-            if str_len(encoded) > 0 {
-                let tokens = react_decode_cmds(encoded)
-                let mut cmd_argv = make([]string, 0, 8)
-                let mut ti = 0
-                while ti < len(tokens) {
-                    let tok = tokens[ti]
-                    if str_eq(tok, "|") {
-                        if len(cmd_argv) > 0 {
-                            cmds = append(cmds, react_encode_argv(cmd_argv))
-                            cmd_argv = make([]string, 0, 8)
+            let mut revt = self.xp["\u001eReactEvt\u001e" + name]
+            if str_len(revt) == 0 {
+                revt = "WRITE"
+            }
+            if str_eq(revt, "ANY") or str_eq(revt, cur_evt) {
+                let rk = react_rule_key(name)
+                let encoded = self.xp[rk]
+                if str_len(encoded) > 0 {
+                    let tokens = react_decode_cmds(encoded)
+                    let mut cmd_argv = make([]string, 0, 8)
+                    let mut ti = 0
+                    while ti < len(tokens) {
+                        let tok = tokens[ti]
+                        if str_eq(tok, "|") {
+                            if len(cmd_argv) > 0 {
+                                cmds = append(cmds, react_encode_argv(cmd_argv))
+                                cmd_argv = make([]string, 0, 8)
+                            }
+                        } else {
+                            cmd_argv = append(cmd_argv, react_sub(tok, key, value, ""))
                         }
-                    } else {
-                        cmd_argv = append(cmd_argv, react_sub(tok, key, value, ""))
+                        ti = ti + 1
                     }
-                    ti = ti + 1
-                }
-                if len(cmd_argv) > 0 {
-                    cmds = append(cmds, react_encode_argv(cmd_argv))
+                    if len(cmd_argv) > 0 {
+                        cmds = append(cmds, react_encode_argv(cmd_argv))
+                    }
                 }
             }
         }
@@ -278,4 +343,5 @@ fn react_decode_argv(encoded: string) -> []string {
 // Keep for touch_store_methods compatibility
 fn Store_react_fire(mut self: Store, db: int, key: string, value: string) {
     // no-op — reactions are executed by shard_loop
+    let _ = db + len(key) + len(value)
 }

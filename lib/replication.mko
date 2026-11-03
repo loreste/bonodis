@@ -110,24 +110,26 @@ fn replica_ingest(fd: int, tls_on: int, tc: TlsConn, bus: []chan[string], replie
             buf = ""
             break
         }
-        while str_len(buf) > 0 {
-            if str_byte_at(buf, 0) == 43 or str_byte_at(buf, 0) == 45 {
-                let cr = find_crlf(buf, 0)
+        let mut bpos = 0
+        let bufn = str_len(buf)
+        while bpos < bufn {
+            if str_byte_at(buf, bpos) == 43 or str_byte_at(buf, bpos) == 45 {
+                let cr = find_crlf(buf, bpos)
                 if cr < 0 {
                     break
                 }
-                buf = buf[cr + 2:]
+                bpos = cr + 2
                 continue
             }
-            let argv, used, st = parse_cmd(buf)
+            let argv, next_pos, st = parse_cmd_at(buf, bpos)
             if st == 0 {
                 break
             }
             if st < 0 {
-                buf = ""
+                bpos = bufn
                 break
             }
-            buf = buf[used:]
+            bpos = next_pos
             let cmd = cmd_name(argv)
             if str_eq(cmd, "SELECT") {
                 if len(argv) >= 2 {
@@ -137,6 +139,13 @@ fn replica_ingest(fd: int, tls_on: int, tc: TlsConn, bus: []chan[string], replie
             } else {
                 log_replica_apply(cmd, db)
                 let _ = dispatch(bus, replies, ids, shards, db, argv)
+            }
+        }
+        if bpos > 0 {
+            if bpos >= bufn {
+                buf = ""
+            } else {
+                buf = buf[bpos:]
             }
         }
     }

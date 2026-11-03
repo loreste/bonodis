@@ -18,8 +18,8 @@ cd mako && make install
 Verify:
 
 ```
-makori --version
-# should print makori 0.5.x or later
+mako --version
+# should print mako 0.7.0 or later
 ```
 
 ## Build Bonodis
@@ -27,8 +27,8 @@ makori --version
 ```
 git clone https://github.com/loreste/bonodis
 cd bonodis
-makori build --release -p lib -o bonodis
-makori build --release -p cli -o bonodis-cli
+mako build ./lib/main.mko -o bonodis
+mako build ./cli/main.mko -o bonodis-cli
 ```
 
 This produces two binaries: `bonodis` (the server) and `bonodis-cli` (the command-line client).
@@ -61,6 +61,11 @@ The server is running. Open another terminal.
 
 ./bonodis-cli GET greeting
 # "hello world"
+
+# Or start an interactive REPL session:
+./bonodis-cli -i
+127.0.0.1:6379> PING
+PONG
 ```
 
 That's it. You have a running data store.
@@ -177,7 +182,7 @@ ZRANK leaderboard "bob"
 # 2
 ```
 
-### Key expiry
+### Key expiry & sub-key TTLs
 
 ```
 SET temp "data"
@@ -185,7 +190,57 @@ EXPIRE temp 30       # expires in 30 seconds
 TTL temp             # 29
 PERSIST temp         # remove the expiry
 TTL temp             # -1 (no expiry)
+
+# Per-field Hash TTLs, per-member Set TTLs, and per-member ZSet TTLs:
+HEXPIRE user:1 60 FIELDS 1 session_token
+SEXPIRE active_tokens 60 MEMBERS 1 tok_123
+ZEXPIRE leaderboard 3600 MEMBERS 1 guest_player
 ```
+
+### Native JSON, Time-Series, Search, Queues & Probabilistic Structures
+
+Bonodis ships Redis Stack capabilities natively in the core binary (zero `.so` modules):
+
+```
+# Native JSON (JSON.*)
+JSON.SET user:1 $ '{"name":"Ada","score":10}'
+JSON.NUMINCRBY user:1 $.score 5
+JSON.GET user:1 $.score
+
+# Native Time-Series (TS.*)
+TS.CREATE cpu:load RETENTION 60000 LABELS host web1
+TS.ADD cpu:load * 42
+TS.RANGE cpu:load - + AGGREGATION avg 10000
+
+# Native Full-Text & Secondary Indexing (FT.*)
+FT.CREATE idx:books ON HASH PREFIX 1 book: SCHEMA title TEXT genre TAG price NUMERIC SORTABLE
+HSET book:1 title "Systems Programming in Mako" genre "tech,systems" price 45
+FT.SEARCH idx:books "@genre:{tech} @price:[40 50]"
+
+# Native Delayed & Retryable Job Queues (QUEUE.*)
+QUEUE.PUSH q:jobs job1 '{"email":"ada@example.com"}' PRIORITY 10 MAXRETRIES 3
+QUEUE.POP q:jobs worker1 VISIBILITY 30000
+QUEUE.ACK q:jobs job1
+
+# Probabilistic Suite (Bloom, Cuckoo, Count-Min Sketch, Top-K)
+BF.ADD seen_urls "https://example.com"
+CF.ADD deletable_filter "item1"
+CMS.INITBYDIM freq_sketch 1000 5
+TOPK.RESERVE hot_queries 10
+
+# Atomic Compare-And-Swap, Fenced Locks & GCRA Rate Limiting
+CAS config:version "v1" "v2" EX 60
+LOCK ACQUIRE resource:db workerA 10000
+CL.THROTTLE api:user:42 15 30 60 1
+```
+
+## Benchmark your instance
+
+```
+./bonodis-cli --bench -n 20000 -P 16 -c 4 -r 10000
+```
+
+Reports `req/s` along with `p50`, `p95`, and `p99` tail-latency percentiles across `PING`, `SET`, `GET`, `INCR`, `LPUSH`, `HSET`, `CAS`, `RATELIMIT`, `BF.ADD`, and `JSON.GET`.
 
 ## Add a password
 

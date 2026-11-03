@@ -437,6 +437,13 @@ fn Store_cmd_brain_compact(mut self: Store, db: int, ns: string) -> string {
                 self.vtxt[ik] = tx
                 if has(self.vecs, ik) {
                     let mut v = self.vecs[ik]
+                    if has(v, ids[i]) and has(v, ids[j]) {
+                        let vi = unpack_floats(v[ids[i]])
+                        let vj = unpack_floats(v[ids[j]])
+                        if len(vi) > 0 and len(vi) == len(vj) {
+                            v[ids[i]] = pack_floats(vec_avg(vi, vj))
+                        }
+                    }
                     delete(v, ids[j])
                     self.vecs[ik] = v
                 }

@@ -61,8 +61,14 @@ Two listeners: `--requirepass s3cret` on `:16381`, open on `:16382`.
 | Glob 100k-`?` stack overflow | **fixed** — iterative glob with single-star backtracking |
 | MGET empty-string → nil | **fixed** — `resp_nil_mask` distinguishes `$-1` from `$0` |
 | UNSUBSCRIBE doesn't exit sub-mode | **fixed** — unsub-all iterates channels; resets `subbed` on count 0 |
-| XRANGE ignores start/end bounds | **fixed** — `xrange_cmp` filter (inline, avoids `xid_gte` shard crash) |
+| XRANGE ignores start/end bounds | **fixed** — `xrange_match` filter with exclusive `(id` bounds, `COUNT`, `XREVRANGE`, and `XREAD` |
+| Multiple XADD to same key crash | **fixed** — copy-on-append in `Store_cmd_xadd` plus monotonic ID validation and `MAXLEN` |
 | Monolithic codebase | **fixed** — split `extra.mko` → geo/hll/bitops/stream; split `server.mko` → pubsub/replication/sentinel |
+| Sub-key Hash Field TTLs | **shipped** — `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HTTL`, `HPTTL`, `HPERSIST`, `HSETEX` with lazy & active sweep and `DUMP`/`RESTORE`/`RENAME` preservation |
+| Active expiry + $O(1)$ sampled LRU | **shipped** — periodic `Store_active_expire` on shard writes plus 16-sample `allkeys-lru` eviction preferring already-expired keys |
+| Deterministic `*SCAN` + `SCAN TYPE` | **shipped** — sorted deterministic pagination for `SCAN` (`MATCH`/`COUNT`/`TYPE`), `HSCAN`, `SSCAN`, `ZSCAN` |
+| Cross-shard `RENAME`/`COPY` + parallel multi-key | **shipped** — standalone cross-shard `RENAME`, `RENAMENX`, and `COPY` for all types + parallel multi-shard `MGET`, `MSET`, `DEL`, `EXISTS`, `TOUCH` |
+| Zero-copy RESP + pipeline write coalescing | **shipped** — `parse_cmd_at` cursor framing, pipelined TCP batch responses, Mako `0.7.0` `#[no_alloc]`, `const fn`, and SWAR bitops |
 
 ## Whitehat (security-auditor)
 
@@ -74,7 +80,6 @@ Full write-up: `audits/adversarial.md`. Highest items (AOF DB collapse, cross-sh
 
 ## Known open
 
-- Multiple XADD to same key crashes (shard slice append aliasing)
 - `SCAN` is still `KEYS`-and-slice, not true incremental cursor
 - `wait_reply` busy-polls (condvar would be better)
 - Thread-per-connection (mitigated by `maxclients` + `accept-rate`)

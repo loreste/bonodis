@@ -288,7 +288,66 @@ fn lua_to_resp(v: LVal) -> string {
         }
         return r_int(1)
     }
+    if str_has_prefix(v.s, "\u001eSTAT:") {
+        let pfx_len = str_len("\u001eSTAT:")
+        return "+" + resp_safe(v.s[pfx_len:]) + "\r\n"
+    }
+    if str_has_prefix(v.s, "\u001eERR:") {
+        let pfx_len = str_len("\u001eERR:")
+        let msg = v.s[pfx_len:]
+        if str_has_prefix(msg, "ERR ") or str_has_prefix(msg, "WRONGTYPE ") {
+            return "-" + resp_safe(msg) + "\r\n"
+        }
+        return "-ERR " + resp_safe(msg) + "\r\n"
+    }
     return r_bulk(v.s)
+}
+
+fn lua_val_str(v: LVal) -> string {
+    if v.k == 1 {
+        return format_int(v.n)
+    }
+    if v.k == 0 {
+        return ""
+    }
+    if v.k == 3 {
+        if v.n == 0 {
+            return "false"
+        }
+        return "true"
+    }
+    return v.s
+}
+
+fn lua_val_int(v: LVal) -> int {
+    if v.k == 1 {
+        return v.n
+    }
+    return int_of(v.s)
+}
+
+fn lua_json_val(raw: string) -> LVal {
+    let t = json_trim(raw)
+    if str_len(t) == 0 or str_eq(t, "null") {
+        return lv_nil()
+    }
+    if str_eq(t, "true") {
+        return lv_bool(1)
+    }
+    if str_eq(t, "false") {
+        return lv_bool(0)
+    }
+    if str_len(t) >= 2 and str_byte_at(t, 0) == 34 and str_byte_at(t, str_len(t) - 1) == 34 {
+        return lv_str(t[1:str_len(t) - 1])
+    }
+    let iv, iok = int_ok(t)
+    if iok == 1 {
+        return lv_int(iv)
+    }
+    if str_byte_at(t, 0) == 123 or str_byte_at(t, 0) == 91 {
+        return lv_str("\u001eJSON:" + t)
+    }
+    return lv_str(t)
 }
 
 fn lua_idx_get(name: string, idx: int, keys: []string, args: []string) -> LVal {
@@ -403,11 +462,37 @@ fn Store_lua_primary(mut self: Store, src: string, p0: int, keys: []string, args
             if ap >= n or str_byte_at(src, ap) != 41 {
                 return (lv_nil(), ap, 1)
             }
+            if str_eq(meth, "status_reply") {
+                let mut msg = "OK"
+                if len(argv) >= 1 {
+                    msg = argv[0]
+                }
+                return (lv_str("\u001eSTAT:" + msg), ap + 1, 0)
+            }
+            if str_eq(meth, "error_reply") {
+                let mut msg = "error"
+                if len(argv) >= 1 {
+                    msg = argv[0]
+                }
+                return (lv_str("\u001eERR:" + msg), ap + 1, 0)
+            }
+            if str_eq(meth, "sha1hex") {
+                let mut msg = ""
+                if len(argv) >= 1 {
+                    msg = argv[0]
+                }
+                return (lv_str(sha1(msg)), ap + 1, 0)
+            }
             if len(argv) == 0 {
                 return (lv_nil(), ap + 1, 2)
             }
             argv[0] = str_to_upper(argv[0])
-            let rr = self.apply(db, argv)
+            let mut rr = ""
+            if has(env, "\u001eRO\u001e") and str_eq(env["\u001eRO\u001e"], "1") and is_write_cmd(argv[0]) == 1 {
+                rr = r_err("ERR Write commands are not allowed from read-only scripts.")
+            } else {
+                rr = self.apply(db, argv)
+            }
             let lv, ler = lua_from_resp(rr)
             if ler != 0 and not str_eq(meth, "pcall") {
                 return (lv, ap + 1, 2)
@@ -439,6 +524,12 @@ fn Store_lua_primary(mut self: Store, src: string, p0: int, keys: []string, args
             if av.k == 0 {
                 return (lv_str("nil"), epos + 1, 0)
             }
+            if av.k == 3 {
+                if av.n == 0 {
+                    return (lv_str("false"), epos + 1, 0)
+                }
+                return (lv_str("true"), epos + 1, 0)
+            }
             return (lv_str(av.s), epos + 1, 0)
         }
         if av.k == 1 {
@@ -450,8 +541,199 @@ fn Store_lua_primary(mut self: Store, src: string, p0: int, keys: []string, args
         }
         return (lv_int(nn), epos + 1, 0)
     }
+    if (str_eq(id, "string") or str_eq(id, "math") or str_eq(id, "cjson")) and q < n and str_byte_at(src, q) == 46 {
+        let meth, mp = lua_ident(src, q + 1)
+        let r = lua_skip(src, mp)
+        if r >= n or str_byte_at(src, r) != 40 {
+            return (lv_nil(), r, 1)
+        }
+        let mut fargs = make([]string, 0, 4)
+        let mut ap = lua_skip(src, r + 1)
+        while ap < n and str_byte_at(src, ap) != 41 {
+            let av, a2, ae = self.lua_expr(src, ap, keys, args, db, env)
+            if ae != 0 {
+                return (av, a2, ae)
+            }
+            fargs = append(fargs, lua_enc(av))
+            ap = lua_skip(src, a2)
+            if ap < n and str_byte_at(src, ap) == 44 {
+                ap = lua_skip(src, ap + 1)
+            }
+        }
+        if ap >= n or str_byte_at(src, ap) != 41 {
+            return (lv_nil(), ap, 1)
+        }
+        let next_p = ap + 1
+        if str_eq(id, "string") {
+            let mut s0 = ""
+            if len(fargs) >= 1 {
+                s0 = lua_val_str(lua_dec(fargs[0]))
+            }
+            if str_eq(meth, "len") {
+                return (lv_int(str_len(s0)), next_p, 0)
+            }
+            if str_eq(meth, "lower") {
+                return (lv_str(str_to_lower(s0)), next_p, 0)
+            }
+            if str_eq(meth, "upper") {
+                return (lv_str(str_to_upper(s0)), next_p, 0)
+            }
+            if str_eq(meth, "rep") {
+                let mut cnt = 0
+                if len(fargs) >= 2 {
+                    cnt = lua_val_int(lua_dec(fargs[1]))
+                }
+                let rb = str_builder()
+                let mut ri = 0
+                while ri < cnt and ri < 4096 {
+                    builder_write(rb, s0)
+                    ri = ri + 1
+                }
+                return (lv_str(builder_string(rb)), next_p, 0)
+            }
+            if str_eq(meth, "find") {
+                if len(fargs) < 2 {
+                    return (lv_nil(), next_p, 0)
+                }
+                let pat = lua_val_str(lua_dec(fargs[1]))
+                let idx = str_index(s0, pat)
+                if idx < 0 {
+                    return (lv_nil(), next_p, 0)
+                }
+                return (lv_int(idx + 1), next_p, 0)
+            }
+            if str_eq(meth, "sub") {
+                let slen = str_len(s0)
+                if slen == 0 or len(fargs) < 2 {
+                    return (lv_str(""), next_p, 0)
+                }
+                let mut i1 = lua_val_int(lua_dec(fargs[1]))
+                let mut i2 = slen
+                if len(fargs) >= 3 {
+                    i2 = lua_val_int(lua_dec(fargs[2]))
+                }
+                if i1 < 0 {
+                    i1 = slen + i1 + 1
+                }
+                if i2 < 0 {
+                    i2 = slen + i2 + 1
+                }
+                if i1 < 1 {
+                    i1 = 1
+                }
+                if i2 > slen {
+                    i2 = slen
+                }
+                if i1 > i2 or i1 > slen {
+                    return (lv_str(""), next_p, 0)
+                }
+                return (lv_str(s0[i1 - 1:i2]), next_p, 0)
+            }
+            return (lv_nil(), next_p, 0)
+        }
+        if str_eq(id, "math") {
+            if len(fargs) == 0 {
+                return (lv_int(0), next_p, 0)
+            }
+            let fa0 = lua_dec(fargs[0])
+            if str_eq(meth, "abs") {
+                let v0 = lua_val_int(fa0)
+                if v0 < 0 {
+                    return (lv_int(0 - v0), next_p, 0)
+                }
+                return (lv_int(v0), next_p, 0)
+            }
+            if str_eq(meth, "floor") {
+                if fa0.k == 1 {
+                    return (fa0, next_p, 0)
+                }
+                return (lv_int(int(parse_float(fa0.s))), next_p, 0)
+            }
+            if str_eq(meth, "min") or str_eq(meth, "max") {
+                let is_max = if str_eq(meth, "max") { 1 } else { 0 }
+                let mut best = lua_val_int(fa0)
+                let mut mi = 1
+                while mi < len(fargs) {
+                    let cur = lua_val_int(lua_dec(fargs[mi]))
+                    if (is_max == 1 and cur > best) or (is_max == 0 and cur < best) {
+                        best = cur
+                    }
+                    mi = mi + 1
+                }
+                return (lv_int(best), next_p, 0)
+            }
+            return (lv_int(0), next_p, 0)
+        }
+        if str_eq(id, "cjson") {
+            if str_eq(meth, "encode") {
+                if len(fargs) == 0 {
+                    return (lv_str("null"), next_p, 0)
+                }
+                let v0 = lua_dec(fargs[0])
+                if v0.k == 0 {
+                    return (lv_str("null"), next_p, 0)
+                }
+                if v0.k == 1 {
+                    return (lv_str(format_int(v0.n)), next_p, 0)
+                }
+                if v0.k == 3 {
+                    if v0.n == 0 {
+                        return (lv_str("false"), next_p, 0)
+                    }
+                    return (lv_str("true"), next_p, 0)
+                }
+                if str_has_prefix(v0.s, "\u001eJSON:") {
+                    let jpfx = str_len("\u001eJSON:")
+                    return (lv_str(v0.s[jpfx:]), next_p, 0)
+                }
+                return (lv_str("\"" + v0.s + "\""), next_p, 0)
+            }
+            if str_eq(meth, "decode") {
+                if len(fargs) == 0 {
+                    return (lv_nil(), next_p, 0)
+                }
+                return (lua_json_val(lua_val_str(lua_dec(fargs[0]))), next_p, 0)
+            }
+        }
+    }
     if has(env, id) {
-        return (lua_dec(env[id]), np, 0)
+        let mut ev = lua_dec(env[id])
+        let mut cur_p = np
+        let jpfx = str_len("\u001eJSON:")
+        while ev.k == 2 and str_has_prefix(ev.s, "\u001eJSON:") {
+            let jq = lua_skip(src, cur_p)
+            if jq < n and str_byte_at(src, jq) == 46 and (jq + 1 >= n or str_byte_at(src, jq + 1) != 46) {
+                let fld, fp = lua_ident(src, jq + 1)
+                if str_len(fld) == 0 {
+                    break
+                }
+                let sub_raw, ok = json_get_path(ev.s[jpfx:], [fld], 0)
+                if ok == 0 {
+                    return (lv_nil(), fp, 0)
+                }
+                ev = lua_json_val(sub_raw)
+                cur_p = fp
+            } else if jq < n and str_byte_at(src, jq) == 91 {
+                let ix, qp, ie = self.lua_expr(src, jq + 1, keys, args, db, env)
+                if ie != 0 {
+                    return (ix, qp, ie)
+                }
+                let rb = lua_skip(src, qp)
+                if rb >= n or str_byte_at(src, rb) != 93 {
+                    return (lv_nil(), rb, 1)
+                }
+                let fld = lua_val_str(ix)
+                let sub_raw, ok = json_get_path(ev.s[jpfx:], [fld], 0)
+                if ok == 0 {
+                    return (lv_nil(), rb + 1, 0)
+                }
+                ev = lua_json_val(sub_raw)
+                cur_p = rb + 1
+            } else {
+                break
+            }
+        }
+        return (ev, cur_p, 0)
     }
     return (lv_nil(), np, 0)
 }
@@ -729,6 +1011,9 @@ fn Store_lua_block(mut self: Store, src: string, p0: int, keys: []string, args: 
     while p < str_len(src) and steps < 10000 {
         steps = steps + 1
         p = lua_skip(src, p)
+        while p < str_len(src) and str_byte_at(src, p) == 59 {
+            p = lua_skip(src, p + 1)
+        }
         if p >= str_len(src) {
             break
         }
@@ -963,6 +1248,9 @@ fn Store_cmd_eval(mut self: Store, db: int, argv: []string) -> string {
         i = i + 1
     }
     let mut env = make(map[string]string)
+    if str_eq(cmd_name(argv), "EVAL_RO") {
+        env["\u001eRO\u001e"] = "1"
+    }
     let v, pe, e = self.lua_block(src, 0, keys, args, db, env)
     let _ = pe
     if e == 1 {

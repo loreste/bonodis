@@ -1,16 +1,20 @@
 pack bonodis
 
+#[no_alloc]
 fn deg2rad(d: float) -> float {
     return d * 3.141592653589793 / 180.0
 }
 
+#[no_alloc]
 fn haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float {
     let r = 6371000.0
     let p1 = deg2rad(lat1)
     let p2 = deg2rad(lat2)
     let dp = deg2rad(lat2 - lat1)
     let dl = deg2rad(lon2 - lon1)
-    let a = math_sin(dp / 2.0) * math_sin(dp / 2.0) + math_cos(p1) * math_cos(p2) * math_sin(dl / 2.0) * math_sin(dl / 2.0)
+    let sdp = math_sin(dp / 2.0)
+    let sdl = math_sin(dl / 2.0)
+    let a = sdp * sdp + math_cos(p1) * math_cos(p2) * sdl * sdl
     let c = 2.0 * math_atan2(math_sqrt(a), math_sqrt(1.0 - a))
     return r * c
 }
@@ -47,6 +51,9 @@ fn Store_cmd_geoadd(mut self: Store, db: int, argv: []string) -> string {
     let mut added = 0
     let mut i = 2
     while i + 2 < len(argv) {
+        if finite_score(argv[i]) == 0 or finite_score(argv[i + 1]) == 0 {
+            return r_err("ERR value is not a valid float")
+        }
         let lon = parse_float(argv[i])
         let lat = parse_float(argv[i + 1])
         if lon < (0.0 - 180.0) or lon > 180.0 or lat < (0.0 - 85.05112878) or lat > 85.05112878 {
@@ -88,12 +95,12 @@ fn Store_cmd_geodist(mut self: Store, db: int, argv: []string) -> string {
     }
     if str_eq(unit, "km") {
         m = m / 1000.0
-    }
-    if str_eq(unit, "ft") {
+    } else if str_eq(unit, "ft") {
         m = m * 3.28084
-    }
-    if str_eq(unit, "mi") {
+    } else if str_eq(unit, "mi") {
         m = m / 1609.344
+    } else if not str_eq(unit, "m") {
+        return r_err("ERR unsupported unit provided. please use M, KM, FT, MI")
     }
     return r_bulk(format_float(m, 4))
 }

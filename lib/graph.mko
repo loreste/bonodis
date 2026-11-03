@@ -170,39 +170,56 @@ fn fact_po(p: string, o: string) -> string {
 }
 
 fn Store_scrub_graph(mut self: Store, ik: string) {
-    let name = ukey(ik)
-    let db = kdb(ik)
-    let outs = edge_rows(self.xp[rk_out(ik)])
-    let mut i = 0
-    while i < len(outs) {
-        let oik = ikey(db, edge_nb(outs[i]))
-        self.xp[rk_in(oik)] = edge_del(self.xp[rk_in(oik)], name)
-        i = i + 1
-    }
-    let ins = edge_rows(self.xp[rk_in(ik)])
-    i = 0
-    while i < len(ins) {
-        let oik = ikey(db, edge_nb(ins[i]))
-        self.xp[rk_out(oik)] = edge_del(self.xp[rk_out(oik)], name)
-        i = i + 1
-    }
-    let facts = edge_rows(self.xp[rk_fact(ik)])
-    i = 0
-    while i < len(facts) {
-        let po = facts[i]
-        let sp = str_index(po, "\u001e")
-        if sp > 0 {
-            let ix = rk_fidx(db, po[:sp], po[sp + 1:])
-            self.xp[ix] = csv_del(self.xp[ix], name)
+    if len(self.xp) > 0 {
+        let name = ukey(ik)
+        let db = kdb(ik)
+        let k_out = rk_out(ik)
+        if has(self.xp, k_out) {
+            let outs = edge_rows(self.xp[k_out])
+            let mut i = 0
+            while i < len(outs) {
+                let oik = ikey(db, edge_nb(outs[i]))
+                self.xp[rk_in(oik)] = edge_del(self.xp[rk_in(oik)], name)
+                i = i + 1
+            }
+            delete(self.xp, k_out)
         }
-        i = i + 1
+        let k_in = rk_in(ik)
+        if has(self.xp, k_in) {
+            let ins = edge_rows(self.xp[k_in])
+            let mut i = 0
+            while i < len(ins) {
+                let oik = ikey(db, edge_nb(ins[i]))
+                self.xp[rk_out(oik)] = edge_del(self.xp[rk_out(oik)], name)
+                i = i + 1
+            }
+            delete(self.xp, k_in)
+        }
+        let k_fact = rk_fact(ik)
+        if has(self.xp, k_fact) {
+            let facts = edge_rows(self.xp[k_fact])
+            let mut i = 0
+            while i < len(facts) {
+                let po = facts[i]
+                let p = edge_nb(po)
+                let o = edge_ty(po)
+                if str_len(p) > 0 {
+                    let ix = rk_fidx(db, p, o)
+                    self.xp[ix] = csv_del(self.xp[ix], name)
+                    delete(self.xseq, rk_bsc(ik, p, o))
+                }
+                i = i + 1
+            }
+            delete(self.xp, k_fact)
+        }
+        delete(self.xp, rk_last(ik))
+        delete(self.xp, rk_tok(ik))
+        delete(self.xp, rk_att(ik))
     }
-    delete(self.xp, rk_out(ik))
-    delete(self.xp, rk_in(ik))
-    delete(self.xp, rk_fact(ik))
-    delete(self.xp, rk_last(ik))
-    delete(self.xp, rk_tok(ik))
-    delete(self.xseq, rk_until(ik))
+    if len(self.xseq) > 0 {
+        delete(self.xseq, rk_until(ik))
+        delete(self.xseq, rk_bud(ik))
+    }
 }
 
 fn Store_cmd_relate(mut self: Store, db: int, argv: []string, add: int) -> string {
@@ -528,4 +545,1062 @@ fn Store_cmd_why(mut self: Store, db: int, argv: []string) -> string {
         items = append(items, "")
     }
     return r_array_bulks(items)
+}
+
+// LOCK ACQUIRE key owner ttl_ms -> *3 [:1|:0, :fencing_token, :ttl_ms]
+// LOCK RENEW key owner ttl_ms [fencing_token] -> :1 | :0
+// LOCK RELEASE key owner [fencing_token] -> :1 | :0
+// LOCK INFO key -> *3 [$owner, :fencing_token, :pttl_ms] | *-1
+fn Store_cmd_lock(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 3 {
+        return r_arity("lock")
+    }
+    let sub = str_to_upper(argv[1])
+    let ik = ikey(db, argv[2])
+    let fk = "\u001eLockFence\u001e" + ik
+    if str_eq(sub, "ACQUIRE") {
+        if len(argv) != 5 {
+            return r_arity("lock")
+        }
+        let owner = argv[3]
+        let ttl_ms, ok = int_ok(argv[4])
+        if ok == 0 or ttl_ms <= 0 {
+            return r_err("ERR ttl_ms must be a positive integer")
+        }
+        let now = wall_ms()
+        let live = self.lease_live(ik)
+        if live == 1 and not str_eq(self.xp[rk_tok(ik)], owner) {
+            let mut rem = self.xseq[rk_until(ik)] - now
+            if rem < 0 {
+                rem = 0
+            }
+            return "*3\r\n" + r_int(0) + r_int(self.xseq[fk]) + r_int(rem)
+        }
+        let seq = self.xseq["\u001eLockSeq\u001e"] + 1
+        self.xseq["\u001eLockSeq\u001e"] = seq
+        self.xp[rk_tok(ik)] = owner
+        self.xseq[rk_until(ik)] = now + ttl_ms
+        self.xseq[fk] = seq
+        return "*3\r\n" + r_int(1) + r_int(seq) + r_int(ttl_ms)
+    }
+    if str_eq(sub, "RENEW") {
+        if len(argv) != 5 and len(argv) != 6 {
+            return r_arity("lock")
+        }
+        let owner = argv[3]
+        let ttl_ms, ok = int_ok(argv[4])
+        if ok == 0 or ttl_ms <= 0 {
+            return r_err("ERR ttl_ms must be a positive integer")
+        }
+        if self.lease_live(ik) == 0 or not str_eq(self.xp[rk_tok(ik)], owner) {
+            return r_int(0)
+        }
+        if len(argv) == 6 {
+            let ftok, fok = int_ok(argv[5])
+            if fok == 0 or ftok != self.xseq[fk] {
+                return r_int(0)
+            }
+        }
+        self.xseq[rk_until(ik)] = wall_ms() + ttl_ms
+        return r_int(1)
+    }
+    if str_eq(sub, "RELEASE") {
+        if len(argv) != 4 and len(argv) != 5 {
+            return r_arity("lock")
+        }
+        let owner = argv[3]
+        if self.lease_live(ik) == 0 or not str_eq(self.xp[rk_tok(ik)], owner) {
+            return r_int(0)
+        }
+        if len(argv) == 5 {
+            let ftok, fok = int_ok(argv[4])
+            if fok == 0 or ftok != self.xseq[fk] {
+                return r_int(0)
+            }
+        }
+        delete(self.xp, rk_tok(ik))
+        delete(self.xseq, rk_until(ik))
+        delete(self.xseq, fk)
+        return r_int(1)
+    }
+    if str_eq(sub, "INFO") {
+        if len(argv) != 3 {
+            return r_arity("lock")
+        }
+        if self.lease_live(ik) == 0 {
+            return "*-1\r\n"
+        }
+        let mut rem = self.xseq[rk_until(ik)] - wall_ms()
+        if rem < 0 {
+            rem = 0
+        }
+        return "*3\r\n" + r_bulk(self.xp[rk_tok(ik)]) + r_int(self.xseq[fk]) + r_int(rem)
+    }
+    return r_err("ERR unknown LOCK subcommand '" + resp_safe(argv[1]) + "'")
+}
+
+// ============================================================================
+// Native Delayed & Retryable Job Queues (QUEUE.PUSH, QUEUE.POP, QUEUE.ACK,
+// QUEUE.NACK, QUEUE.DLQ, QUEUE.STATS)
+// ============================================================================
+
+fn qk_ids(ik: string) -> string {
+    return "\u001eQids\u001e" + ik
+}
+
+fn qk_prop(ik: string, jid: string, prop: string) -> string {
+    return "\u001eQ" + prop + "\u001e" + ik + "\u001e" + jid
+}
+
+fn qk_ids_list(s: string) -> []string {
+    let mut out = make([]string, 0, 4)
+    if str_len(s) == 0 {
+        return out
+    }
+    let parts = str_split(s, ",")
+    let mut i = 0
+    while i < len(parts) {
+        if str_len(parts[i]) > 0 {
+            out = append(out, parts[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn Store_queue_sweep(mut self: Store, ik: string, now: int) {
+    let sk = qk_ids(ik)
+    if not has(self.xp, sk) {
+        return
+    }
+    let ids = qk_ids_list(self.xp[sk])
+    let mut i = 0
+    while i < len(ids) {
+        let jid = ids[i]
+        let stk = qk_prop(ik, jid, "st")
+        let st = self.xseq[stk]
+        if st == 2 {
+            let at = self.xseq[qk_prop(ik, jid, "at")]
+            if at <= now {
+                self.xseq[stk] = 1
+            }
+        } else if st == 3 {
+            let at = self.xseq[qk_prop(ik, jid, "at")]
+            if at <= now {
+                let att = self.xseq[qk_prop(ik, jid, "att")]
+                let mx = self.xseq[qk_prop(ik, jid, "max")]
+                if att > mx {
+                    self.xseq[stk] = 4
+                } else {
+                    self.xseq[stk] = 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn Store_queue_drop_job(mut self: Store, ik: string, jid: string) {
+    delete(self.xp, qk_prop(ik, jid, "pay"))
+    delete(self.xp, qk_prop(ik, jid, "wkr"))
+    delete(self.xseq, qk_prop(ik, jid, "st"))
+    delete(self.xseq, qk_prop(ik, jid, "at"))
+    delete(self.xseq, qk_prop(ik, jid, "pri"))
+    delete(self.xseq, qk_prop(ik, jid, "att"))
+    delete(self.xseq, qk_prop(ik, jid, "max"))
+    delete(self.xseq, qk_prop(ik, jid, "seq"))
+}
+
+fn Store_cmd_queue(mut self: Store, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    if str_eq(cmd, "QUEUE.PUSH") {
+        if len(argv) < 4 {
+            return r_arity("queue.push")
+        }
+        let ik = ikey(db, argv[1])
+        let t = self.kind(ik)
+        if t != T_NONE and (t != T_STR or not str_eq(self.strs[ik], "QUEUE1")) {
+            return r_wrongtype()
+        }
+        let jid = argv[2]
+        let payload = argv[3]
+        let mut delay_ms = 0
+        let mut pri = 0
+        let mut max_ret = 3
+        let mut i = 4
+        while i + 1 < len(argv) {
+            let o = str_to_upper(argv[i])
+            if str_eq(o, "DELAY") {
+                delay_ms = int_of(argv[i + 1])
+                i = i + 2
+            } else if str_eq(o, "PRIORITY") {
+                pri = int_of(argv[i + 1])
+                i = i + 2
+            } else if str_eq(o, "MAXRETRIES") {
+                max_ret = int_of(argv[i + 1])
+                i = i + 2
+            } else {
+                return r_syntax()
+            }
+        }
+        self.strs[ik] = "QUEUE1"
+        self.types[ik] = T_STR
+        let sk = qk_ids(ik)
+        let mut cur_ids = ""
+        if has(self.xp, sk) {
+            cur_ids = self.xp[sk]
+        }
+        let mut is_new = 1
+        if csv_has(cur_ids, jid) == 1 {
+            is_new = 0
+        }
+        self.xp[sk] = csv_add(cur_ids, jid)
+        let seq_k = "\u001eQseqCnt\u001e" + ik
+        let mut seq = 1
+        if has(self.xseq, seq_k) {
+            seq = self.xseq[seq_k] + 1
+        }
+        self.xseq[seq_k] = seq
+        let now = wall_ms()
+        self.xp[qk_prop(ik, jid, "pay")] = payload
+        self.xseq[qk_prop(ik, jid, "pri")] = pri
+        self.xseq[qk_prop(ik, jid, "att")] = 0
+        self.xseq[qk_prop(ik, jid, "max")] = max_ret
+        self.xseq[qk_prop(ik, jid, "seq")] = seq
+        if delay_ms > 0 {
+            self.xseq[qk_prop(ik, jid, "st")] = 2
+            self.xseq[qk_prop(ik, jid, "at")] = now + delay_ms
+        } else {
+            self.xseq[qk_prop(ik, jid, "st")] = 1
+            self.xseq[qk_prop(ik, jid, "at")] = now
+        }
+        return r_int(is_new)
+    }
+    if str_eq(cmd, "QUEUE.POP") {
+        if len(argv) < 3 {
+            return r_arity("queue.pop")
+        }
+        let ik = ikey(db, argv[1])
+        let wkr = argv[2]
+        let mut vis_ms = 30000
+        let mut count = 1
+        let mut has_count = 0
+        let mut i = 3
+        while i + 1 < len(argv) {
+            let o = str_to_upper(argv[i])
+            if str_eq(o, "VISIBILITY") {
+                vis_ms = int_of(argv[i + 1])
+                i = i + 2
+            } else if str_eq(o, "COUNT") {
+                count = int_of(argv[i + 1])
+                has_count = 1
+                i = i + 2
+            } else {
+                return r_syntax()
+            }
+        }
+        let t = self.kind(ik)
+        if t == T_NONE {
+            if has_count == 1 {
+                return "*0\r\n"
+            }
+            return "*-1\r\n"
+        }
+        if t != T_STR or not str_eq(self.strs[ik], "QUEUE1") {
+            return r_wrongtype()
+        }
+        let now = wall_ms()
+        self.queue_sweep(ik, now)
+        let sk = qk_ids(ik)
+        if not has(self.xp, sk) {
+            if has_count == 1 {
+                return "*0\r\n"
+            }
+            return "*-1\r\n"
+        }
+        let ids = qk_ids_list(self.xp[sk])
+        let mut popped_ids = make([]string, 0, count)
+        let mut popped_pay = make([]string, 0, count)
+        let mut popped_att = make([]int, 0, count)
+        while len(popped_ids) < count {
+            let mut best_id = ""
+            let mut best_pri = -2147483648
+            let mut best_seq = 2147483647
+            let mut ji = 0
+            while ji < len(ids) {
+                let jid = ids[ji]
+                if self.xseq[qk_prop(ik, jid, "st")] == 1 {
+                    let pri = self.xseq[qk_prop(ik, jid, "pri")]
+                    let seq = self.xseq[qk_prop(ik, jid, "seq")]
+                    if str_len(best_id) == 0 or pri > best_pri or (pri == best_pri and seq < best_seq) {
+                        best_id = jid
+                        best_pri = pri
+                        best_seq = seq
+                    }
+                }
+                ji = ji + 1
+            }
+            if str_len(best_id) == 0 {
+                break
+            }
+            let att = self.xseq[qk_prop(ik, best_id, "att")] + 1
+            let mx = self.xseq[qk_prop(ik, best_id, "max")]
+            self.xseq[qk_prop(ik, best_id, "att")] = att
+            if att > mx + 1 {
+                self.xseq[qk_prop(ik, best_id, "st")] = 4
+                continue
+            }
+            self.xseq[qk_prop(ik, best_id, "st")] = 3
+            self.xseq[qk_prop(ik, best_id, "at")] = now + vis_ms
+            self.xp[qk_prop(ik, best_id, "wkr")] = wkr
+            popped_ids = append(popped_ids, best_id)
+            popped_pay = append(popped_pay, self.xp[qk_prop(ik, best_id, "pay")])
+            popped_att = append(popped_att, att)
+        }
+        if has_count == 0 {
+            if len(popped_ids) == 0 {
+                return "*-1\r\n"
+            }
+            return "*3\r\n" + r_bulk(popped_ids[0]) + r_bulk(popped_pay[0]) + r_int(popped_att[0])
+        }
+        let b = str_builder()
+        builder_write(b, "*")
+        builder_write(b, fmt_int_fast(len(popped_ids)))
+        builder_write(b, "\r\n")
+        let mut pi = 0
+        while pi < len(popped_ids) {
+            builder_write(b, "*3\r\n")
+            builder_write(b, r_bulk(popped_ids[pi]))
+            builder_write(b, r_bulk(popped_pay[pi]))
+            builder_write(b, r_int(popped_att[pi]))
+            pi = pi + 1
+        }
+        return builder_string(b)
+    }
+    if str_eq(cmd, "QUEUE.ACK") {
+        if len(argv) < 3 {
+            return r_arity("queue.ack")
+        }
+        let ik = ikey(db, argv[1])
+        let sk = qk_ids(ik)
+        if self.kind(ik) != T_STR or not has(self.xp, sk) {
+            return r_int(0)
+        }
+        let mut cur_ids = self.xp[sk]
+        let mut acked = 0
+        let mut i = 2
+        while i < len(argv) {
+            let jid = argv[i]
+            if csv_has(cur_ids, jid) == 1 {
+                cur_ids = csv_del(cur_ids, jid)
+                self.queue_drop_job(ik, jid)
+                acked = acked + 1
+            }
+            i = i + 1
+        }
+        self.xp[sk] = cur_ids
+        return r_int(acked)
+    }
+    if str_eq(cmd, "QUEUE.NACK") {
+        if len(argv) < 3 {
+            return r_arity("queue.nack")
+        }
+        let ik = ikey(db, argv[1])
+        let jid = argv[2]
+        let sk = qk_ids(ik)
+        if self.kind(ik) != T_STR or not has(self.xp, sk) {
+            return r_int(0)
+        }
+        if csv_has(self.xp[sk], jid) == 0 {
+            return r_int(0)
+        }
+        let mut delay_ms = 0
+        if len(argv) >= 5 and str_eq(str_to_upper(argv[3]), "DELAY") {
+            delay_ms = int_of(argv[4])
+        }
+        let att = self.xseq[qk_prop(ik, jid, "att")]
+        let mx = self.xseq[qk_prop(ik, jid, "max")]
+        if att > mx {
+            self.xseq[qk_prop(ik, jid, "st")] = 4
+            return r_int(2)
+        }
+        let now = wall_ms()
+        if delay_ms > 0 {
+            self.xseq[qk_prop(ik, jid, "st")] = 2
+            self.xseq[qk_prop(ik, jid, "at")] = now + delay_ms
+        } else {
+            self.xseq[qk_prop(ik, jid, "st")] = 1
+            self.xseq[qk_prop(ik, jid, "at")] = now
+        }
+        return r_int(1)
+    }
+    if str_eq(cmd, "QUEUE.DLQ") {
+        if len(argv) < 2 {
+            return r_arity("queue.dlq")
+        }
+        let ik = ikey(db, argv[1])
+        let sk = qk_ids(ik)
+        if self.kind(ik) == T_NONE or not has(self.xp, sk) {
+            return "*0\r\n"
+        }
+        let now = wall_ms()
+        self.queue_sweep(ik, now)
+        let mut sub = "LIST"
+        if len(argv) >= 3 {
+            sub = str_to_upper(argv[2])
+        }
+        if str_eq(sub, "RETRY") {
+            if len(argv) != 4 {
+                return r_arity("queue.dlq")
+            }
+            let jid = argv[3]
+            if csv_has(self.xp[sk], jid) == 0 or self.xseq[qk_prop(ik, jid, "st")] != 4 {
+                return r_int(0)
+            }
+            self.xseq[qk_prop(ik, jid, "att")] = 0
+            self.xseq[qk_prop(ik, jid, "st")] = 1
+            self.xseq[qk_prop(ik, jid, "at")] = now
+            return r_int(1)
+        }
+        let ids = qk_ids_list(self.xp[sk])
+        if str_eq(sub, "PURGE") {
+            let mut cur_ids = self.xp[sk]
+            let mut dropped = 0
+            let mut di = 0
+            while di < len(ids) {
+                let jid = ids[di]
+                if self.xseq[qk_prop(ik, jid, "st")] == 4 {
+                    cur_ids = csv_del(cur_ids, jid)
+                    self.queue_drop_job(ik, jid)
+                    dropped = dropped + 1
+                }
+                di = di + 1
+            }
+            self.xp[sk] = cur_ids
+            return r_int(dropped)
+        }
+        let mut dlq_ids = make([]string, 0, 4)
+        let mut ji = 0
+        while ji < len(ids) {
+            let jid = ids[ji]
+            if self.xseq[qk_prop(ik, jid, "st")] == 4 {
+                dlq_ids = append(dlq_ids, jid)
+            }
+            ji = ji + 1
+        }
+        dlq_ids = sort_strings(dlq_ids)
+        let b = str_builder()
+        builder_write(b, "*")
+        builder_write(b, fmt_int_fast(len(dlq_ids)))
+        builder_write(b, "\r\n")
+        let mut i = 0
+        while i < len(dlq_ids) {
+            let jid = dlq_ids[i]
+            builder_write(b, "*3\r\n")
+            builder_write(b, r_bulk(jid))
+            builder_write(b, r_bulk(self.xp[qk_prop(ik, jid, "pay")]))
+            builder_write(b, r_int(self.xseq[qk_prop(ik, jid, "att")]))
+            i = i + 1
+        }
+        return builder_string(b)
+    }
+    if str_eq(cmd, "QUEUE.STATS") {
+        if len(argv) != 2 {
+            return r_arity("queue.stats")
+        }
+        let ik = ikey(db, argv[1])
+        let sk = qk_ids(ik)
+        let mut n_ready = 0
+        let mut n_delayed = 0
+        let mut n_inflight = 0
+        let mut n_dlq = 0
+        if self.kind(ik) == T_STR and has(self.xp, sk) {
+            self.queue_sweep(ik, wall_ms())
+            let ids = qk_ids_list(self.xp[sk])
+            let mut ji = 0
+            while ji < len(ids) {
+                let st = self.xseq[qk_prop(ik, ids[ji], "st")]
+                if st == 1 {
+                    n_ready = n_ready + 1
+                } else if st == 2 {
+                    n_delayed = n_delayed + 1
+                } else if st == 3 {
+                    n_inflight = n_inflight + 1
+                } else if st == 4 {
+                    n_dlq = n_dlq + 1
+                }
+                ji = ji + 1
+            }
+        }
+        let total = n_ready + n_delayed + n_inflight + n_dlq
+        let b = str_builder()
+        builder_write(b, "*10\r\n")
+        builder_write(b, r_bulk("ready"))
+        builder_write(b, r_int(n_ready))
+        builder_write(b, r_bulk("delayed"))
+        builder_write(b, r_int(n_delayed))
+        builder_write(b, r_bulk("inflight"))
+        builder_write(b, r_int(n_inflight))
+        builder_write(b, r_bulk("dlq"))
+        builder_write(b, r_int(n_dlq))
+        builder_write(b, r_bulk("total"))
+        builder_write(b, r_int(total))
+        return builder_string(b)
+    }
+    return r_err("ERR unknown QUEUE command")
+}
+
+// ============================================================================
+// Native Full-Text & Secondary Indexing (FT.CREATE, FT.SEARCH, FT.INFO,
+// FT.DROPINDEX, FT._LIST)
+// ============================================================================
+
+fn ft_def_key(db: int, idx: string) -> string {
+    return "\u001eFTdef\u001e" + fmt_int_fast(db) + "\u001e" + idx
+}
+
+fn ft_list_key(db: int) -> string {
+    return "\u001eFTlist\u001e" + fmt_int_fast(db)
+}
+
+fn ft_parse_hdr(raw: string) -> (string, []string) {
+    let mut on_type = "HASH"
+    let mut pfxs = make([]string, 0, 2)
+    let lines = str_split(raw, "\n")
+    if len(lines) == 0 {
+        return (on_type, pfxs)
+    }
+    let hparts = str_split(lines[0], "\t")
+    if len(hparts) >= 1 and str_len(hparts[0]) > 0 {
+        on_type = hparts[0]
+    }
+    if len(hparts) >= 2 and str_len(hparts[1]) > 0 {
+        let ps = str_split(hparts[1], ",")
+        let mut pi = 0
+        while pi < len(ps) {
+            if str_len(ps[pi]) > 0 {
+                pfxs = append(pfxs, ps[pi])
+            }
+            pi = pi + 1
+        }
+    }
+    return (on_type, pfxs)
+}
+
+fn ft_parse_schema(raw: string) -> ([]string, []string) {
+    let mut f_names = make([]string, 0, 4)
+    let mut f_types = make([]string, 0, 4)
+    let lines = str_split(raw, "\n")
+    let mut i = 1
+    while i < len(lines) {
+        let ln = lines[i]
+        let tab = str_index(ln, "\t")
+        if tab > 0 {
+            f_names = append(f_names, ln[:tab])
+            f_types = append(f_types, ln[tab + 1:])
+        }
+        i = i + 1
+    }
+    return (f_names, f_types)
+}
+
+fn Store_ft_doc_field(mut self: Store, ik: string, on_type: string, field: string) -> (string, int) {
+    if str_eq(on_type, "JSON") {
+        if self.kind(ik) != T_STR {
+            return ("", 0)
+        }
+        let v, ok = json_get_path(self.strs[ik], json_norm_path(field), 0)
+        if ok == 0 {
+            return ("", 0)
+        }
+        if str_len(v) >= 2 and str_byte_at(v, 0) == 34 and str_byte_at(v, str_len(v) - 1) == 34 {
+            return (v[1:str_len(v) - 1], 1)
+        }
+        return (v, 1)
+    }
+    if self.kind(ik) != T_HASH {
+        return ("", 0)
+    }
+    let h = self.hashes[ik]
+    if not has(h, field) {
+        return ("", 0)
+    }
+    return (h[field], 1)
+}
+
+fn ft_tag_matches(field_val: string, tag_expr: string) -> int {
+    let want_tags = str_split(str_to_lower(tag_expr), "|")
+    let doc_tags = str_split(str_to_lower(field_val), ",")
+    let mut wi = 0
+    while wi < len(want_tags) {
+        let wt = json_trim(want_tags[wi])
+        if str_len(wt) > 0 {
+            let mut di = 0
+            while di < len(doc_tags) {
+                if str_eq(json_trim(doc_tags[di]), wt) {
+                    return 1
+                }
+                di = di + 1
+            }
+        }
+        wi = wi + 1
+    }
+    return 0
+}
+
+fn Store_ft_match_doc(mut self: Store, ik: string, on_type: string, f_names: []string, f_types: []string, query: string) -> (int, float) {
+    let q = json_trim(query)
+    if str_len(q) == 0 or str_eq(q, "*") {
+        return (1, 1.0)
+    }
+    let tokens = str_split(q, " ")
+    let mut score = 0.0
+    let mut ti = 0
+    while ti < len(tokens) {
+        let tok = tokens[ti]
+        if str_len(tok) == 0 {
+            ti = ti + 1
+            continue
+        }
+        if str_has_prefix(tok, "@") {
+            let colon = str_index(tok, ":")
+            if colon > 1 {
+                let fname = tok[1:colon]
+                let mut fexpr = tok[colon + 1:]
+                while str_has_prefix(fexpr, "[") and not str_has_suffix(fexpr, "]") and ti + 1 < len(tokens) {
+                    ti = ti + 1
+                    fexpr = fexpr + " " + tokens[ti]
+                }
+                let fv, fok = self.ft_doc_field(ik, on_type, fname)
+                if fok == 0 {
+                    return (0, 0.0)
+                }
+                if str_has_prefix(fexpr, "{") and str_has_suffix(fexpr, "}") {
+                    let inner = fexpr[1:str_len(fexpr) - 1]
+                    if ft_tag_matches(fv, inner) == 0 {
+                        return (0, 0.0)
+                    }
+                    score = score + 2.0
+                } else if str_has_prefix(fexpr, "[") and str_has_suffix(fexpr, "]") {
+                    let inner = json_trim(fexpr[1:str_len(fexpr) - 1])
+                    let sp = str_index(inner, " ")
+                    if sp <= 0 {
+                        return (0, 0.0)
+                    }
+                    let min_s = json_trim(inner[:sp])
+                    let max_s = json_trim(inner[sp + 1:])
+                    if z_bound_ok(fv, min_s, max_s) == 0 {
+                        return (0, 0.0)
+                    }
+                    score = score + 2.0
+                } else {
+                    if not str_contains(str_to_lower(fv), str_to_lower(fexpr)) {
+                        return (0, 0.0)
+                    }
+                    score = score + 2.0
+                }
+                ti = ti + 1
+                continue
+            }
+        }
+        let ltok = str_to_lower(tok)
+        let mut hit_tok = 0
+        let mut fi = 0
+        while fi < len(f_names) {
+            if str_eq(f_types[fi], "TEXT") or str_eq(f_types[fi], "TAG") {
+                let fv, fok = self.ft_doc_field(ik, on_type, f_names[fi])
+                if fok == 1 and str_contains(str_to_lower(fv), ltok) {
+                    hit_tok = 1
+                    score = score + 1.0
+                }
+            }
+            fi = fi + 1
+        }
+        if hit_tok == 0 {
+            return (0, 0.0)
+        }
+        ti = ti + 1
+    }
+    return (1, score)
+}
+
+fn Store_cmd_ft(mut self: Store, db: int, argv: []string) -> string {
+    let cmd = cmd_name(argv)
+    if str_eq(cmd, "FT._LIST") {
+        let lk = ft_list_key(db)
+        let mut raw = ""
+        if has(self.xp, lk) {
+            raw = self.xp[lk]
+        }
+        let mut out = make([]string, 0, 4)
+        if str_len(raw) > 0 {
+            let parts = str_split(raw, ",")
+            let mut i = 0
+            while i < len(parts) {
+                if str_len(parts[i]) > 0 {
+                    out = append(out, parts[i])
+                }
+                i = i + 1
+            }
+        }
+        return r_array_bulks(out)
+    }
+    if str_eq(cmd, "FT.CREATE") {
+        if len(argv) < 4 {
+            return r_arity("ft.create")
+        }
+        let idx = argv[1]
+        let dk = ft_def_key(db, idx)
+        if has(self.xp, dk) and str_len(self.xp[dk]) > 0 {
+            return r_err("Index already exists")
+        }
+        let mut on_type = "HASH"
+        let mut pfxs = make([]string, 0, 2)
+        let mut f_names = make([]string, 0, 4)
+        let mut f_types = make([]string, 0, 4)
+        let mut i = 2
+        let mut in_schema = 0
+        while i < len(argv) {
+            let u = str_to_upper(argv[i])
+            if in_schema == 0 {
+                if str_eq(u, "ON") and i + 1 < len(argv) {
+                    on_type = str_to_upper(argv[i + 1])
+                    i = i + 2
+                } else if str_eq(u, "PREFIX") and i + 1 < len(argv) {
+                    let np, ok = int_ok(argv[i + 1])
+                    if ok == 0 or np < 0 or i + 2 + np > len(argv) {
+                        return r_syntax()
+                    }
+                    let mut pi = 0
+                    while pi < np {
+                        pfxs = append(pfxs, argv[i + 2 + pi])
+                        pi = pi + 1
+                    }
+                    i = i + 2 + np
+                } else if str_eq(u, "SCHEMA") {
+                    in_schema = 1
+                    i = i + 1
+                } else {
+                    i = i + 1
+                }
+            } else {
+                let mut fname = argv[i]
+                i = i + 1
+                if i + 1 < len(argv) and str_eq(str_to_upper(argv[i]), "AS") {
+                    fname = argv[i + 1]
+                    i = i + 2
+                }
+                if i >= len(argv) {
+                    return r_syntax()
+                }
+                let ftype = str_to_upper(argv[i])
+                i = i + 1
+                while i < len(argv) {
+                    let opt = str_to_upper(argv[i])
+                    if str_eq(opt, "SORTABLE") or str_eq(opt, "NOINDEX") or str_eq(opt, "NOSTEM") {
+                        i = i + 1
+                    } else if str_eq(opt, "WEIGHT") and i + 1 < len(argv) {
+                        i = i + 2
+                    } else if str_eq(opt, "SEPARATOR") and i + 1 < len(argv) {
+                        i = i + 2
+                    } else {
+                        break
+                    }
+                }
+                f_names = append(f_names, fname)
+                f_types = append(f_types, ftype)
+            }
+        }
+        let b = str_builder()
+        builder_write(b, on_type)
+        builder_write(b, "\t")
+        let mut pi = 0
+        while pi < len(pfxs) {
+            if pi > 0 {
+                builder_write(b, ",")
+            }
+            builder_write(b, pfxs[pi])
+            pi = pi + 1
+        }
+        builder_write(b, "\n")
+        let mut fi = 0
+        while fi < len(f_names) {
+            builder_write(b, f_names[fi])
+            builder_write(b, "\t")
+            builder_write(b, f_types[fi])
+            builder_write(b, "\n")
+            fi = fi + 1
+        }
+        self.xp[dk] = builder_string(b)
+        let lk = ft_list_key(db)
+        let mut cur_l = ""
+        if has(self.xp, lk) {
+            cur_l = self.xp[lk]
+        }
+        self.xp[lk] = csv_add(cur_l, idx)
+        return r_ok()
+    }
+    if str_eq(cmd, "FT.DROPINDEX") {
+        if len(argv) < 2 {
+            return r_arity("ft.dropindex")
+        }
+        let idx = argv[1]
+        let dk = ft_def_key(db, idx)
+        if not has(self.xp, dk) or str_len(self.xp[dk]) == 0 {
+            return r_err("Unknown Index name")
+        }
+        let on_type, pfxs = ft_parse_hdr(self.xp[dk])
+        let mut dd = 0
+        if len(argv) >= 3 and str_eq(str_to_upper(argv[2]), "DD") {
+            dd = 1
+        }
+        delete(self.xp, dk)
+        let lk = ft_list_key(db)
+        if has(self.xp, lk) {
+            self.xp[lk] = csv_del(self.xp[lk], idx)
+        }
+        if dd == 1 {
+            let all_k = self.collect_keys(db, "*")
+            let mut ki = 0
+            while ki < len(all_k) {
+                let k = all_k[ki]
+                let mut p_ok = if len(pfxs) == 0 { 1 } else { 0 }
+                let mut pi = 0
+                while pi < len(pfxs) {
+                    if str_has_prefix(k, pfxs[pi]) {
+                        p_ok = 1
+                        break
+                    }
+                    pi = pi + 1
+                }
+                if p_ok == 1 {
+                    let ik = ikey(db, k)
+                    if (str_eq(on_type, "HASH") and self.kind(ik) == T_HASH) or (str_eq(on_type, "JSON") and self.kind(ik) == T_STR) {
+                        let _ = self.drop_key(ik)
+                    }
+                }
+                ki = ki + 1
+            }
+        }
+        return r_ok()
+    }
+    if str_eq(cmd, "FT.INFO") {
+        if len(argv) != 2 {
+            return r_arity("ft.info")
+        }
+        let idx = argv[1]
+        let dk = ft_def_key(db, idx)
+        if not has(self.xp, dk) or str_len(self.xp[dk]) == 0 {
+            return r_err("Unknown Index name")
+        }
+        let on_type, pfxs = ft_parse_hdr(self.xp[dk])
+        let f_names, f_types = ft_parse_schema(self.xp[dk])
+        let b = str_builder()
+        builder_write(b, "*8\r\n")
+        builder_write(b, r_bulk("index_name"))
+        builder_write(b, r_bulk(idx))
+        builder_write(b, r_bulk("on_type"))
+        builder_write(b, r_bulk(on_type))
+        builder_write(b, r_bulk("prefixes"))
+        builder_write(b, r_array_bulks(pfxs))
+        builder_write(b, r_bulk("attributes"))
+        let mut attrs = make([]string, 0, len(f_names) * 2)
+        let mut fi = 0
+        while fi < len(f_names) {
+            attrs = append(attrs, f_names[fi])
+            attrs = append(attrs, f_types[fi])
+            fi = fi + 1
+        }
+        builder_write(b, r_array_bulks(attrs))
+        return builder_string(b)
+    }
+    if str_eq(cmd, "FT.SEARCH") {
+        if len(argv) < 3 {
+            return r_arity("ft.search")
+        }
+        let idx = argv[1]
+        let query = argv[2]
+        let dk = ft_def_key(db, idx)
+        if not has(self.xp, dk) or str_len(self.xp[dk]) == 0 {
+            return r_err("Unknown Index name")
+        }
+        let on_type, pfxs = ft_parse_hdr(self.xp[dk])
+        let f_names, f_types = ft_parse_schema(self.xp[dk])
+        let mut nocontent = 0
+        let mut lim_off = 0
+        let mut lim_num = 10
+        let mut sort_field = ""
+        let mut sort_desc = 0
+        let mut filt_field = ""
+        let mut filt_min = ""
+        let mut filt_max = ""
+        let mut ret_fields = make([]string, 0, 4)
+        let mut i = 3
+        while i < len(argv) {
+            let u = str_to_upper(argv[i])
+            if str_eq(u, "NOCONTENT") {
+                nocontent = 1
+                i = i + 1
+            } else if str_eq(u, "LIMIT") and i + 2 < len(argv) {
+                lim_off = int_of(argv[i + 1])
+                lim_num = int_of(argv[i + 2])
+                i = i + 3
+            } else if str_eq(u, "SORTBY") and i + 1 < len(argv) {
+                sort_field = argv[i + 1]
+                i = i + 2
+                if i < len(argv) {
+                    let dir = str_to_upper(argv[i])
+                    if str_eq(dir, "DESC") {
+                        sort_desc = 1
+                        i = i + 1
+                    } else if str_eq(dir, "ASC") {
+                        sort_desc = 0
+                        i = i + 1
+                    }
+                }
+            } else if str_eq(u, "FILTER") and i + 3 < len(argv) {
+                filt_field = argv[i + 1]
+                filt_min = argv[i + 2]
+                filt_max = argv[i + 3]
+                i = i + 4
+            } else if str_eq(u, "RETURN") and i + 1 < len(argv) {
+                let nr = int_of(argv[i + 1])
+                let mut ri = 0
+                while ri < nr and i + 2 + ri < len(argv) {
+                    ret_fields = append(ret_fields, argv[i + 2 + ri])
+                    ri = ri + 1
+                }
+                i = i + 2 + nr
+            } else {
+                i = i + 1
+            }
+        }
+        let all_k = self.collect_keys(db, "*")
+        let mut hit_keys = make([]string, 0, 8)
+        let mut hit_sort = make([]string, 0, 8)
+        let mut ki = 0
+        while ki < len(all_k) {
+            let k = all_k[ki]
+            let mut p_ok = if len(pfxs) == 0 { 1 } else { 0 }
+            let mut pi = 0
+            while pi < len(pfxs) {
+                if str_has_prefix(k, pfxs[pi]) {
+                    p_ok = 1
+                    break
+                }
+                pi = pi + 1
+            }
+            if p_ok == 1 {
+                let ik = ikey(db, k)
+                let t = self.kind(ik)
+                if (str_eq(on_type, "HASH") and t == T_HASH) or (str_eq(on_type, "JSON") and t == T_STR) {
+                    let m_ok, sc = self.ft_match_doc(ik, on_type, f_names, f_types, query)
+                    let mut f_ok = m_ok
+                    if f_ok == 1 and str_len(filt_field) > 0 {
+                        let fv, fok = self.ft_doc_field(ik, on_type, filt_field)
+                        if fok == 0 or z_bound_ok(fv, filt_min, filt_max) == 0 {
+                            f_ok = 0
+                        }
+                    }
+                    if f_ok == 1 {
+                        hit_keys = append(hit_keys, k)
+                        if str_len(sort_field) > 0 {
+                            let sv, _ = self.ft_doc_field(ik, on_type, sort_field)
+                            hit_sort = append(hit_sort, sv)
+                        } else {
+                            hit_sort = append(hit_sort, format_float(sc, 4))
+                        }
+                    }
+                }
+            }
+            ki = ki + 1
+        }
+        // Sort hit_keys
+        let nh = len(hit_keys)
+        let mut p = 0
+        while p < nh {
+            let mut j = 0
+            while j < nh - 1 {
+                let mut sw = 0
+                if str_len(sort_field) > 0 {
+                    let fa = parse_float(hit_sort[j])
+                    let fb = parse_float(hit_sort[j + 1])
+                    if finite_score(hit_sort[j]) == 1 and finite_score(hit_sort[j + 1]) == 1 {
+                        if (sort_desc == 0 and fa > fb) or (sort_desc == 1 and fa < fb) {
+                            sw = 1
+                        }
+                    } else {
+                        if (sort_desc == 0 and str_lt(hit_sort[j + 1], hit_sort[j]) == 1) or (sort_desc == 1 and str_lt(hit_sort[j], hit_sort[j + 1]) == 1) {
+                            sw = 1
+                        }
+                    }
+                } else {
+                    if str_lt(hit_keys[j + 1], hit_keys[j]) == 1 {
+                        sw = 1
+                    }
+                }
+                if sw == 1 {
+                    let tk = hit_keys[j]
+                    hit_keys[j] = hit_keys[j + 1]
+                    hit_keys[j + 1] = tk
+                    let ts = hit_sort[j]
+                    hit_sort[j] = hit_sort[j + 1]
+                    hit_sort[j + 1] = ts
+                }
+                j = j + 1
+            }
+            p = p + 1
+        }
+        let page_k = slice_skip_take(hit_keys, lim_off, lim_num)
+        let b = str_builder()
+        builder_write(b, "*")
+        if nocontent == 1 {
+            builder_write(b, fmt_int_fast(1 + len(page_k)))
+        } else {
+            builder_write(b, fmt_int_fast(1 + len(page_k) * 2))
+        }
+        builder_write(b, "\r\n")
+        builder_write(b, r_int(nh))
+        let mut pi = 0
+        while pi < len(page_k) {
+            let k = page_k[pi]
+            builder_write(b, r_bulk(k))
+            if nocontent == 0 {
+                let ik = ikey(db, k)
+                let mut kv = make([]string, 0, 8)
+                if len(ret_fields) > 0 {
+                    let mut ri = 0
+                    while ri < len(ret_fields) {
+                        let fv, fok = self.ft_doc_field(ik, on_type, ret_fields[ri])
+                        if fok == 1 {
+                            kv = append(kv, ret_fields[ri])
+                            kv = append(kv, fv)
+                        }
+                        ri = ri + 1
+                    }
+                } else if str_eq(on_type, "JSON") {
+                    kv = append(kv, "$")
+                    kv = append(kv, self.strs[ik])
+                } else {
+                    let h = self.hashes[ik]
+                    let mut hks = make([]string, 0, len(h))
+                    for f, _ in range h {
+                        hks = append(hks, f)
+                    }
+                    hks = sort_strings(hks)
+                    let mut hi = 0
+                    while hi < len(hks) {
+                        let f = hks[hi]
+                        kv = append(kv, f)
+                        kv = append(kv, h[f])
+                        hi = hi + 1
+                    }
+                }
+                builder_write(b, r_array_bulks(kv))
+            }
+            pi = pi + 1
+        }
+        return builder_string(b)
+    }
+    return r_err("ERR unknown FT command")
 }

@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- [Mako](https://github.com/loreste/mako) 0.5.7 or later
+- [Mako](https://github.com/loreste/mako) 0.7.0 or later
 - Linux (x86_64, arm64) or macOS (Apple Silicon, Intel)
 - Windows is not supported (the server uses Unix syscalls for sockets and signals)
 

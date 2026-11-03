@@ -259,7 +259,43 @@ fn cluster_key_cmd(cmd: string) -> int {
     if str_eq(cmd, "HEXISTS") or str_eq(cmd, "HKEYS") or str_eq(cmd, "HVALS") or str_eq(cmd, "HLEN") or str_eq(cmd, "HINCRBY") or str_eq(cmd, "HMSET") {
         return 1
     }
-    if str_eq(cmd, "LPUSH") or str_eq(cmd, "RPUSH") or str_eq(cmd, "LPOP") or str_eq(cmd, "RPOP") or str_eq(cmd, "BLPOP") or str_eq(cmd, "BRPOP") {
+    if str_eq(cmd, "HEXPIRE") or str_eq(cmd, "HPEXPIRE") or str_eq(cmd, "HEXPIREAT") or str_eq(cmd, "HPEXPIREAT") or str_eq(cmd, "HEXPIRETIME") or str_eq(cmd, "HPEXPIRETIME") or str_eq(cmd, "HTTL") or str_eq(cmd, "HPTTL") or str_eq(cmd, "HPERSIST") or str_eq(cmd, "HSETEX") or str_eq(cmd, "HGETEX") {
+        return 1
+    }
+    if str_eq(cmd, "SEXPIRE") or str_eq(cmd, "SPEXPIRE") or str_eq(cmd, "SEXPIREAT") or str_eq(cmd, "SPEXPIREAT") or str_eq(cmd, "STTL") or str_eq(cmd, "SPTTL") or str_eq(cmd, "SPERSIST") {
+        return 1
+    }
+    if str_eq(cmd, "ZEXPIRE") or str_eq(cmd, "ZPEXPIRE") or str_eq(cmd, "ZEXPIREAT") or str_eq(cmd, "ZPEXPIREAT") or str_eq(cmd, "ZTTL") or str_eq(cmd, "ZPTTL") or str_eq(cmd, "ZPERSIST") {
+        return 1
+    }
+    if str_eq(cmd, "CAS") or str_eq(cmd, "CAD") or str_eq(cmd, "DELEX") or str_eq(cmd, "RATELIMIT") or str_eq(cmd, "CL.THROTTLE") or str_eq(cmd, "LCS") or str_eq(cmd, "SUBSTR") or str_eq(cmd, "LOCK") {
+        return 1
+    }
+    if str_eq(cmd, "BF.RESERVE") or str_eq(cmd, "BF.ADD") or str_eq(cmd, "BF.MADD") or str_eq(cmd, "BF.EXISTS") or str_eq(cmd, "BF.MEXISTS") or str_eq(cmd, "BF.CARD") or str_eq(cmd, "BF.INFO") {
+        return 1
+    }
+    if str_eq(cmd, "CF.RESERVE") or str_eq(cmd, "CF.ADD") or str_eq(cmd, "CF.ADDNX") or str_eq(cmd, "CF.EXISTS") or str_eq(cmd, "CF.MEXISTS") or str_eq(cmd, "CF.DEL") or str_eq(cmd, "CF.COUNT") or str_eq(cmd, "CF.INFO") {
+        return 1
+    }
+    if str_eq(cmd, "CMS.INITBYDIM") or str_eq(cmd, "CMS.INITBYPROB") or str_eq(cmd, "CMS.INCRBY") or str_eq(cmd, "CMS.QUERY") or str_eq(cmd, "CMS.INFO") {
+        return 1
+    }
+    if str_eq(cmd, "TOPK.RESERVE") or str_eq(cmd, "TOPK.ADD") or str_eq(cmd, "TOPK.INCRBY") or str_eq(cmd, "TOPK.QUERY") or str_eq(cmd, "TOPK.COUNT") or str_eq(cmd, "TOPK.LIST") or str_eq(cmd, "TOPK.INFO") {
+        return 1
+    }
+    if str_eq(cmd, "QUEUE.PUSH") or str_eq(cmd, "QUEUE.POP") or str_eq(cmd, "QUEUE.ACK") or str_eq(cmd, "QUEUE.NACK") or str_eq(cmd, "QUEUE.DLQ") or str_eq(cmd, "QUEUE.STATS") {
+        return 1
+    }
+    if str_eq(cmd, "JSON.SET") or str_eq(cmd, "JSON.GET") or str_eq(cmd, "JSON.MGET") or str_eq(cmd, "JSON.DEL") or str_eq(cmd, "JSON.FORGET") or str_eq(cmd, "JSON.TYPE") or str_eq(cmd, "JSON.NUMINCRBY") or str_eq(cmd, "JSON.STRAPPEND") or str_eq(cmd, "JSON.STRLEN") or str_eq(cmd, "JSON.ARRAPPEND") or str_eq(cmd, "JSON.ARRLEN") or str_eq(cmd, "JSON.OBJKEYS") or str_eq(cmd, "JSON.OBJLEN") {
+        return 1
+    }
+    if str_eq(cmd, "TS.CREATE") or str_eq(cmd, "TS.ADD") or str_eq(cmd, "TS.MADD") or str_eq(cmd, "TS.INCRBY") or str_eq(cmd, "TS.DECRBY") or str_eq(cmd, "TS.GET") or str_eq(cmd, "TS.RANGE") or str_eq(cmd, "TS.REVRANGE") or str_eq(cmd, "TS.INFO") {
+        return 1
+    }
+    if str_eq(cmd, "ZRANGESTORE") or str_eq(cmd, "ZRANGEBYLEX") or str_eq(cmd, "ZREVRANGEBYLEX") or str_eq(cmd, "ZLEXCOUNT") or str_eq(cmd, "ZREMRANGEBYLEX") or str_eq(cmd, "ZINTERCARD") or str_eq(cmd, "SORT_RO") {
+        return 1
+    }
+    if str_eq(cmd, "LPUSH") or str_eq(cmd, "RPUSH") or str_eq(cmd, "LPOP") or str_eq(cmd, "RPOP") or str_eq(cmd, "BLPOP") or str_eq(cmd, "BRPOP") or str_eq(cmd, "BLMOVE") or str_eq(cmd, "BRPOPLPUSH") or str_eq(cmd, "BLMPOP") or str_eq(cmd, "BZMPOP") {
         return 1
     }
     if str_eq(cmd, "LRANGE") or str_eq(cmd, "LLEN") or str_eq(cmd, "LINDEX") or str_eq(cmd, "LSET") or str_eq(cmd, "LTRIM") {
@@ -313,10 +349,10 @@ fn cluster_key_cmd(cmd: string) -> int {
     if str_eq(cmd, "HGETDEL") or str_eq(cmd, "LMPOP") or str_eq(cmd, "ZMPOP") or str_eq(cmd, "BITFIELD") {
         return 1
     }
-    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") {
+    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") or str_eq(cmd, "EVAL_RO") or str_eq(cmd, "EVALSHA_RO") {
         return 1
     }
-    if str_eq(cmd, "VADD") or str_eq(cmd, "VSIM") or str_eq(cmd, "VREM") or str_eq(cmd, "VCARD") or str_eq(cmd, "VDIM") or str_eq(cmd, "VATTR") or str_eq(cmd, "VGETATTR") or str_eq(cmd, "BRAIN") {
+    if str_eq(cmd, "VADD") or str_eq(cmd, "VSIM") or str_eq(cmd, "VSEARCH") or str_eq(cmd, "VREM") or str_eq(cmd, "VCARD") or str_eq(cmd, "VDIM") or str_eq(cmd, "VATTR") or str_eq(cmd, "VGETATTR") or str_eq(cmd, "BRAIN") {
         return 1
     }
     if str_eq(cmd, "RELATE") or str_eq(cmd, "UNRELATE") or str_eq(cmd, "NEIGHBORS") or str_eq(cmd, "PATH") or str_eq(cmd, "FACT") or str_eq(cmd, "WHY") or str_eq(cmd, "LEASE") or str_eq(cmd, "UNLEASE") or str_eq(cmd, "LEASED") {
@@ -330,7 +366,7 @@ fn cluster_key_cmd(cmd: string) -> int {
 
 fn cluster_key_slot_of(argv: []string) -> (int, int) {
     let cmd = cmd_name(argv)
-    if str_eq(cmd, "COPY") or str_eq(cmd, "RELATE") or str_eq(cmd, "UNRELATE") or str_eq(cmd, "PATH") or str_eq(cmd, "TURN") {
+    if str_eq(cmd, "COPY") or str_eq(cmd, "RELATE") or str_eq(cmd, "UNRELATE") or str_eq(cmd, "PATH") or str_eq(cmd, "TURN") or str_eq(cmd, "ZRANGESTORE") or str_eq(cmd, "LCS") {
         if len(argv) < 3 {
             return (0, 0)
         }
@@ -438,7 +474,7 @@ fn cluster_key_slot_of(argv: []string) -> (int, int) {
         }
         return (slot, 1)
     }
-    if str_eq(cmd, "LMOVE") or str_eq(cmd, "SMOVE") {
+    if str_eq(cmd, "LMOVE") or str_eq(cmd, "SMOVE") or str_eq(cmd, "BLMOVE") or str_eq(cmd, "BRPOPLPUSH") {
         if len(argv) < 3 {
             return (0, 0)
         }
@@ -458,7 +494,7 @@ fn cluster_key_slot_of(argv: []string) -> (int, int) {
         }
         return (slot, 1)
     }
-    if str_eq(cmd, "BRAIN") {
+    if str_eq(cmd, "BRAIN") or str_eq(cmd, "LOCK") {
         if len(argv) < 3 {
             return (0, 0)
         }
@@ -480,7 +516,7 @@ fn cluster_key_slot_of(argv: []string) -> (int, int) {
         }
         return (0, 0)
     }
-    if str_eq(cmd, "LMPOP") or str_eq(cmd, "ZMPOP") or str_eq(cmd, "SINTERCARD") or str_eq(cmd, "ZUNION") or str_eq(cmd, "ZINTER") or str_eq(cmd, "ZDIFF") {
+    if str_eq(cmd, "LMPOP") or str_eq(cmd, "ZMPOP") or str_eq(cmd, "SINTERCARD") or str_eq(cmd, "ZINTERCARD") or str_eq(cmd, "ZUNION") or str_eq(cmd, "ZINTER") or str_eq(cmd, "ZDIFF") {
         if len(argv) < 3 {
             return (0, 0)
         }
@@ -495,6 +531,52 @@ fn cluster_key_slot_of(argv: []string) -> (int, int) {
                 return (slot, 0 - 1)
             }
             j = j + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "BLMPOP") or str_eq(cmd, "BZMPOP") {
+        if len(argv) < 4 {
+            return (0, 0)
+        }
+        let nk = int_of(argv[2])
+        if nk < 1 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[3])
+        let mut j = 1
+        while j < nk and 3 + j < len(argv) {
+            if key_slot(argv[3 + j]) != slot {
+                return (slot, 0 - 1)
+            }
+            j = j + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "JSON.MGET") {
+        if len(argv) < 3 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        let mut j = 2
+        while j < len(argv) - 1 {
+            if key_slot(argv[j]) != slot {
+                return (slot, 0 - 1)
+            }
+            j = j + 1
+        }
+        return (slot, 1)
+    }
+    if str_eq(cmd, "TS.MADD") {
+        if len(argv) < 4 {
+            return (0, 0)
+        }
+        let slot = key_slot(argv[1])
+        let mut j = 4
+        while j < len(argv) {
+            if key_slot(argv[j]) != slot {
+                return (slot, 0 - 1)
+            }
+            j = j + 3
         }
         return (slot, 1)
     }
@@ -513,7 +595,7 @@ fn cluster_key_slot_of(argv: []string) -> (int, int) {
         }
         return (slot, 1)
     }
-    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") {
+    if str_eq(cmd, "EVAL") or str_eq(cmd, "EVALSHA") or str_eq(cmd, "EVAL_RO") or str_eq(cmd, "EVALSHA_RO") {
         if len(argv) < 3 {
             return (0, 0)
         }

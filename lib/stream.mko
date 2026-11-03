@@ -1,56 +1,5 @@
 pack bonodis
 
-fn Store_cmd_xadd(mut self: Store, db: int, argv: []string) -> string {
-    if len(argv) < 5 or (len(argv) % 2) == 0 {
-        return r_arity("xadd")
-    }
-    let ik = ikey(db, argv[1])
-    let t = self.kind(ik)
-    if t != T_NONE and t != T_STREAM {
-        return r_wrongtype()
-    }
-    if t == T_NONE {
-        self.streams[ik] = make([]string, 0, 4)
-        self.types[ik] = T_STREAM
-        self.xseq[ik] = 0
-    }
-    let mut seq = 0
-    if has(self.xseq, ik) {
-        seq = self.xseq[ik]
-    }
-    seq = seq + 1
-    self.xseq[ik] = seq
-    let mut id = format_int(wall_ms()) + "-" + format_int(seq)
-    if not str_eq(argv[2], "*") {
-        id = argv[2]
-    }
-    let mut rec = id
-    let mut i = 3
-    while i + 1 < len(argv) {
-        rec = rec + "\u001f" + argv[i] + "\u001f" + argv[i + 1]
-        i = i + 2
-    }
-    let mut xs = self.streams[ik]
-    xs = append(xs, rec)
-    self.streams[ik] = xs
-    return r_bulk(id)
-}
-
-fn Store_cmd_xlen(mut self: Store, db: int, argv: []string) -> string {
-    if len(argv) != 2 {
-        return r_arity("xlen")
-    }
-    let ik = ikey(db, argv[1])
-    let t = self.kind(ik)
-    if t == T_NONE {
-        return r_int(0)
-    }
-    if t != T_STREAM {
-        return r_wrongtype()
-    }
-    return r_int(len(self.streams[ik]))
-}
-
 fn xrange_cmp(a: string, b: string) -> int {
     // returns -1, 0, 1
     let da = str_index(a, "-")
@@ -82,6 +31,107 @@ fn xrange_cmp(a: string, b: string) -> int {
     return 0
 }
 
+fn Store_cmd_xadd(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) < 5 {
+        return r_arity("xadd")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t != T_NONE and t != T_STREAM {
+        return r_wrongtype()
+    }
+    let mut idx = 2
+    let mut maxlen = -1
+    if str_eq(str_to_upper(argv[2]), "MAXLEN") {
+        idx = 3
+        if idx < len(argv) and (str_eq(argv[idx], "~") or str_eq(argv[idx], "=")) {
+            idx = idx + 1
+        }
+        if idx >= len(argv) {
+            return r_syntax()
+        }
+        let ml, ok = int_ok(argv[idx])
+        if ok == 0 or ml < 0 {
+            return r_notint()
+        }
+        maxlen = ml
+        idx = idx + 1
+    }
+    let rem = len(argv) - (idx + 1)
+    if idx >= len(argv) or rem < 2 or (rem % 2) != 0 {
+        return r_arity("xadd")
+    }
+    let raw_id = argv[idx]
+    if not str_eq(raw_id, "*") {
+        if str_eq(raw_id, "0-0") or str_eq(raw_id, "0") {
+            return r_err("ERR The ID specified in XADD must be greater than 0-0")
+        }
+        if t == T_STREAM {
+            let cur_xs = self.streams[ik]
+            if len(cur_xs) > 0 {
+                let last_rec = cur_xs[len(cur_xs) - 1]
+                let lsep = str_index(last_rec, "\u001f")
+                let mut last_id = last_rec
+                if lsep > 0 {
+                    last_id = last_rec[:lsep]
+                }
+                if xrange_cmp(raw_id, last_id) <= 0 {
+                    return r_err("ERR The ID specified in XADD is equal or smaller than the target stream top item")
+                }
+            }
+        }
+    }
+    if t == T_NONE {
+        self.streams[ik] = make([]string, 0, 4)
+        self.types[ik] = T_STREAM
+        self.xseq[ik] = 0
+    }
+    let mut seq = 0
+    if has(self.xseq, ik) {
+        seq = self.xseq[ik]
+    }
+    seq = seq + 1
+    self.xseq[ik] = seq
+    let mut id = format_int(wall_ms()) + "-" + format_int(seq)
+    if not str_eq(raw_id, "*") {
+        id = "" + raw_id
+    }
+    let rb = str_builder()
+    builder_write(rb, id)
+    let mut i = idx + 1
+    while i + 1 < len(argv) {
+        builder_write(rb, "\u001f")
+        builder_write(rb, argv[i])
+        builder_write(rb, "\u001f")
+        builder_write(rb, argv[i + 1])
+        i = i + 2
+    }
+    let rec = builder_string(rb)
+    let mut xs = self.streams[ik]
+    xs = append(xs, rec)
+    if maxlen >= 0 and len(xs) > maxlen {
+        let dropn = len(xs) - maxlen
+        xs = slice_skip_take(xs, dropn, maxlen)
+    }
+    self.streams[ik] = xs
+    return r_bulk(id)
+}
+
+fn Store_cmd_xlen(mut self: Store, db: int, argv: []string) -> string {
+    if len(argv) != 2 {
+        return r_arity("xlen")
+    }
+    let ik = ikey(db, argv[1])
+    let t = self.kind(ik)
+    if t == T_NONE {
+        return r_int(0)
+    }
+    if t != T_STREAM {
+        return r_wrongtype()
+    }
+    return r_int(len(self.streams[ik]))
+}
+
 fn xrange_match(rec: string, start: string, endid: string) -> int {
     let sep = str_index(rec, "\u001f")
     let mut id = rec
@@ -92,13 +142,29 @@ fn xrange_match(rec: string, start: string, endid: string) -> int {
         return 0
     }
     if not str_eq(start, "-") {
-        if xrange_cmp(id, start) < 0 {
-            return 0
+        if str_has_prefix(start, "(") {
+            if xrange_cmp(id, start[1:]) <= 0 {
+                return 0
+            }
+        } else {
+            if xrange_cmp(id, start) < 0 {
+                return 0
+            }
         }
     }
     if not str_eq(endid, "+") {
-        if xrange_cmp(id, endid) > 0 {
-            return 0
+        if str_has_prefix(endid, "(") {
+            if xrange_cmp(id, endid[1:]) >= 0 {
+                return 0
+            }
+        } else {
+            let mut eff_end = endid
+            if str_index(eff_end, "-") < 0 {
+                eff_end = eff_end + "-9223372036854775807"
+            }
+            if xrange_cmp(id, eff_end) > 0 {
+                return 0
+            }
         }
     }
     return 1
@@ -108,9 +174,20 @@ fn Store_cmd_xrange(mut self: Store, db: int, argv: []string) -> string {
     if len(argv) < 4 {
         return r_arity("xrange")
     }
+    let mut limit = -1
+    if len(argv) >= 6 and str_eq(str_to_upper(argv[4]), "COUNT") {
+        let c, ok = int_ok(argv[5])
+        if ok == 0 {
+            return r_notint()
+        }
+        limit = c
+        if limit < 0 {
+            limit = 0
+        }
+    }
     let ik = ikey(db, argv[1])
     let t = self.kind(ik)
-    if t == T_NONE {
+    if t == T_NONE or limit == 0 {
         let none: []string = []
         return r_array_bulks(none)
     }
@@ -126,6 +203,9 @@ fn Store_cmd_xrange(mut self: Store, db: int, argv: []string) -> string {
     while i < len(xs) {
         if xrange_match(xs[i], start, endid) == 1 {
             cnt = cnt + 1
+            if limit > 0 and cnt >= limit {
+                break
+            }
         }
         i = i + 1
     }
@@ -133,8 +213,9 @@ fn Store_cmd_xrange(mut self: Store, db: int, argv: []string) -> string {
     builder_write(b, "*")
     builder_write(b, format_int(cnt))
     builder_write(b, "\r\n")
+    let mut emitted = 0
     i = 0
-    while i < len(xs) {
+    while i < len(xs) and emitted < cnt {
         if xrange_match(xs[i], start, endid) == 1 {
             let parts = str_split(xs[i], "\u001f")
             builder_write(b, "*2\r\n")
@@ -146,6 +227,7 @@ fn Store_cmd_xrange(mut self: Store, db: int, argv: []string) -> string {
                 j = j + 1
             }
             builder_write(b, r_array_bulks(rest))
+            emitted = emitted + 1
         }
         i = i + 1
     }
@@ -153,20 +235,80 @@ fn Store_cmd_xrange(mut self: Store, db: int, argv: []string) -> string {
 }
 
 fn Store_cmd_xread(mut self: Store, db: int, argv: []string) -> string {
-    // XREAD STREAMS key id
+    // XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]
+    let mut count = -1
     let mut ki = -1
     let mut i = 1
     while i < len(argv) {
-        if str_eq(str_to_upper(argv[i]), "STREAMS") {
+        let o = str_to_upper(argv[i])
+        if str_eq(o, "COUNT") and i + 1 < len(argv) {
+            let n, ok = int_ok(argv[i + 1])
+            if ok == 0 or n < 0 {
+                return r_notint()
+            }
+            count = n
+            i = i + 2
+        } else if str_eq(o, "BLOCK") and i + 1 < len(argv) {
+            let _, ok = int_ok(argv[i + 1])
+            if ok == 0 {
+                return r_notint()
+            }
+            i = i + 2
+        } else if str_eq(o, "STREAMS") {
             ki = i + 1
             break
+        } else {
+            return r_syntax()
         }
-        i = i + 1
     }
     if ki < 0 or ki >= len(argv) {
         return r_syntax()
     }
-    return self.cmd_xrange(db, ["XRANGE", argv[ki], "-", "+"])
+    let rem = len(argv) - ki
+    if rem < 2 or (rem % 2) != 0 {
+        return r_err("ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.")
+    }
+    let nstreams = rem / 2
+    let mut nmatched = 0
+    let body = str_builder()
+    let mut si = 0
+    while si < nstreams {
+        let key = argv[ki + si]
+        let sid = argv[ki + nstreams + si]
+        let ik = ikey(db, key)
+        let t = self.kind(ik)
+        if t != T_NONE and t != T_STREAM {
+            return r_wrongtype()
+        }
+        if t == T_STREAM and not str_eq(sid, "$") and count != 0 {
+            let mut xargv = make([]string, 0, 6)
+            xargv = append(xargv, "XRANGE")
+            xargv = append(xargv, key)
+            xargv = append(xargv, "(" + sid)
+            xargv = append(xargv, "+")
+            if count > 0 {
+                xargv = append(xargv, "COUNT")
+                xargv = append(xargv, format_int(count))
+            }
+            let xr = self.cmd_xrange(db, xargv)
+            if not str_eq(xr, "*0\r\n") {
+                builder_write(body, "*2\r\n")
+                builder_write(body, r_bulk(key))
+                builder_write(body, xr)
+                nmatched = nmatched + 1
+            }
+        }
+        si = si + 1
+    }
+    if nmatched == 0 {
+        return r_nil()
+    }
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(nmatched))
+    builder_write(b, "\r\n")
+    builder_write(b, builder_string(body))
+    return builder_string(b)
 }
 
 fn Store_cmd_xdel(mut self: Store, db: int, argv: []string) -> string {
@@ -215,9 +357,20 @@ fn Store_cmd_xrevrange(mut self: Store, db: int, argv: []string) -> string {
     if len(argv) < 4 {
         return r_arity("xrevrange")
     }
+    let mut limit = -1
+    if len(argv) >= 6 and str_eq(str_to_upper(argv[4]), "COUNT") {
+        let c, ok = int_ok(argv[5])
+        if ok == 0 {
+            return r_notint()
+        }
+        limit = c
+        if limit < 0 {
+            limit = 0
+        }
+    }
     let ik = ikey(db, argv[1])
     let t = self.kind(ik)
-    if t == T_NONE {
+    if t == T_NONE or limit == 0 {
         let none: []string = []
         return r_array_bulks(none)
     }
@@ -225,23 +378,40 @@ fn Store_cmd_xrevrange(mut self: Store, db: int, argv: []string) -> string {
         return r_wrongtype()
     }
     let xs = self.streams[ik]
-    let b = str_builder()
-    builder_write(b, "*")
-    builder_write(b, format_int(len(xs)))
-    builder_write(b, "\r\n")
+    let endid = argv[2]
+    let start = argv[3]
+    let mut cnt = 0
     let mut i = len(xs) - 1
     while i >= 0 {
-        let rec = xs[i]
-        let parts = str_split(rec, "\u001f")
-        builder_write(b, "*2\r\n")
-        builder_write(b, r_bulk(parts[0]))
-        let mut rest = make([]string, 0, 4)
-        let mut j = 1
-        while j < len(parts) {
-            rest = append(rest, parts[j])
-            j = j + 1
+        if xrange_match(xs[i], start, endid) == 1 {
+            cnt = cnt + 1
+            if limit > 0 and cnt >= limit {
+                break
+            }
         }
-        builder_write(b, r_array_bulks(rest))
+        i = i - 1
+    }
+    let b = str_builder()
+    builder_write(b, "*")
+    builder_write(b, format_int(cnt))
+    builder_write(b, "\r\n")
+    let mut emitted = 0
+    i = len(xs) - 1
+    while i >= 0 and emitted < cnt {
+        if xrange_match(xs[i], start, endid) == 1 {
+            let rec = xs[i]
+            let parts = str_split(rec, "\u001f")
+            builder_write(b, "*2\r\n")
+            builder_write(b, r_bulk(parts[0]))
+            let mut rest = make([]string, 0, 4)
+            let mut j = 1
+            while j < len(parts) {
+                rest = append(rest, parts[j])
+                j = j + 1
+            }
+            builder_write(b, r_array_bulks(rest))
+            emitted = emitted + 1
+        }
         i = i - 1
     }
     return builder_string(b)

@@ -176,17 +176,25 @@ fn TestProbeUnsubExitsSubMode() {
 }
 
 fn TestProbeXrangeBounds() {
-    // ponytail: skipped — multiple XADD to same key is a known pre-existing crash (shard append issue)
-    // fix when shard_loop slice aliasing is resolved
     let stop = atomic_new(0)
     let port = 19751
     crew t {
         let srv = t.kick(probe_boot(port, stop))
         let fd = wait_connect("127.0.0.1", port, 80)
         assert(fd >= 0)
-        let _ = resp_send(fd, ["XADD", "xs", "1-1", "f", "a"])
-        let r = resp_send(fd, ["XRANGE", "xs", "-", "+"])
-        assert(str_contains(r, "a"))
+        assert_eq_str(resp_send(fd, ["XADD", "xs", "1-1", "f", "a"]), "$3\r\n1-1\r\n")
+        assert_eq_str(resp_send(fd, ["XADD", "xs", "1-2", "f", "b"]), "$3\r\n1-2\r\n")
+        assert_eq_str(resp_send(fd, ["XADD", "xs", "1-3", "f", "c"]), "$3\r\n1-3\r\n")
+        let r = resp_send(fd, ["XRANGE", "xs", "(1-1", "1-2"])
+        assert(not str_contains(r, "1-1"))
+        assert(str_contains(r, "1-2"))
+        assert(not str_contains(r, "1-3"))
+        let rev = resp_send(fd, ["XREVRANGE", "xs", "1-3", "1-2", "COUNT", "1"])
+        assert(str_contains(rev, "1-3"))
+        assert(not str_contains(rev, "1-2"))
+        let xr = resp_send(fd, ["XREAD", "COUNT", "2", "STREAMS", "xs", "1-1"])
+        assert(str_contains(xr, "1-2"))
+        assert(str_contains(xr, "1-3"))
         assert_eq_str(resp_send(fd, ["PING"]), "+PONG\r\n")
         let _ = resp_send(fd, ["QUIT"])
         let _ = tcp_close(fd)

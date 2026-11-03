@@ -355,6 +355,7 @@ fn crc16_t15(lo: int) -> int {
     }
 }
 
+#[no_alloc]
 fn crc16_tab(i: int) -> int {
     let x = i & 255
     let hi = (x >> 4) & 15
@@ -407,6 +408,7 @@ fn crc16_tab(i: int) -> int {
     return crc16_t15(lo)
 }
 
+#[no_alloc]
 fn crc16_range(data: string, start: int, end: int) -> int {
     let mut crc = 0
     let mut i = start
@@ -427,10 +429,12 @@ fn crc16_range(data: string, start: int, end: int) -> int {
     return crc
 }
 
+#[no_alloc]
 fn crc16(data: string) -> int {
     return crc16_range(data, 0, str_len(data))
 }
 
+#[no_alloc]
 fn hash_tag_span(key: string) -> (int, int) {
     let n = str_len(key)
     let i = str_index(key, "{")
@@ -452,27 +456,20 @@ fn hash_tag(key: string) -> string {
     return key[a:b]
 }
 
+#[no_alloc]
 fn key_slot(key: string) -> int {
     let a, b = hash_tag_span(key)
     return crc16_range(key, a, b) & 16383
 }
 
+#[no_alloc]
 fn key_shard(key: string, shards: int) -> int {
     if shards <= 1 {
         return 0
     }
     let slot = key_slot(key)
-    if shards == 16 {
-        return slot & 15
-    }
-    if shards == 8 {
-        return slot & 7
-    }
-    if shards == 4 {
-        return slot & 3
-    }
-    if shards == 2 {
-        return slot & 1
+    if (shards & (shards - 1)) == 0 {
+        return slot & (shards - 1)
     }
     return slot % shards
 }

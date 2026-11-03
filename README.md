@@ -11,7 +11,7 @@ makori run -p cli -- SET k v
 makori run -p cli -- GET k
 ```
 
-Version **0.14.0**. Needs [Mako](https://github.com/loreste/mako) 0.5.7+. See [install docs](docs/install.md).
+Version **0.14.0**. Needs [Mako](https://github.com/loreste/mako) 0.7.0+. See [install docs](docs/install.md).
 
 ## What it is
 
@@ -24,7 +24,7 @@ Not Redis. Specifically:
 - No Redis modules (`.so` ABI)
 - No RDB file format (`dump.bonodis` is a command stream, not RDB bytes)
 - No Redis Cluster bus binary protocol (gossip is RESP-based `CLUSTERX`)
-- No full Lua 5.1 (`EVAL` is a sandboxed subset: `redis.call`, `KEYS`, `ARGV`, control flow, no `os`/`io`/`load`/`require`/`cjson`)
+- No full Lua 5.1 (`EVAL` is a sandboxed subset: `redis.call`, `redis.pcall`, `redis.status_reply`, `redis.error_reply`, `redis.sha1hex`, `KEYS`, `ARGV`, `string.*`, `math.*`, `cjson.encode`/`cjson.decode`, control flow; no `os`/`io`/`load`/`require`)
 - No Sentinel quorum (compatibility API answers from the data node itself)
 - ACL uses Bonodis `users.acl` format, not Redis ACL command-selector files
 - `DUMP`/`RESTORE` payloads are `BND1`, not Redis RDB bytes
@@ -47,7 +47,7 @@ clients --RESP2--> per-connection handlers
             WAL persist task (optional)
 ```
 
-One OS thread per connection. Commands on different keys run in parallel. A shard stays serial. Multi-key commands scatter/merge. Expiry is lazy. 16 logical databases (`SELECT 0..15`).
+One OS thread per connection. Commands on different keys run in parallel. A shard stays serial. Multi-key commands and multi-shard client pipelines scatter/gather concurrently across all involved shards. Expiry is lazy plus periodic background sweeps. 16 logical databases (`SELECT 0..15`).
 
 Four `SO_REUSEPORT` accept threads (`--accept-threads`), 16k listen backlog, 50k default `--maxclients`. GET/SET skip the admin-command chain and go straight to the shard. `--prod` refuses to start without `--maxmemory` and `--appendonly yes`.
 
@@ -108,11 +108,13 @@ bonodis --prod --bind 0.0.0.0 --port 6379 --dir /var/lib/bonodis \
 
 ```
 bonodis-cli -h 127.0.0.1 -p 6379 PING
+bonodis-cli -h 127.0.0.1 -p 6379 -i                  # Interactive REPL
 bonodis-cli -a secret SET k v
 bonodis-cli --tls PING
 bonodis-cli --tls-ca /path/ca.pem PING
 bonodis-cli -s /tmp/bonodis.sock PING
 bonodis-cli -u alice -a secret ACL WHOAMI
+bonodis-cli --bench -n 50000 -P 16 -c 4 -r 10000     # Multi-client, multi-shard benchmark with p50/p95/p99
 ```
 
 ### Client libraries
@@ -130,35 +132,43 @@ r.get("k")
 
 ### Connection / server
 
-`PING`, `ECHO`, `QUIT`, `AUTH` (password or user + password), `SELECT`, `HELLO`, `COMMAND LIST`/`COUNT`, `TIME`, `CLIENT ID`/`SETNAME`/`GETNAME`/`LIST`/`INFO`/`KILL`, `CONFIG GET`/`SET`/`REWRITE`, `INFO`, `SLOWLOG`, `METRICS`, `MEMORY`/`MEMORY USAGE`, `LASTSAVE`, `SAVE`/`BGSAVE`, `BGREWRITEAOF`, `SHUTDOWN [SAVE|NOSAVE]`, `ACL SETUSER`/`LIST`/`GETUSER`/`WHOAMI`/`SAVE`/`LOAD`, `OBJECT ENCODING`/`IDLETIME`, `LATENCY`, `PUBSUB`, `MONITOR`
+`PING`, `ECHO`, `QUIT`, `AUTH` (password or user + password), `SELECT`, `HELLO`, `COMMAND LIST`/`COUNT`/`DOCS`/`GETKEYS`, `TIME`, `CLIENT ID`/`SETNAME`/`GETNAME`/`LIST`/`INFO`/`KILL`/`TRACKING` (`ON`/`OFF`/`BCAST`/`PREFIX` with `__redis__:invalidate` notifications)/`TRACKINGINFO`, `CONFIG GET`/`SET`/`REWRITE`/`RESETSTAT`, `INFO`, `SLOWLOG`, `METRICS`, `MEMORY`/`MEMORY USAGE`, `LASTSAVE`, `SAVE`/`BGSAVE`, `BGREWRITEAOF`, `SHUTDOWN [SAVE|NOSAVE]`, `ACL SETUSER`/`LIST`/`GETUSER`/`WHOAMI`/`SAVE`/`LOAD`, `OBJECT ENCODING`/`IDLETIME`, `LATENCY`, `PUBSUB`, `MONITOR`
 
 ### Strings
 
-`GET`, `SET` (`NX`/`XX`/`GET`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`), `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETDEL`, `GETEX`, `GETRANGE`, `SETRANGE`, `APPEND`, `STRLEN`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `DECR`, `DECRBY`, `MGET`, `MSET`, `MSETNX`, `COPY`, `TOUCH`, `DUMP`/`RESTORE`
+`GET`, `SET` (`NX`/`XX`/`GET`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`), `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETDEL`, `GETEX`, `GETRANGE`, `SUBSTR`, `SETRANGE`, `LCS` (`LEN`/`IDX`/`MINMATCHLEN`/`WITHMATCHLEN`), `CAS` (atomic Compare-And-Swap with `EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`), `CAD` (atomic Compare-And-Delete), `DELEX` (`IFEQ`/`IFNE`), `RATELIMIT` (atomic window rate limiter), `CL.THROTTLE` (native `redis-cell` GCRA rate limiter), `LOCK` (`ACQUIRE`/`RENEW`/`RELEASE`/`INFO` fenced distributed locks with monotonic fencing tokens), `APPEND`, `STRLEN`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `DECR`, `DECRBY`, `MGET`, `MSET`, `MSETNX`, `COPY`, `TOUCH`, `DUMP`/`RESTORE`
 
 ### Keys
 
-`DEL`, `UNLINK`, `EXISTS`, `TYPE`, `EXPIRE` (`NX`/`XX`/`GT`/`LT`), `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `EXPIRETIME`, `PEXPIRETIME`, `TTL`, `PTTL`, `PERSIST`, `RENAME`, `RENAMENX`, `MOVE`, `SWAPDB`, `KEYS` (capped at 4096), `SCAN`, `HOTKEYS`, `RANDOMKEY`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`
+`DEL`, `UNLINK`, `EXISTS`, `TYPE`, `EXPIRE` (`NX`/`XX`/`GT`/`LT`), `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `EXPIRETIME`, `PEXPIRETIME`, `TTL`, `PTTL`, `PERSIST`, `RENAME`, `RENAMENX`, `MOVE`, `SWAPDB`, `KEYS` (capped at 4096), `SCAN` (`MATCH`/`COUNT`/`TYPE`), `HOTKEYS`, `RANDOMKEY`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`
 
 ### Hashes
 
-`HSET`, `HMSET`, `HSETNX`, `HGET`, `HMGET`, `HGETALL`, `HDEL`, `HGETDEL`, `HEXISTS`, `HKEYS`, `HVALS`, `HLEN`, `HINCRBY`, `HINCRBYFLOAT`, `HSTRLEN`, `HRANDFIELD [COUNT]`, `HSCAN`
+`HSET`, `HMSET`, `HSETNX`, `HSETEX` (`FNX`/`FXX`/`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`), `HGET`, `HMGET`, `HGETEX` (`EX`/`PX`/`EXAT`/`PXAT`/`PERSIST`), `HGETALL`, `HDEL`, `HGETDEL`, `HEXISTS`, `HKEYS`, `HVALS`, `HLEN`, `HINCRBY`, `HINCRBYFLOAT`, `HSTRLEN`, `HRANDFIELD [COUNT [WITHVALUES]]`, `HSCAN` (`MATCH`/`COUNT`), `HEXPIRE`/`HPEXPIRE`/`HEXPIREAT`/`HPEXPIREAT` (`NX`/`XX`/`GT`/`LT`), `HEXPIRETIME`, `HPEXPIRETIME`, `HTTL`, `HPTTL`, `HPERSIST`
 
-### Lists
+### Lists (True $O(1)$ Head-Slack Deque)
 
-`LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`, `RPOP`, `LMPOP`, `BLPOP`, `BRPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LPOS`, `LSET`, `LTRIM`, `LREM`, `LINSERT`, `LMOVE`, `RPOPLPUSH`
+`LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`, `RPOP`, `LMPOP`, `BLPOP`, `BRPOP`, `BLMPOP`, `BLMOVE`, `BRPOPLPUSH`, `LRANGE`, `LLEN`, `LINDEX`, `LPOS`, `LSET`, `LTRIM`, `LREM`, `LINSERT`, `LMOVE`, `RPOPLPUSH`
 
 ### Sets
 
-`SADD`, `SREM`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SCARD`, `SPOP`, `SRANDMEMBER`, `SMOVE`, `SUNION`, `SINTER`, `SDIFF`, `SINTERCARD`, `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`, `SSCAN`
+`SADD`, `SREM`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SCARD`, `SPOP`, `SRANDMEMBER`, `SMOVE`, `SUNION`, `SINTER`, `SDIFF`, `SINTERCARD`, `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`, `SSCAN`, `SEXPIRE`/`SPEXPIRE`/`SEXPIREAT`/`SPEXPIREAT` (`NX`/`XX`/`GT`/`LT` per-member TTLs), `STTL`, `SPTTL`, `SPERSIST`
 
 ### Sorted sets
 
-`ZADD`, `ZREM`, `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZCOUNT`, `ZPOPMIN`, `ZPOPMAX`, `ZMPOP`, `BZPOPMIN`, `BZPOPMAX`, `ZRANK`, `ZREVRANK`, `ZINCRBY`, `ZRANDMEMBER`, `ZUNION`/`ZINTER`/`ZDIFF`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`, `ZSCAN`
+`ZADD` (`NX`/`XX`/`GT`/`LT`/`CH`/`INCR`), `ZREM`, `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZRANGE` (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`/`WITHSCORES`), `ZRANGESTORE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZCOUNT`, `ZLEXCOUNT`, `ZPOPMIN`, `ZPOPMAX`, `ZMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `ZRANK [WITHSCORE]`, `ZREVRANK [WITHSCORE]`, `ZINCRBY`, `ZRANDMEMBER`, `ZUNION`/`ZINTER`/`ZDIFF`, `ZINTERCARD`, `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`, `ZREMRANGEBYLEX`, `ZSCAN`, `ZEXPIRE`/`ZPEXPIRE`/`ZEXPIREAT`/`ZPEXPIREAT` (`NX`/`XX`/`GT`/`LT` per-member TTLs), `ZTTL`, `ZPTTL`, `ZPERSIST`
 
-### Sort / HyperLogLog
+### Sort / Probabilistic / JSON / Time-Series / Search / Job Queues
 
-`SORT` (`ALPHA`/`DESC`/`LIMIT`/`STORE`), `PFADD`, `PFCOUNT`, `PFMERGE`
+- **Sort & HyperLogLog**: `SORT` (`ALPHA`/`DESC`/`LIMIT`/`STORE`), `SORT_RO`, `PFADD`, `PFCOUNT`, `PFMERGE`
+- **Native Bloom Filters**: `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.EXISTS`, `BF.MEXISTS`, `BF.CARD`, `BF.INFO`
+- **Native Cuckoo Filters (deletable probabilistic sets)**: `CF.RESERVE`, `CF.ADD`, `CF.ADDNX`, `CF.INSERT`, `CF.INSERTNX`, `CF.EXISTS`, `CF.MEXISTS`, `CF.DEL`, `CF.COUNT`, `CF.INFO`
+- **Native Count-Min Sketch**: `CMS.INITBYDIM`, `CMS.INITBYPROB`, `CMS.INCRBY`, `CMS.QUERY`, `CMS.INFO`
+- **Native Top-K Heavy Hitters**: `TOPK.RESERVE`, `TOPK.ADD`, `TOPK.INCRBY`, `TOPK.QUERY`, `TOPK.COUNT`, `TOPK.LIST [WITHCOUNT]`, `TOPK.INFO`
+- **Native JSON (RedisJSON drop-in)**: `JSON.SET` (`NX`/`XX`), `JSON.GET`, `JSON.MGET`, `JSON.DEL`, `JSON.FORGET`, `JSON.TYPE`, `JSON.NUMINCRBY`, `JSON.STRAPPEND`, `JSON.STRLEN`, `JSON.ARRAPPEND`, `JSON.ARRLEN`, `JSON.OBJKEYS`, `JSON.OBJLEN`
+- **Native Time-Series (RedisTimeSeries drop-in)**: `TS.CREATE` (`RETENTION`/`LABELS`), `TS.ADD`, `TS.MADD`, `TS.INCRBY`, `TS.DECRBY`, `TS.GET`, `TS.RANGE` / `TS.REVRANGE` (`COUNT` + `AGGREGATION avg|sum|min|max|count|first|last bucket_ms`), `TS.INFO`
+- **Native Full-Text & Secondary Indexing (RediSearch drop-in)**: `FT.CREATE idx [ON HASH|JSON] [PREFIX n p1 ...] SCHEMA field TEXT|TAG|NUMERIC [SORTABLE] ...`, `FT.SEARCH idx query [NOCONTENT] [LIMIT offset num] [SORTBY field [ASC|DESC]] [RETURN n f1 ...]`, `FT.INFO`, `FT.DROPINDEX [DD]`, `FT._LIST`
+- **Native Delayed & Retryable Job Queues**: `QUEUE.PUSH key job_id payload [DELAY ms] [PRIORITY pri] [MAXRETRIES n]`, `QUEUE.POP key worker_id [VISIBILITY ms] [COUNT n]`, `QUEUE.ACK key job_id ...`, `QUEUE.NACK key job_id [DELAY ms]`, `QUEUE.DLQ key [LIST|RETRY job_id|PURGE]`, `QUEUE.STATS key`
 
 ### Bitmaps
 
@@ -182,9 +192,9 @@ r.get("k")
 
 ### Lua
 
-`EVAL`, `EVALSHA`, `SCRIPT LOAD`/`EXISTS`/`FLUSH`/`KILL`
+`EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `SCRIPT LOAD`/`EXISTS`/`FLUSH`/`KILL`
 
-Sandboxed subset. Available: `KEYS`, `ARGV`, `redis.call`, `redis.pcall`, local variables, assignment, `if`/`while`, `and`/`or`, `#`, `return`, string literals, numbers. Not available: `os`, `io`, `load`, `require`, `cjson`, tables, metatables. Nesting depth capped at 200. Script size capped at 64KB.
+Sandboxed subset. Available: `KEYS`, `ARGV`, `redis.call`, `redis.pcall`, `redis.status_reply`, `redis.error_reply`, `redis.sha1hex`, `string.len`, `string.sub`, `string.lower`, `string.upper`, `string.find`, `string.rep`, `math.min`, `math.max`, `math.abs`, `math.floor`, `cjson.encode`, `cjson.decode` (with `.field` and `["field"]` access), `tonumber`, `tostring`, local variables, assignment, `if`/`while`, `and`/`or`, `#`, `..`, `return`, string literals, numbers. `EVAL_RO`/`EVALSHA_RO` strictly reject write commands inside `redis.call`/`redis.pcall`. Not available: `os`, `io`, `load`, `require`, metatables. Nesting depth capped at 200. Script size capped at 64KB.
 
 ### Cluster / replication
 
@@ -192,7 +202,7 @@ Sandboxed subset. Available: `KEYS`, `ARGV`, `redis.call`, `redis.pcall`, local 
 
 ## Vectors
 
-`VADD key id float [float ...]` stores a float vector. `VSIM key COUNT n WITHSCORES float [float ...]` ranks by cosine similarity. `VREM`, `VCARD`, `VDIM`, `VATTR`, `VGETATTR`.
+`VADD key id float [float ...] [QUANTIZED|INT8] [ATTR text]` stores a float vector (or 8x smaller `int8` scalar-quantized vector when `QUANTIZED` is passed). `VSIM key COUNT n WITHSCORES float [float ...]` ranks by cosine similarity. `VSEARCH key [COUNT n] [FILTER substr] [TEXT query] [MINSCORE sc] [WITHSCORES] [WITHATTR] [VALUES f1 f2 ...]` runs hybrid vector cosine + token-overlap + attribute filter search in one call. `VREM`, `VCARD`, `VDIM`, `VATTR`, `VGETATTR`.
 
 Embeddings are computed by the client. Bonodis stores and ranks. It does not call a model.
 
@@ -261,15 +271,18 @@ curl -s http://127.0.0.1:9090/turn -d '{"session":"{d}sess","ns":"{d}mem","query
 
 ## REACT (server-side triggers)
 
-`REACT CREATE name key ON WRITE cmd [arg ...] [| cmd [arg ...]]`
+`REACT CREATE name key_or_glob ON WRITE|DELETE|EXPIRE|ANY cmd [arg ...] [| cmd [arg ...]]`
 
-Registers a trigger. When `key` is written, the listed commands run on the same shard, same thread, no network round-trips. Pipe `|` chains commands. `$RESULT` from the previous command feeds into the next.
+Registers a trigger. When `key_or_glob` (exact key or glob pattern such as `user:*`) is written, deleted, or expired, the listed commands run on the same shard, same thread, no network round-trips. Pipe `|` chains commands. `$RESULT` from the previous command feeds into the next.
 
 ```
 # Copy a value on write
 REACT CREATE copier {r}src ON WRITE SET {r}dst $VALUE
 SET {r}src hello
 GET {r}dst    # "hello"
+
+# Glob + ON EXPIRE trigger
+REACT CREATE audit sess:* ON EXPIRE INCR stats:expired
 
 # Chain commands
 REACT CREATE chain {c}src ON WRITE GET {c}src | SET {c}copy $RESULT
@@ -282,13 +295,13 @@ BRAIN REMEMBER {a}mem p1 "user prefers dark mode"
 # compact + pack ran server-side; context is fresh
 ```
 
-Substitutions: `$KEY` (written key), `$VALUE` (`argv[2]` of the write command), `$RESULT` (RESP payload of previous piped command).
+Substitutions: `$KEY` (triggered key), `$VALUE` (`argv[2]` of the write command), `$RESULT` (RESP payload of previous piped command).
 
 Constraints:
 - Trigger and target keys must share a hash tag (same shard)
+- Exact keys and glob patterns (`*`, `?`, `[...]`) are supported
 - Rules persist in the WAL, survive restarts
 - No recursive triggers (a trigger's writes do not fire other triggers)
-- Exact key match only, no globs
 - `REACT DELETE name` removes a rule
 - `REACT LIST` returns all rules as name/key pairs
 
@@ -396,7 +409,7 @@ Structured slog (text or `--log-json yes`). Default level `info`.
 | SRANDMEMBER negative count | capped at 10000 |
 | SETRANGE offset | capped at 512 MB |
 
-Protected-mode checks parse the peer address as an IP (`127.0.0.0/8`, `::1`, `::ffff:127.0.0.0/8`). Cross-shard `RENAME` and `MSETNX` return `CROSSSLOT`. Replicas refuse writes. `ZADD` rejects `nan`/`inf`. `CONFIG SET` of unknown keys returns an error. Raise `ulimit -n` above `--maxclients`.
+Protected-mode checks parse the peer address as an IP (`127.0.0.0/8`, `::1`, `::ffff:127.0.0.0/8`). In cluster mode, cross-slot `RENAME`, `COPY`, and `MSETNX` return `CROSSSLOT` (in standalone multi-shard mode, `RENAME`, `RENAMENX`, and `COPY` work transparently across shards for all data types and TTLs). Replicas refuse writes. `ZADD` rejects `nan`/`inf`. `CONFIG SET` of unknown keys returns an error. Raise `ulimit -n` above `--maxclients`.
 
 ## Deploy
 
@@ -437,13 +450,13 @@ Unit tests (store, RESP codec, CRC16, glob, Lua) and live TCP tests (every comma
 ## Documentation
 
 - [Install](docs/install.md) -- requirements, platforms, systemd, Docker
-- [Getting started](docs/getting-started.md) -- first commands, language examples, production checklist
-- [Agent memory](docs/agent-memory.md) -- store/recall/pack context for AI agents
-- [REACT triggers](docs/react.md) -- server-side triggers on writes
-- [Graph, facts, leases](docs/graph-and-facts.md) -- edges, triples, beliefs, budgets
+- [Getting started](docs/getting-started.md) -- first commands, language examples, JSON/TS/Search/Queues, production checklist
+- [Agent memory](docs/agent-memory.md) -- store/recall/pack context, quantized `int8` vectors, and hybrid `VSEARCH`
+- [REACT triggers](docs/react.md) -- server-side triggers on `WRITE`, `DELETE`, `EXPIRE`, and `ANY` with glob patterns
+- [Graph, facts, leases](docs/graph-and-facts.md) -- edges, triples, beliefs, budgets, fenced `LOCK`, `QUEUE.*`, and `FT.*`
 - [Cluster setup](docs/cluster.md) -- multi-node with failover
 - [HTTP API](docs/http-api.md) -- JSON API, Brain endpoints, MCP
-- [Lua scripting](docs/lua-eval.md) -- EVAL sandbox
+- [Lua scripting](docs/lua-eval.md) -- `EVAL` / `EVAL_RO` sandbox with `string.*`, `math.*`, `cjson.*`, and `redis.*`
 - [Persistence](docs/persistence.md) -- WAL, snapshots, fsync
 - [TLS](docs/tls.md) -- encrypted connections
 - [ACL](docs/acl.md) -- per-user access control
@@ -452,23 +465,23 @@ Unit tests (store, RESP codec, CRC16, glob, Lua) and live TCP tests (every comma
 
 ```
 lib/
-  server.mko      connection handling, dispatch, config, accept loops
-  store.mko       core data types (string, hash, list, set, zset), shard loop
-  extra.mko       secondary commands (sort, scan helpers, dump/restore, rekey)
+  server.mko      connection handling, parallel multi-shard pipeline scatter-gather, config, accept loops
+  store.mko       core data types (string, hash, O(1) head-slack deque list, set, zset), shard loop
+  extra.mko       sort, scan, dump/restore, sub-key TTLs, CAS/CAD/DELEX, RATELIMIT/CL.THROTTLE, JSON.*, TS.*
   stream.mko      XADD/XRANGE/XREADGROUP/PEL and stream helpers
   bitops.mko      SETBIT/GETBIT/BITCOUNT/BITOP/BITFIELD
   geo.mko         GEOADD/GEODIST/GEOPOS/GEORADIUS/GEOSEARCH
-  hll.mko         PFADD/PFCOUNT/PFMERGE (HyperLogLog)
-  brain.mko       BRAIN commands, HTTP /brain/* API
+  hll.mko         PFADD/PFCOUNT/PFMERGE, BF.* (Bloom), CF.* (Cuckoo), CMS.* (Count-Min), TOPK.* (Top-K)
+  brain.mko       BRAIN commands, quantized VADD/VSIM/VSEARCH, HTTP /brain/* API
   mind.mko        BELIEVE/TENSIONS/ASK/ATTEND/BUDGET/SPEND/TURN
-  graph.mko       RELATE/UNRELATE/NEIGHBORS/PATH/FACT/WHY
-  react.mko       REACT CREATE/DELETE/LIST, trigger execution
+  graph.mko       RELATE/UNRELATE/NEIGHBORS/PATH/FACT/WHY, LOCK, QUEUE.*, FT.* (RediSearch drop-in)
+  react.mko       REACT CREATE/DELETE/LIST, WRITE/DELETE/EXPIRE/ANY + glob trigger execution
   cluster.mko     CLUSTER commands, slot routing, gossip, failover
   replication.mko replica worker, PSYNC feed, master ingest
   pubsub.mko      SUBSCRIBE/PUBLISH, MONITOR
   sentinel.mko    SENTINEL compatibility API
-  lua.mko         EVAL sandbox
-  resp.mko        RESP2 codec, command names
+  lua.mko         EVAL / EVAL_RO sandbox + string.*, math.*, cjson.*, redis.* stdlib
+  resp.mko        zero-copy RESP2 codec, command names
   acl.mko         ACL
   api.mko         HTTP JSON /api, /mcp
   persist.mko     WAL read/write
@@ -477,7 +490,7 @@ lib/
   consts.mko      buffer limits
   client.mko      RESP2 test client
   *_test.mko      unit + live TCP tests
-cli/              CLI
+cli/              CLI (single-shot, -i REPL, --cluster, --bench with -c/-r and p50/p95/p99 histograms)
 clients/          Lua / Python / JS HTTP helpers
 deploy/           systemd unit
 scripts/          bench.sh
@@ -486,13 +499,11 @@ Dockerfile        release binary
 
 ## Known limitations
 
-- Thread per connection (mitigated by `maxclients` + `accept-rate`, but no epoll/io_uring event loop)
-- `SCAN` walks all keys per call (not a true incremental cursor)
+- Thread per connection (mitigated by `maxclients` + `accept-rate`, zero-copy cursor RESP parsing, and pipelined write coalescing, though no epoll/io_uring event loop)
+- `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN` sort matching keys/elements per call for deterministic cursor pagination rather than maintaining stateful cursor iterators
 - `wait_reply` busy-polls at 50us intervals (should be a condvar)
-- Cross-shard `RENAME` for strings is not atomic (check-then-act)
+- Cross-shard `RENAME` / `COPY` in standalone mode is staged (`DUMP` -> `RESTORE` -> `DEL`) rather than globally locked across shards
 - `WATCH`/`MULTI`/`EXEC` is per-shard, not cross-shard atomic
-- Multiple `XADD` to the same stream key can crash (shard slice aliasing bug)
-- `SRANDMEMBER key count` with positive count returns first N members, not a random sample
 - No Windows, no BSD
 
 ## License

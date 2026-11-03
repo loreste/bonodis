@@ -2,7 +2,8 @@ pack main
 
 fn usage() {
     print("bonodis-cli — RESP2 client (Mako)")
-    print("Usage: bonodis-cli [-h HOST] [-p PORT] [-s SOCKET] [-a PASS] [-u USER] [--tls] [--tls-ca PATH] [CMD args...]")
+    print("Usage: bonodis-cli [-h HOST] [-p PORT] [-s SOCKET] [-a PASS] [-u USER] [--tls] [--tls-ca PATH] [-i|--repl] [CMD args...]")
+    print("       bonodis-cli --bench [-h HOST] [-p PORT] [-n REQUESTS] [-P PIPELINE] [-c CLIENTS] [-r KEYSPACE]")
     print("       bonodis-cli --cluster create [--replicas N] host:port [host:port ...]")
     print("       bonodis-cli --cluster add-node new:port existing:port [--slave]")
     print("Platforms: linux, macOS")
@@ -32,6 +33,13 @@ fn encode(argv: []string) -> string {
         i = i + 1
     }
     return builder_string(b)
+}
+
+fn tls_cli_new(ca: string) -> TlsClient {
+    if str_len(ca) > 0 {
+        return tls_client_new(ca)
+    }
+    return tls_client_new_insecure()
 }
 
 fn tls_write_all(tc: TlsConn, s: string) -> int {
@@ -174,6 +182,17 @@ fn count_node_lines(blob: string) -> int {
     return c
 }
 
+fn send_to(host: string, port: int, argv: []string) -> string {
+    let fd = tcp_connect(host, port)
+    if fd < 0 {
+        return ""
+    }
+    let _ = tcp_nodelay(fd)
+    let r = send(fd, argv)
+    let _ = tcp_close(fd)
+    return r
+}
+
 fn wait_n_nodes(host: string, port: int, want: int) -> int {
     let mut n = 0
     while n < 80 {
@@ -185,17 +204,6 @@ fn wait_n_nodes(host: string, port: int, want: int) -> int {
         n = n + 1
     }
     return 0
-}
-
-fn send_to(host: string, port: int, argv: []string) -> string {
-    let fd = tcp_connect(host, port)
-    if fd < 0 {
-        return ""
-    }
-    let _ = tcp_nodelay(fd)
-    let r = send(fd, argv)
-    let _ = tcp_close(fd)
-    return r
 }
 
 fn cluster_create(replicas: int, addrs: []string) {
@@ -430,6 +438,269 @@ fn cluster_main() {
     exit(1)
 }
 
+fn count_crlf(s: string) -> int {
+    let n = str_len(s)
+    let mut c = 0
+    let mut i = 0
+    while i + 1 < n {
+        if str_byte_at(s, i) == 13 and str_byte_at(s, i + 1) == 10 {
+            c = c + 1
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    return c
+}
+
+fn sort_ints(mut xs: []int) -> []int {
+    let n = len(xs)
+    if n <= 1 {
+        return xs
+    }
+    let gaps = [701, 301, 132, 57, 23, 10, 4, 1]
+    let mut gi = 0
+    while gi < len(gaps) {
+        let gap = gaps[gi]
+        if gap < n {
+            let mut i = gap
+            while i < n {
+                let tv = xs[i]
+                let mut j = i
+                while j >= gap and tv < xs[j - gap] {
+                    xs[j] = xs[j - gap]
+                    j = j - gap
+                }
+                xs[j] = tv
+                i = i + 1
+            }
+        }
+        gi = gi + 1
+    }
+    return xs
+}
+
+fn fmt_us_ms(us: int) -> string {
+    let ms_whole = us / 1000
+    let ms_frac = (us % 1000) / 10
+    let mut fstr = format_int(ms_frac)
+    if ms_frac < 10 {
+        fstr = "0" + fstr
+    }
+    return format_int(ms_whole) + "." + fstr + "ms"
+}
+
+fn bench_worker(host: string, port: int, batch: string, iters: int, want_crlf: int, done: AtomicInt) -> int {
+    let wfd = tcp_connect(host, port)
+    if wfd < 0 {
+        let _ = atomic_add(done, 1)
+        return 0
+    }
+    let _ = tcp_nodelay(wfd)
+    let mut it = 0
+    while it < iters {
+        let _ = tcp_write_all(wfd, batch)
+        let mut got = 0
+        while got < want_crlf {
+            let chunk = tcp_read(wfd)
+            if str_len(chunk) == 0 {
+                break
+            }
+            got = got + count_crlf(chunk)
+        }
+        it = it + 1
+    }
+    let _ = tcp_close(wfd)
+    let _ = atomic_add(done, 1)
+    return 1
+}
+
+fn bench_one(fd: int, host: string, port: int, name: string, argv: []string, n_req: int, pipe: int, clients: int, keyspace: int, crlf_per_reply: int) {
+    let b = str_builder()
+    let mut pi = 0
+    while pi < pipe {
+        if keyspace > 0 and len(argv) >= 2 {
+            let mut v = make([]string, 0, len(argv))
+            v = append(v, argv[0])
+            v = append(v, argv[1] + ":" + format_int(pi % keyspace))
+            let mut ai = 2
+            while ai < len(argv) {
+                v = append(v, argv[ai])
+                ai = ai + 1
+            }
+            builder_write(b, encode(v))
+        } else {
+            builder_write(b, encode(argv))
+        }
+        pi = pi + 1
+    }
+    let batch = builder_string(b)
+    let want_crlf = pipe * crlf_per_reply
+    let mut ncli = clients
+    if ncli < 1 {
+        ncli = 1
+    }
+    let mut iters = n_req / (pipe * ncli)
+    if iters < 1 {
+        iters = 1
+    }
+    let total_ops = iters * pipe * ncli
+    let mut samples = make([]int, 0, iters)
+    let t0 = mono_ns()
+    if ncli <= 1 {
+        let mut it = 0
+        while it < iters {
+            let bt0 = mono_ns()
+            let _ = tcp_write_all(fd, batch)
+            let mut got = 0
+            while got < want_crlf {
+                let chunk = tcp_read(fd)
+                if str_len(chunk) == 0 {
+                    break
+                }
+                got = got + count_crlf(chunk)
+            }
+            samples = append(samples, elapsed_ns(bt0) / 1000)
+            it = it + 1
+        }
+    } else {
+        let done = atomic_new(0)
+        let mut ci = 1
+        while ci < ncli {
+            detach bench_worker(host, port, batch, iters, want_crlf, done)
+            ci = ci + 1
+        }
+        let mut it = 0
+        while it < iters {
+            let bt0 = mono_ns()
+            let _ = tcp_write_all(fd, batch)
+            let mut got = 0
+            while got < want_crlf {
+                let chunk = tcp_read(fd)
+                if str_len(chunk) == 0 {
+                    break
+                }
+                got = got + count_crlf(chunk)
+            }
+            samples = append(samples, elapsed_ns(bt0) / 1000)
+            it = it + 1
+        }
+        while atomic_load(done) < ncli - 1 {
+            sleep_ms(1)
+        }
+    }
+    let mut ns = elapsed_ns(t0)
+    if ns < 1 {
+        ns = 1
+    }
+    samples = sort_ints(samples)
+    let nsamp = len(samples)
+    let mut p50 = 0
+    let mut p95 = 0
+    let mut p99 = 0
+    if nsamp > 0 {
+        p50 = samples[(nsamp * 50) / 100]
+        p95 = samples[(nsamp * 95) / 100]
+        p99 = samples[(nsamp * 99) / 100]
+    }
+    let ops_sec = (total_ops * 1000000000) / ns
+    print(name + ": " + format_int(ops_sec) + " req/s | p50=" + fmt_us_ms(p50) + " p95=" + fmt_us_ms(p95) + " p99=" + fmt_us_ms(p99))
+}
+
+fn run_bench(fd: int, host: string, port: int, n_req: int, pipe: int, clients: int, keyspace: int) {
+    print("bonodis-cli benchmark (" + format_int(n_req) + " requests, P=" + format_int(pipe) + ", c=" + format_int(clients) + ", r=" + format_int(keyspace) + ")")
+    let _ = send(fd, ["SET", "bench:k", "hello_bonodis"])
+    let _ = send(fd, ["JSON.SET", "bench:j", "$", "{\"v\":1}"])
+    if keyspace > 0 {
+        let mut ki = 0
+        while ki < pipe and ki < keyspace {
+            let _ = send(fd, ["SET", "bench:k:" + format_int(ki), "hello_bonodis"])
+            let _ = send(fd, ["JSON.SET", "bench:j:" + format_int(ki), "$", "{\"v\":1}"])
+            ki = ki + 1
+        }
+    }
+    bench_one(fd, host, port, "PING         ", ["PING"], n_req, pipe, clients, 0, 1)
+    bench_one(fd, host, port, "SET          ", ["SET", "bench:k", "hello_bonodis"], n_req, pipe, clients, keyspace, 1)
+    bench_one(fd, host, port, "GET          ", ["GET", "bench:k"], n_req, pipe, clients, keyspace, 2)
+    bench_one(fd, host, port, "INCR         ", ["INCR", "bench:ctr"], n_req, pipe, clients, keyspace, 1)
+    bench_one(fd, host, port, "LPUSH        ", ["LPUSH", "bench:list", "item"], n_req, pipe, clients, keyspace, 1)
+    bench_one(fd, host, port, "HSET         ", ["HSET", "bench:hash", "f1", "v1"], n_req, pipe, clients, keyspace, 1)
+    bench_one(fd, host, port, "CAS          ", ["CAS", "bench:k", "hello_bonodis", "hello_bonodis"], n_req, pipe, clients, keyspace, 1)
+    bench_one(fd, host, port, "RATELIMIT    ", ["RATELIMIT", "bench:rl", "1000000", "1000000", "1"], n_req, pipe, clients, keyspace, 4)
+    bench_one(fd, host, port, "BF.ADD       ", ["BF.ADD", "bench:bf", "item1"], n_req, pipe, clients, keyspace, 1)
+    bench_one(fd, host, port, "JSON.GET     ", ["JSON.GET", "bench:j", "$.v"], n_req, pipe, clients, keyspace, 2)
+    let _ = send(fd, ["DEL", "bench:k", "bench:ctr", "bench:list", "bench:hash", "bench:rl", "bench:bf", "bench:j"])
+}
+
+fn split_repl_line(line: string) -> []string {
+    let mut out = make([]string, 0, 8)
+    let n = str_len(line)
+    let mut i = 0
+    while i < n {
+        while i < n {
+            let c = str_byte_at(line, i)
+            if c == 32 or c == 9 or c == 10 or c == 13 {
+                i = i + 1
+            } else {
+                break
+            }
+        }
+        if i >= n {
+            break
+        }
+        let q = str_byte_at(line, i)
+        if q == 34 or q == 39 {
+            i = i + 1
+            let b = str_builder()
+            while i < n and str_byte_at(line, i) != q {
+                if str_byte_at(line, i) == 92 and i + 1 < n {
+                    i = i + 1
+                }
+                builder_write(b, line[i:i + 1])
+                i = i + 1
+            }
+            if i < n and str_byte_at(line, i) == q {
+                i = i + 1
+            }
+            out = append(out, builder_string(b))
+        } else {
+            let s0 = i
+            while i < n {
+                let c = str_byte_at(line, i)
+                if c == 32 or c == 9 or c == 10 or c == 13 {
+                    break
+                }
+                i = i + 1
+            }
+            out = append(out, line[s0:i])
+        }
+    }
+    return out
+}
+
+fn run_repl(fd: int, host: string, port: int) {
+    let prompt = host + ":" + format_int(port) + "> "
+    while true {
+        print_raw(prompt)
+        let line = syscall_read(0, 4096)
+        if str_len(line) == 0 {
+            print("")
+            break
+        }
+        let argv = split_repl_line(line)
+        if len(argv) == 0 {
+            continue
+        }
+        let u0 = str_to_upper(argv[0])
+        if str_eq(u0, "EXIT") or str_eq(u0, "QUIT") {
+            let _ = send(fd, ["QUIT"])
+            break
+        }
+        let r = send(fd, argv)
+        show(r)
+    }
+}
+
 fn main() {
     require_unix()
     if argc() >= 2 and str_eq(arg_get(1), "--cluster") {
@@ -443,6 +714,12 @@ fn main() {
     let mut user = ""
     let mut use_tls = 0
     let mut tls_ca = ""
+    let mut bench_mode = 0
+    let mut repl_mode = 0
+    let mut bench_n = 10000
+    let mut bench_p = 16
+    let mut bench_c = 1
+    let mut bench_r = 0
     let mut cmd = make([]string, 0, 8)
     let n = argc()
     let mut i = 1
@@ -451,6 +728,64 @@ fn main() {
         if str_eq(a, "--help") {
             usage()
             return
+        }
+        if str_eq(a, "-i") or str_eq(a, "--repl") {
+            repl_mode = 1
+            i = i + 1
+            continue
+        }
+        if str_eq(a, "--bench") or str_eq(a, "bench") {
+            bench_mode = 1
+            i = i + 1
+            continue
+        }
+        if str_eq(a, "-n") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(nr) => {
+                    if nr > 0 {
+                        bench_n = nr
+                    }
+                },
+                Err(_) => {},
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "-P") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(pr) => {
+                    if pr > 0 {
+                        bench_p = pr
+                    }
+                },
+                Err(_) => {},
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "-c") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(cr) => {
+                    if cr > 0 {
+                        bench_c = cr
+                    }
+                },
+                Err(_) => {},
+            }
+            i = i + 2
+            continue
+        }
+        if str_eq(a, "-r") and i + 1 < n {
+            match parse_int(arg_get(i + 1)) {
+                Ok(rr) => {
+                    if rr >= 0 {
+                        bench_r = rr
+                    }
+                },
+                Err(_) => {},
+            }
+            i = i + 2
+            continue
         }
         if str_eq(a, "-h") or str_eq(a, "--host") {
             if i + 1 >= n {
@@ -542,55 +877,59 @@ fn main() {
         }
         let _ = tcp_nodelay(fd)
     }
-    let mut tc = tls_accept(tls_server_new("", ""), -1)
-    let mut cli = tls_client_new_insecure()
-    if use_tls == 1 {
-        if str_len(tls_ca) > 0 {
-            let _ = tls_client_free(cli)
-            cli = tls_client_new(tls_ca)
+    if use_tls == 0 {
+        if str_len(pass) > 0 {
+            let mut ar = ""
+            if str_len(user) > 0 {
+                ar = send(fd, ["AUTH", user, pass])
+            } else {
+                ar = send(fd, ["AUTH", pass])
+            }
+            if not str_has_prefix(ar, "+OK") {
+                show(ar)
+                let _ = tcp_close(fd)
+                exit(1)
+            }
         }
-        tc = tls_connect(cli, fd, host)
-        if tls_conn_fd(tc) < 0 {
-            print("TLS handshake failed")
+        if bench_mode == 1 {
+            run_bench(fd, host, port, bench_n, bench_p, bench_c, bench_r)
             let _ = tcp_close(fd)
-            let _ = tls_client_free(cli)
-            exit(1)
+            return
         }
+        if repl_mode == 1 {
+            run_repl(fd, host, port)
+            let _ = tcp_close(fd)
+            return
+        }
+        let r = send(fd, cmd)
+        let _ = tcp_close(fd)
+        show(r)
+        return
+    }
+    let cli = tls_cli_new(tls_ca)
+    let tc = tls_connect(cli, fd, host)
+    if tls_conn_fd(tc) < 0 {
+        print("TLS handshake failed")
+        let _ = tcp_close(fd)
+        let _ = tls_client_free(cli)
+        exit(1)
     }
     if str_len(pass) > 0 {
         let mut ar = ""
         if str_len(user) > 0 {
-            if use_tls == 1 {
-                ar = send_tls(tc, ["AUTH", user, pass])
-            } else {
-                ar = send(fd, ["AUTH", user, pass])
-            }
+            ar = send_tls(tc, ["AUTH", user, pass])
         } else {
-            if use_tls == 1 {
-                ar = send_tls(tc, ["AUTH", pass])
-            } else {
-                ar = send(fd, ["AUTH", pass])
-            }
+            ar = send_tls(tc, ["AUTH", pass])
         }
         if not str_has_prefix(ar, "+OK") {
             show(ar)
-            if use_tls == 1 {
-                let _ = tls_conn_close(tc)
-            } else {
-                let _ = tcp_close(fd)
-            }
+            let _ = tls_conn_close(tc)
             let _ = tls_client_free(cli)
             exit(1)
         }
     }
-    let mut r = ""
-    if use_tls == 1 {
-        r = send_tls(tc, cmd)
-        let _ = tls_conn_close(tc)
-    } else {
-        r = send(fd, cmd)
-        let _ = tcp_close(fd)
-    }
+    let r = send_tls(tc, cmd)
+    let _ = tls_conn_close(tc)
     let _ = tls_client_free(cli)
     show(r)
 }
