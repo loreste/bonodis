@@ -1020,6 +1020,7 @@ fn cluster_meet_peer(clus: CMap, ip: string, port: int) -> string {
         }
         let _ = tcp_close(fd)
         cluster_save(clus)
+        cluster_push_all(clus)
         log_cluster_meet(ip, port)
         return r_ok()
     }
@@ -1051,6 +1052,7 @@ fn cluster_meet_peer(clus: CMap, ip: string, port: int) -> string {
     }
     peer_close(fd, tls_on, tc, cli)
     cluster_save(clus)
+    cluster_push_all(clus)
     log_cluster_meet(ip, port)
     return r_ok()
 }

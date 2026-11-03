@@ -2439,6 +2439,7 @@ fn is_batchable_cmd(cmd: string) -> int {
 fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3: chan[string], s4: chan[string], s5: chan[string], s6: chan[string], s7: chan[string], s8: chan[string], s9: chan[string], s10: chan[string], s11: chan[string], s12: chan[string], s13: chan[string], s14: chan[string], s15: chan[string], replies: CMap, ids: AtomicInt, shards: int, pass: string, port: int, protected: int, connected: AtomicInt, cmds: AtomicInt, wal_ch: chan[string], aof: int, sl: CMap, slowlog_us: int, feed: CMap, replcfg: CMap, stop: AtomicInt, clus: CMap, peer0: string) -> int {
     let bus = pack_bus(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15)
     let _ = tcp_nodelay(fd)
+    let _ = tcp_set_timeout(fd, 0)
     let _ = tcp_set_recv_buf(fd, SOCK_BUF)
     let _ = tcp_set_send_buf(fd, SOCK_BUF)
     let mut peer = peer0
@@ -2481,6 +2482,8 @@ fn handle_conn(fd: int, s0: chan[string], s1: chan[string], s2: chan[string], s3
     let idle = int_of(cmap_get(replcfg, "timeout"))
     if idle > 0 {
         let _ = tcp_set_timeout(fd, idle * 1000)
+    } else {
+        let _ = tcp_set_timeout(fd, 0)
     }
     let mut buf = ""
     let db_a = atomic_new(0)
