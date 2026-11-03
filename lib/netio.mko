@@ -1,7 +1,7 @@
 pack bonodis
 
 fn dummy_tls_conn() -> TlsConn {
-    return tls_accept(tls_server_new("", ""), -1)
+    return tls_accept(tls_server_new(str_repeat("x", 1025), ""), -1)
 }
 
 fn dummy_tls_client() -> TlsClient {
@@ -57,19 +57,18 @@ fn conn_close(fd: int, tls_on: int, tc: TlsConn) {
 }
 
 fn conn_handshake(fd: int, cert: string, key: string) -> (int, TlsConn) {
-    let none = dummy_tls_conn()
     if str_len(cert) == 0 or str_len(key) == 0 {
-        return (0, none)
+        return (0, dummy_tls_conn())
     }
     if tls_server_available() == 0 {
         slog_error("TLS requested but tls_server_available=0")
-        return (0 - 1, none)
+        return (0 - 1, dummy_tls_conn())
     }
     let srv = tls_server_new(cert, key)
     let tc = tls_accept(srv, fd)
     if tls_conn_fd(tc) < 0 {
         slog_with("error", "TLS handshake failed", "fd", format_int(fd))
-        return (0 - 1, none)
+        return (0 - 1, tc)
     }
     slog_with("info", "TLS accepted", "fd", format_int(fd))
     return (1, tc)

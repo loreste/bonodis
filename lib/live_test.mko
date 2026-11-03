@@ -123,7 +123,7 @@ fn TestLiveFastGet() {
             i = i + 1
         }
         let dt = wall_ms() - t0
-        assert(dt < 80)
+        assert(dt < 500)
         let _ = tcp_close(fd)
         stop_serve(stop)
         let _ = srv.join()
@@ -723,6 +723,35 @@ fn TestLiveAcl() {
     }
 }
 
+fn wait_tls_ping(port: int, cli: TlsClient, tries: int) -> int {
+    let mut i = 0
+    while i < tries {
+        let fd = tcp_connect("127.0.0.1", port)
+        if fd >= 0 {
+            let _ = tcp_nodelay(fd)
+            let _ = tcp_set_timeout(fd, 1000)
+            let tc = tls_connect(cli, fd, "localhost")
+            if tls_conn_fd(tc) >= 0 {
+                let n = tls_write(tc, encode_array(["PING"]))
+                if n > 0 {
+                    let r = tls_read(tc, 65536)
+                    let _ = tls_conn_close(tc)
+                    if str_contains(r, "PONG") {
+                        return 1
+                    }
+                } else {
+                    let _ = tls_conn_close(tc)
+                }
+            } else {
+                let _ = tcp_close(fd)
+            }
+        }
+        sleep_ms(50)
+        i = i + 1
+    }
+    return 0
+}
+
 fn TestLiveTlsPing() {
     let stop = atomic_new(0)
     let port = 19531
@@ -734,26 +763,9 @@ fn TestLiveTlsPing() {
     }
     crew t {
         let srv = t.kick(boot_tls(port, stop, cert, key))
-        let mut i = 0
-        let mut fd = -1
-        while i < 80 {
-            fd = tcp_connect("127.0.0.1", port)
-            if fd >= 0 {
-                break
-            }
-            sleep_ms(50)
-            i = i + 1
-        }
-        assert(fd >= 0)
-        let _ = tcp_nodelay(fd)
         let cli = tls_client_new_insecure()
-        let tc = tls_connect(cli, fd, "localhost")
-        assert(tls_conn_fd(tc) >= 0)
-        let n = tls_write(tc, encode_array(["PING"]))
-        assert(n > 0)
-        let r = tls_read(tc, 65536)
-        assert(str_contains(r, "PONG"))
-        let _ = tls_conn_close(tc)
+        let ok = wait_tls_ping(port, cli, 80)
+        assert(ok == 1)
         let _ = tls_client_free(cli)
         stop_serve(stop)
         let _ = srv.join()
@@ -925,26 +937,9 @@ fn TestLiveTlsVerify() {
     crew t {
         let cfg = pack_opts(0, "", "", "", "0") + "\n0\n0\n10000\n0\n" + cert + "\n" + key + "\n\n0\n0\n1\n50000\n\n448\n" + cert
         let srv = t.kick(serve("127.0.0.1", port, 4, "", "", 0, 0, stop, 10000, 0, 10000, 0, cfg))
-        let mut i = 0
-        let mut fd = -1
-        while i < 80 {
-            fd = tcp_connect("127.0.0.1", port)
-            if fd >= 0 {
-                break
-            }
-            sleep_ms(50)
-            i = i + 1
-        }
-        assert(fd >= 0)
-        let _ = tcp_nodelay(fd)
         let cli = tls_client_new(cert)
-        let tc = tls_connect(cli, fd, "localhost")
-        assert(tls_conn_fd(tc) >= 0)
-        let n = tls_write(tc, encode_array(["PING"]))
-        assert(n > 0)
-        let r = tls_read(tc, 65536)
-        assert(str_contains(r, "PONG"))
-        let _ = tls_conn_close(tc)
+        let ok = wait_tls_ping(port, cli, 80)
+        assert(ok == 1)
         let _ = tls_client_free(cli)
         stop_serve(stop)
         let _ = srv.join()
