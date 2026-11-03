@@ -28,7 +28,7 @@ Unauthenticated `SET`/`FLUSHALL` was **not** achieved when `requirepass` was set
 - Redis modules (`.so` ABI)
 - Redis-format RDB bytes (`dump.bonodis` + PSYNC command stream)
 - Redis Cluster bus binary protocol (gossip is RESP `CLUSTERX`)
-- Full Lua 5.1 VM (no first-class tables, no `os`/`io`, no `cjson`)
+- Full Lua 5.1 VM (no general mutable tables/metatables, no `os`/`io`/`load`/`require`; `string.*`, `math.*`, `cjson.*`, and `redis.*` are built-in)
 - Unix socket `chmod` (Mako does not export `_mako_syscall_chmod`)
 - `SENTINEL` as a 3-process quorum (compatibility API on the data node only)
 
@@ -67,8 +67,14 @@ Two listeners: `--requirepass s3cret` on `:16381`, open on `:16382`.
 | Sub-key Hash Field TTLs | **shipped** — `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HTTL`, `HPTTL`, `HPERSIST`, `HSETEX` with lazy & active sweep and `DUMP`/`RESTORE`/`RENAME` preservation |
 | Active expiry + $O(1)$ sampled LRU | **shipped** — periodic `Store_active_expire` on shard writes plus 16-sample `allkeys-lru` eviction preferring already-expired keys |
 | Deterministic `*SCAN` + `SCAN TYPE` | **shipped** — sorted deterministic pagination for `SCAN` (`MATCH`/`COUNT`/`TYPE`), `HSCAN`, `SSCAN`, `ZSCAN` |
-| Cross-shard `RENAME`/`COPY` + parallel multi-key | **shipped** — standalone cross-shard `RENAME`, `RENAMENX`, and `COPY` for all types + parallel multi-shard `MGET`, `MSET`, `DEL`, `EXISTS`, `TOUCH` |
+| Cross-shard `RENAME`/`COPY` + parallel multi-key | **shipped** — standalone cross-shard `RENAME`, `RENAMENX`, and `COPY` for all types + parallel multi-shard `MGET`, `MSET`, `DEL`, `EXISTS`, `TOUCH`, and multi-shard client pipeline scatter-gather |
 | Zero-copy RESP + pipeline write coalescing | **shipped** — `parse_cmd_at` cursor framing, pipelined TCP batch responses, Mako `0.7.0` `#[no_alloc]`, `const fn`, and SWAR bitops |
+| True $O(1)$ Head-Slack Deque Lists | **shipped** — `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LINDEX`, `LRANGE` in $O(1)$ amortized time without array shifting |
+| Set & ZSet Member TTLs | **shipped** — `SEXPIRE`/`SPEXPIRE`/`SEXPIREAT`/`SPEXPIREAT`/`STTL`/`SPTTL`/`SPERSIST` and `ZEXPIRE`/`ZPEXPIRE`/`ZEXPIREAT`/`ZPEXPIREAT`/`ZTTL`/`ZPTTL`/`ZPERSIST` |
+| Native Redis Stack & Probabilistic Suite | **shipped** — `JSON.*`, `TS.*`, `FT.*`, `QUEUE.*`, `BF.*`, `CF.*`, `CMS.*`, `TOPK.*`, `CAS`/`CAD`/`DELEX`, `RATELIMIT`/`CL.THROTTLE`, fenced `LOCK`, `CLIENT TRACKING` |
+| Lua Stdlib & `EVAL_RO` | **shipped** — `EVAL_RO`/`EVALSHA_RO`, `string.*`, `math.*`, `cjson.encode`/`cjson.decode`, `redis.status_reply`/`error_reply`/`sha1hex` |
+| Quantized Vectors & `REACT` Globs | **shipped** — `int8` scalar-quantized `VADD` + hybrid `VSEARCH`, `REACT` on `WRITE`/`DELETE`/`EXPIRE`/`ANY` with glob patterns |
+| Linux Socket Timeout & TLS Handshake Hardening | **fixed** — clear inherited `SO_RCVTIMEO` on accepted sockets, immediate `CLUSTER MEET` gossip push, and clean OpenSSL error queue handling |
 
 ## Whitehat (security-auditor)
 

@@ -14,12 +14,17 @@ The HTTP API is now at `http://127.0.0.1:9090`.
 
 ### Single command
 
+Any RESP command supported by Bonodis — including `JSON.*`, `TS.*`, `FT.*`, `QUEUE.*`, `BF.*`, `CF.*`, `CMS.*`, `TOPK.*`, `LOCK`, `CAS`, `CL.THROTTLE`, and `VSEARCH` — can be called via `POST /api`:
+
 ```
 curl -s http://127.0.0.1:9090/api -d '{"argv":["SET","mykey","myvalue"]}'
 # {"ok":true,"result":"OK"}
 
 curl -s http://127.0.0.1:9090/api -d '{"argv":["GET","mykey"]}'
 # {"ok":true,"result":"myvalue"}
+
+curl -s http://127.0.0.1:9090/api -d '{"argv":["JSON.SET","doc:1","$","{\"title\":\"Bonodis\"}"]}'
+# {"ok":true,"result":"OK"}
 ```
 
 ### Pipeline (multiple commands)

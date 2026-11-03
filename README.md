@@ -5,10 +5,10 @@ In-memory data store that speaks RESP2. Written in [Mako](https://github.com/lor
 Runs on Linux and macOS (x86_64, arm64). Windows is not supported (Unix syscalls). WSL2 works.
 
 ```
-makori run -p lib -- --bind 127.0.0.1 --port 6379 --protected-mode no
-makori run -p cli -- PING
-makori run -p cli -- SET k v
-makori run -p cli -- GET k
+mako run ./lib/main.mko -- --bind 127.0.0.1 --port 6379 --protected-mode no
+mako run ./cli/main.mko -- PING
+mako run ./cli/main.mko -- SET k v
+mako run ./cli/main.mko -- GET k
 ```
 
 Version **0.14.0**. Needs [Mako](https://github.com/loreste/mako) 0.7.0+. See [install docs](docs/install.md).
@@ -54,7 +54,7 @@ Four `SO_REUSEPORT` accept threads (`--accept-threads`), 16k listen backlog, 50k
 ## Run
 
 ```
-makori run -p lib -- --port 6379 --bind 0.0.0.0 --shards 16 \
+mako run ./lib/main.mko -- --port 6379 --bind 0.0.0.0 --shards 16 \
     --dir ./data --appendonly yes --requirepass secret --protected-mode yes \
     --maxclients 50000 --maxmemory 268435456 \
     --metrics-port 9090 --appendfsync everysec
@@ -422,7 +422,7 @@ sudo mkdir -p /var/lib/bonodis && sudo chown bonodis:bonodis /var/lib/bonodis
 sudo systemctl enable --now bonodis
 
 # Docker
-makori build --release -p lib -o bonodis
+mako build ./lib/main.mko -o bonodis
 docker build -t bonodis .
 docker run --name bonodis -p 6379:6379 -v bonodis-data:/data bonodis
 
@@ -435,14 +435,16 @@ bonodis --bind 127.0.0.1 --unixsocket /tmp/bonodis.sock --protected-mode no
 bonodis-cli -s /tmp/bonodis.sock PING
 
 # Bench (needs a running server)
+./bonodis-cli --bench -n 50000 -P 16 -c 4 -r 10000
 ./scripts/bench.sh 127.0.0.1 6379 20000
-makori bench -p lib
 ```
 
 ## Tests
 
 ```
-makori test .
+mako check .
+mako lint
+mako test .
 ```
 
 Unit tests (store, RESP codec, CRC16, glob, Lua) and live TCP tests (every command group, cluster, replication, TLS, unix sockets, pub/sub, streams, ACL, adversarial probes). All tests are in-process.

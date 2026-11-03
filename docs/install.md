@@ -30,7 +30,8 @@ cd mako && make install
 Verify:
 
 ```
-makori --version
+mako --version
+# should print mako 0.7.0 or later
 ```
 
 ## Get Bonodis
@@ -47,26 +48,35 @@ git clone --branch v0.14.0 https://github.com/loreste/bonodis
 cd bonodis
 ```
 
-## Run (development)
+## Build or Run (development)
 
-No build step needed. Mako compiles and runs in one command:
+Build standalone binaries:
 
 ```
-makori run -p lib -- --bind 127.0.0.1 --port 6379 --protected-mode no
+mako build ./lib/main.mko -o bonodis
+mako build ./cli/main.mko -o bonodis-cli
+```
+
+Or compile and run directly in one command:
+
+```
+mako run ./lib/main.mko -- --bind 127.0.0.1 --port 6379 --protected-mode no
 ```
 
 In another terminal:
 
 ```
-makori run -p cli -- PING
-makori run -p cli -- SET hello world
-makori run -p cli -- GET hello
+mako run ./cli/main.mko -- PING
+mako run ./cli/main.mko -- SET hello world
+mako run ./cli/main.mko -- GET hello
 ```
 
 ## Run tests
 
 ```
-makori test .
+mako check .
+mako lint
+mako test .
 ```
 
 All 12 test suites should pass.
@@ -76,7 +86,7 @@ All 12 test suites should pass.
 For production use, run the server with persistence and memory limits:
 
 ```
-makori run -p lib -- --prod --bind 0.0.0.0 --port 6379 \
+./bonodis --prod --bind 0.0.0.0 --port 6379 \
     --requirepass <password> \
     --appendonly yes --dir /var/lib/bonodis \
     --maxmemory 1073741824 \
@@ -108,7 +118,7 @@ docker build -t bonodis .
 docker run --name bonodis -p 6379:6379 -v bonodis-data:/data bonodis
 ```
 
-The Dockerfile expects a `bonodis` binary in the repo root. Build it first with `makori run -p lib` on a Linux host, or use a multi-stage build.
+The Dockerfile expects a `bonodis` binary in the repo root. Build it first with `mako build ./lib/main.mko -o bonodis` on a Linux host, or use a multi-stage build.
 
 ## Connecting
 
@@ -140,8 +150,8 @@ rdb.Get(ctx, "k")
 ```
 # CLI
 bonodis-cli -h 127.0.0.1 -p 6379 PING
-# or via makori
-makori run -p cli -- -h 127.0.0.1 -p 6379 PING
+# or via mako
+mako run ./cli/main.mko -- -h 127.0.0.1 -p 6379 PING
 ```
 
 ## Platform notes

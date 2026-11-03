@@ -1,5 +1,5 @@
 # Build on the host first (Mako native backend is host-only):
-#   mako build --release -p lib -o bonodis
+#   mako build ./lib/main.mko -o bonodis
 #   docker build -t bonodis .
 # Add --requirepass in `docker run ... bonodis --bind 0.0.0.0 ... --requirepass secret` if the port is exposed.
 FROM debian:bookworm-slim

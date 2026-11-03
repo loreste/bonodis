@@ -31,12 +31,16 @@ user <name> <on|off> [nopass|>password] [+@all|+@read|+@write|+@admin|+cmd|-cmd]
 | `on` / `off` | User is enabled / disabled |
 | `nopass` | No password required |
 | `>password` | Set the password |
-| `+@all` | Allow all commands |
-| `+@read` | Allow read commands |
-| `+@write` | Allow write commands |
-| `+@admin` | Allow admin commands (CONFIG, FLUSHALL, etc.) |
+| `reset` | Reset user to `off`, clear passwords and command permissions |
+| `+@all` / `allcommands` / `+*` | Allow all commands |
+| `-@all` / `nocommands` / `-*` | Deny all commands |
+| `+@read` / `-@read` | Allow / deny read commands |
+| `+@write` / `-@write` | Allow / deny write commands |
+| `+@admin` / `-@admin` | Allow / deny admin commands (`CONFIG`, `FLUSHALL`, `ACL`, etc.) |
 | `+cmd` | Allow a specific command |
 | `-cmd` | Deny a specific command |
+
+Rules are evaluated left-to-right (later tokens override earlier tokens, e.g., `+@all -@admin` or `-@all +@read +set`).
 
 ## Authenticating
 
@@ -72,6 +76,8 @@ ACL GETUSER readonly
 # (user details)
 
 ACL SETUSER writer on >writerpass +@write
+ACL DELUSER writer
+ACL GENPASS  # generate a random password token
 ACL SAVE     # write back to the acl file
 ACL LOAD     # reload from the acl file
 ```

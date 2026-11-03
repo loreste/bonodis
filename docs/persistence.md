@@ -42,9 +42,12 @@ Writes `<dir>/dump.bonodis` -- a command stream (not Redis RDB format). No fork.
 
 ## What gets persisted
 
-- All data commands (SET, HSET, LPUSH, SADD, ZADD, XADD, etc.)
-- REACT CREATE / REACT DELETE rules
-- Database number (SELECT is recorded per write)
+- All core and extended data commands (`SET`, `CAS`, `CAD`, `DELEX`, `HSET`, `HSETEX`, `LPUSH`, `SADD`, `ZADD`, `XADD`, `SETBIT`, `GEOADD`, `PFADD`, etc.)
+- Sub-key TTL commands (`HEXPIRE`/`HPEXPIRE`/`HEXPIREAT`/`HPEXPIREAT`/`HPERSIST`, `SEXPIRE`/`SPEXPIRE`/`SEXPIREAT`/`SPEXPIREAT`/`SPERSIST`, `ZEXPIRE`/`ZPEXPIRE`/`ZEXPIREAT`/`ZPEXPIREAT`/`ZPERSIST`)
+- Native Redis Stack & probabilistic commands (`JSON.*`, `TS.*`, `FT.*`, `QUEUE.*`, `BF.*`, `CF.*`, `CMS.*`, `TOPK.*`, `LOCK`, `RATELIMIT`, `CL.THROTTLE`)
+- Vector, Brain, and Graph commands (`VADD`, `VREM`, `VATTR`, `BRAIN REMEMBER`/`SAY`/`COMPACT`/`CACHE`, `RELATE`/`UNRELATE`, `FACT ADD`/`DEL`, `BELIEVE`, `ATTEND`, `BUDGET`, `SPEND`, `LEASE`/`UNLEASE`)
+- `REACT CREATE` / `REACT DELETE` trigger rules
+- Database number (`SELECT` is recorded per write)
 
 What is NOT persisted:
 - Client connections, subscriptions, MONITOR state
